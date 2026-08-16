@@ -284,6 +284,31 @@ jobs:
           cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST_HUB}"
           cosign sign --yes "${GHCR_IMAGE}@${DIGEST_GHCR}"
 
+      - name: Checkout for Docker Hub description
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Prepare Docker Hub README (absolute links)
+        run: |
+          python3 - <<'PY'
+          import re
+          md = open('README.md').read()
+          # Docker Hub cannot resolve repo-relative links; point them at GitHub.
+          md = re.sub(r'\]\((?!https?://|#)([^)]+)\)',
+                      r'](https://github.com/ESITC-Paris/unbound-distroless/blob/main/\1)', md)
+          open('README.dockerhub.md', 'w').write(md)
+          PY
+
+      - name: Sync Docker Hub description
+        uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4.0.2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: esitcparis/unbound-distroless
+          short-description: Production-grade Unbound DNS resolver on a distroless base. Non-root, DNSSEC, signed, auto-updated.
+          readme-filepath: ./README.dockerhub.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
