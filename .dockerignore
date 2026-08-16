@@ -1,0 +1,14 @@
+# Only the Dockerfile's inputs belong in the build context.
+.git
+.github
+.superpowers
+docs
+tests
+*.md
+.DS_Store
+.gitignore
+.dockerignore
+docker-compose.yml
+unbound.conf.local
+.build-state.json
+versions.env

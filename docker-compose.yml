@@ -1,0 +1,24 @@
+# Production example for unbound-distroless.
+# The image healthcheck (unbound-control over a unix socket) is built in.
+services:
+  unbound:
+    image: esitcparis/unbound-distroless:latest
+    container_name: unbound
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      # Persist the DNSSEC root trust anchor across restarts (RFC 5011).
+      - unbound-rootkey:/var/lib/unbound
+      # Optional: your own configuration.
+      # - ./unbound.conf:/etc/unbound/unbound.conf:ro
+
+volumes:
+  unbound-rootkey:

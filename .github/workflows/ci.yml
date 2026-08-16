@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '*.md']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      # Every action is pinned to a full commit SHA (the trailing comment records
+      # the tag that SHA was resolved from). A moving tag is a mutable dependency
+      # that runs with the job's token; a SHA is not.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Load pinned versions
+        run: cat versions.env >> "$GITHUB_ENV"
+
+      - name: Load pinned base image digests
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
+          state = json.load(open('.build-state.json'))
+          print(f"DEBIAN_BASE=debian:trixie@{state['debian']}")
+          print(f"DISTROLESS_BASE=gcr.io/distroless/base-debian13:nonroot@{state['distroless']}")
+          PY
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build image (amd64)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          load: true
+          tags: unbound-distroless:test
+          build-args: |
+            UNBOUND_VERSION=${{ env.UNBOUND_VERSION }}
+            UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
+            DEBIAN_BASE=${{ env.DEBIAN_BASE }}
+            DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Structure tests
+        run: bash tests/structure.sh unbound-distroless:test
+
+      - name: Install dig
+        run: command -v dig >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq bind9-dnsutils)
+
+      - name: Functional tests
+        run: bash tests/functional.sh unbound-distroless:test
+
+      - name: Trivy vulnerability scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-distroless:test
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true

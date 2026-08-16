@@ -1,0 +1,172 @@
+name: Upstream check
+
+on:
+  schedule:
+    # Hourly at minute 17 (off-peak minute to avoid the top-of-hour GitHub
+    # scheduler congestion). A new upstream release or base-image update is
+    # therefore picked up within ~1 hour.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: upstream-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a full commit SHA (trailing comment records the tag it came
+      # from): this job pushes to main, tags, and dispatches the release.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Load current pins
+        run: cat versions.env >> "$GITHUB_ENV"
+
+      - name: Check latest Unbound release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Authenticated so the shared runner IP's 60 req/h anonymous quota can't
+          # flake the daily check. Release candidates (release-1.2.3rc1) are
+          # excluded by requiring the closing quote right after the patch number.
+          LATEST=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/NLnetLabs/unbound/tags \
+            | grep -oE '"name": *"release-[0-9]+\.[0-9]+\.[0-9]+"' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+          [ -n "$LATEST" ] || { echo "could not determine latest version"; exit 1; }
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Current: ${UNBOUND_VERSION:-unset} — Latest: $LATEST"
+
+      - name: Check base image digests
+        id: digests
+        run: |
+          DEBIAN=$(docker buildx imagetools inspect debian:trixie --format '{{println .Manifest.Digest}}' | head -1)
+          DISTROLESS=$(docker buildx imagetools inspect gcr.io/distroless/base-debian13:nonroot --format '{{println .Manifest.Digest}}' | head -1)
+          # An empty digest would compare unequal to the stored one, triggering a
+          # spurious revision release and then writing "" into .build-state.json —
+          # which makes every subsequent run bump again. Fail loudly instead.
+          [ -n "$DEBIAN" ] && [ -n "$DISTROLESS" ] || { echo "digest resolution failed"; exit 1; }
+          echo "debian=$DEBIAN" >> "$GITHUB_OUTPUT"
+          echo "distroless=$DISTROLESS" >> "$GITHUB_OUTPUT"
+
+      - name: Decide action
+        id: decide
+        env:
+          LATEST: ${{ steps.upstream.outputs.latest }}
+          NEW_DEBIAN: ${{ steps.digests.outputs.debian }}
+          NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
+        run: |
+          OLD_DEBIAN=$(python3 -c "import json;print(json.load(open('.build-state.json'))['debian'])")
+          OLD_DISTROLESS=$(python3 -c "import json;print(json.load(open('.build-state.json'))['distroless'])")
+          # Monotonicity guard: only ever move UP. The tags API is paginated and
+          # page 1 is not ordered by version, so a transient upstream/API hiccup
+          # could report an older release as "latest" — without this guard that
+          # would auto-tag, auto-build and auto-publish a downgrade as :latest.
+          NEWEST=$(printf '%s\n%s\n' "$LATEST" "$UNBOUND_VERSION" | sort -V | tail -1)
+          if [ "$LATEST" != "$UNBOUND_VERSION" ] && [ "$NEWEST" = "$LATEST" ]; then
+            echo "action=version" >> "$GITHUB_OUTPUT"
+            echo "New Unbound version: $LATEST"
+          elif [ "$NEW_DEBIAN" != "$OLD_DEBIAN" ] || [ "$NEW_DISTROLESS" != "$OLD_DISTROLESS" ]; then
+            if [ "$LATEST" != "$UNBOUND_VERSION" ]; then
+              echo "::warning::upstream reported $LATEST, which is not above the pinned $UNBOUND_VERSION — ignoring it and treating this as a revision rebuild"
+            fi
+            echo "action=revision" >> "$GITHUB_OUTPUT"
+            echo "Base image digests changed — revision rebuild"
+          else
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "Everything up to date"
+          fi
+
+      - name: Update pins for a new Unbound version
+        if: steps.decide.outputs.action == 'version'
+        env:
+          LATEST: ${{ steps.upstream.outputs.latest }}
+          # "NLnet Labs releases signing key G2 <releases@nlnetlabs.nl>" — the key
+          # that signs NSD/Unbound/ldns tarballs published after 2026-01-01.
+          # Fingerprint published at https://nlnetlabs.nl/signing-keys/ and
+          # confirmed against the issuer-fpr subpacket of the 1.26.0 signature.
+          UNBOUND_SIGNING_KEY: 231018690C4D903EF419146AA144323DEAACDF45
+        run: |
+          BASE=https://nlnetlabs.nl/downloads/unbound
+          curl -fsSL -o /tmp/unbound.tar.gz     "$BASE/unbound-${LATEST}.tar.gz"
+          curl -fsSL -o /tmp/unbound.tar.gz.asc "$BASE/unbound-${LATEST}.tar.gz.asc"
+
+          # Fail-closed OpenPGP verification, before the hash is recorded: a
+          # recorded hash is a trusted-forever pin, so it must never be minted
+          # from an unverified download. The key comes from a keyserver that is
+          # independent of the download host (nlnetlabs.nl only as fallback) and
+          # its fingerprint is pinned above, so whoever serves the tarball cannot
+          # also serve the key that vouches for it.
+          GNUPGHOME=$(mktemp -d); export GNUPGHOME; chmod 700 "$GNUPGHOME"
+          curl -fsSL -o /tmp/nlnetlabs.asc \
+            "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${UNBOUND_SIGNING_KEY}" \
+            || curl -fsSL -o /tmp/nlnetlabs.asc https://nlnetlabs.nl/downloads/keys/releases-g2.asc
+          gpg --batch --import /tmp/nlnetlabs.asc
+          gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print $10}' \
+            | grep -qx "$UNBOUND_SIGNING_KEY" \
+            || { echo "::error::imported key is not the pinned NLnet Labs signing key"; exit 1; }
+          gpg --batch --verify /tmp/unbound.tar.gz.asc /tmp/unbound.tar.gz \
+            || { echo "::error::OpenPGP verification of unbound-${LATEST}.tar.gz failed"; exit 1; }
+
+          SHA=$(sha256sum /tmp/unbound.tar.gz | cut -d' ' -f1)
+
+          # Cheap second opinion: upstream also publishes a .sha256 next to the
+          # tarball. Disagreement means the two artefacts came from different
+          # trees; refuse to pin either.
+          PUBLISHED=$(curl -fsSL "$BASE/unbound-${LATEST}.tar.gz.sha256" | tr -d '[:space:]')
+          [ "$PUBLISHED" = "$SHA" ] \
+            || { echo "::error::published .sha256 ($PUBLISHED) does not match the downloaded tarball ($SHA)"; exit 1; }
+
+          # versions.env must stay comment-free KEY=VALUE: ci.yml and release.yml
+          # cat it straight into $GITHUB_ENV.
+          printf 'UNBOUND_VERSION=%s\nUNBOUND_SHA256=%s\nREVISION=0\n' "$LATEST" "$SHA" > versions.env
+          cat versions.env >> "$GITHUB_ENV"
+
+      - name: Bump revision for dependency updates
+        if: steps.decide.outputs.action == 'revision'
+        run: |
+          NEWREV=$((REVISION + 1))
+          sed -i "s/^REVISION=.*/REVISION=$NEWREV/" versions.env
+          echo "REVISION=$NEWREV" >> "$GITHUB_ENV"
+
+      - name: Commit state, tag, and dispatch release
+        if: steps.decide.outputs.action != 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          NEW_DEBIAN: ${{ steps.digests.outputs.debian }}
+          NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
+        run: |
+          # shellcheck disable=SC1091
+          . ./versions.env
+          printf '{\n  "debian": "%s",\n  "distroless": "%s"\n}\n' \
+            "$NEW_DEBIAN" "$NEW_DISTROLESS" > .build-state.json
+          TAG="v${UNBOUND_VERSION}-r${REVISION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.env .build-state.json
+          git commit -m "chore: ${TAG} (${ACTION} update) [skip ci]"
+          git tag "$TAG"
+          # --atomic so a rejected main (someone else pushed first) cannot leave
+          # the tag behind on the remote: a stranded tag would make every later
+          # run fail with "already exists" until a human deletes it. Push only
+          # this tag, never --tags.
+          git push --atomic origin main "$TAG"
+          # A tag pushed with GITHUB_TOKEN does not trigger workflows, so the
+          # release has to be dispatched explicitly against the new tag. The push
+          # already happened, so a failed dispatch would otherwise mean a silent,
+          # permanent missed release (the next run sees action=none). Retry, then
+          # fail the job so the miss is visible in the Actions UI.
+          for i in 1 2 3 4 5; do
+            if gh workflow run release.yml --ref "$TAG" -f tag="$TAG"; then exit 0; fi
+            echo "dispatch attempt $i failed; retrying in 15s"
+            sleep 15
+          done
+          echo "::error::release dispatch failed after 5 attempts — run manually: gh workflow run release.yml --ref $TAG -f tag=$TAG"
+          exit 1

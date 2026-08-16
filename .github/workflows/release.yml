@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.26.0-r0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_IMAGE: esitcparis/unbound-distroless
+  GHCR_IMAGE: ghcr.io/esitc-paris/unbound-distroless
+
+# Every action is pinned to a full commit SHA (the trailing comment records the
+# tag that SHA was resolved from). These jobs hold contents:write,
+# packages:write and id-token:write, so a mutable tag on a third-party action
+# would be a direct path to a signed, published image.
+#
+# Each architecture builds and runs the FULL test gate natively on its own
+# runner (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64 — no QEMU
+# anywhere), then pushes its platform image by digest only (untagged). The
+# merge job assembles the multi-arch manifest lists, signs them, and creates
+# the GitHub Release. No user-visible tag exists until every gate has passed.
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      full: ${{ steps.tag.outputs.full }}
+      rev: ${{ steps.tag.outputs.rev }}
+      minor: ${{ steps.tag.outputs.minor }}
+      major: ${{ steps.tag.outputs.major }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          TAG="$RAW_TAG"
+          # Reject anything that is not exactly vX.Y.Z-rN before it can reach a registry.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]]; then
+            echo "bad tag format: $TAG (expected vX.Y.Z-rN)"
+            exit 1
+          fi
+          # v1.26.0-r2 -> full=1.26.0 rev=2 minor=1.26 major=1
+          FULL="${TAG#v}"; FULL="${FULL%-r*}"
+          REV="${TAG##*-r}"
+          MINOR="${FULL%.*}"
+          MAJOR="${FULL%%.*}"
+          {
+            echo "tag=$TAG"
+            echo "full=$FULL"
+            echo "rev=$REV"
+            echo "minor=$MINOR"
+            echo "major=$MAJOR"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Cross-check tag against versions.env
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TAG_FULL: ${{ steps.tag.outputs.full }}
+          TAG_REV: ${{ steps.tag.outputs.rev }}
+        run: |
+          # shellcheck disable=SC1091
+          . ./versions.env
+          [ "$UNBOUND_VERSION" = "$TAG_FULL" ] \
+            || { echo "tag $TAG_NAME does not match versions.env ($UNBOUND_VERSION)"; exit 1; }
+          # The revision half of the tag is just as load-bearing: it selects the
+          # -rN image tags. A tag whose rev disagrees with versions.env means the
+          # tag and the tree it points at came from different states.
+          [ "$REVISION" = "$TAG_REV" ] \
+            || { echo "tag $TAG_NAME revision r$TAG_REV does not match versions.env (REVISION=$REVISION)"; exit 1; }
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Load pinned versions
+        run: cat versions.env >> "$GITHUB_ENV"
+
+      - name: Load pinned base image digests
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
+          state = json.load(open('.build-state.json'))
+          print(f"DEBIAN_BASE=debian:trixie@{state['debian']}")
+          print(f"DISTROLESS_BASE=gcr.io/distroless/base-debian13:nonroot@{state['distroless']}")
+          PY
+
+      - name: Sanitize platform name
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build image for testing (native)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          load: true
+          platforms: ${{ matrix.platform }}
+          tags: unbound-distroless:test
+          build-args: |
+            UNBOUND_VERSION=${{ env.UNBOUND_VERSION }}
+            UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
+            DEBIAN_BASE=${{ env.DEBIAN_BASE }}
+            DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Structure tests
+        run: bash tests/structure.sh unbound-distroless:test
+
+      - name: Install dig
+        run: command -v dig >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq bind9-dnsutils)
+
+      - name: Functional tests
+        run: bash tests/functional.sh unbound-distroless:test
+
+      - name: Trivy vulnerability scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-distroless:test
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push platform image by digest (untagged) with SBOM + provenance
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            UNBOUND_VERSION=${{ env.UNBOUND_VERSION }}
+            UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
+            DEBIAN_BASE=${{ env.DEBIAN_BASE }}
+            DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+          outputs: type=image,"name=${{ env.DOCKERHUB_IMAGE }},${{ env.GHCR_IMAGE }}",push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest lists
+        env:
+          TAG_MAJOR: ${{ needs.prepare.outputs.major }}
+          TAG_MINOR: ${{ needs.prepare.outputs.minor }}
+          TAG_FULL: ${{ needs.prepare.outputs.full }}
+          TAG_REV: ${{ needs.prepare.outputs.rev }}
+        run: |
+          cd /tmp/digests
+          COUNT=$(find . -maxdepth 1 -type f | wc -l)
+          [ "$COUNT" -eq 2 ] || { echo "expected 2 platform digests, found $COUNT"; exit 1; }
+          REFS_HUB=""; REFS_GHCR=""
+          for f in *; do
+            REFS_HUB="$REFS_HUB $DOCKERHUB_IMAGE@sha256:$f"
+            REFS_GHCR="$REFS_GHCR $GHCR_IMAGE@sha256:$f"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+            -t "$DOCKERHUB_IMAGE:latest" \
+            -t "$DOCKERHUB_IMAGE:$TAG_MAJOR" \
+            -t "$DOCKERHUB_IMAGE:$TAG_MINOR" \
+            -t "$DOCKERHUB_IMAGE:$TAG_FULL" \
+            -t "$DOCKERHUB_IMAGE:$TAG_FULL-r$TAG_REV" \
+            $REFS_HUB
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+            -t "$GHCR_IMAGE:latest" \
+            -t "$GHCR_IMAGE:$TAG_MAJOR" \
+            -t "$GHCR_IMAGE:$TAG_MINOR" \
+            -t "$GHCR_IMAGE:$TAG_FULL" \
+            -t "$GHCR_IMAGE:$TAG_FULL-r$TAG_REV" \
+            $REFS_GHCR
+
+      - name: Resolve index digests
+        id: digest
+        env:
+          TAG_FULL: ${{ needs.prepare.outputs.full }}
+          TAG_REV: ${{ needs.prepare.outputs.rev }}
+        run: |
+          HUB=$(docker buildx imagetools inspect "$DOCKERHUB_IMAGE:$TAG_FULL-r$TAG_REV" --format '{{println .Manifest.Digest}}' | head -1)
+          GHCR=$(docker buildx imagetools inspect "$GHCR_IMAGE:$TAG_FULL-r$TAG_REV" --format '{{println .Manifest.Digest}}' | head -1)
+          [ -n "$HUB" ] && [ -n "$GHCR" ] || { echo "index digest resolution failed"; exit 1; }
+          {
+            echo "hub=$HUB"
+            echo "ghcr=$GHCR"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: Sign images (keyless OIDC)
+        env:
+          DIGEST_HUB: ${{ steps.digest.outputs.hub }}
+          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+        run: |
+          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST_HUB}"
+          cosign sign --yes "${GHCR_IMAGE}@${DIGEST_GHCR}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            **Unbound ${{ needs.prepare.outputs.full }}** (revision r${{ needs.prepare.outputs.rev }}) — multi-arch (amd64, arm64), distroless, signed.
+
+            **Images:**
+            - `${{ env.DOCKERHUB_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
+            - `${{ env.GHCR_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
+
+            **Digests:** Docker Hub `${{ steps.digest.outputs.hub }}` · GHCR `${{ steps.digest.outputs.ghcr }}`
+
+            Verify:
+            ```
+            cosign verify ${{ env.DOCKERHUB_IMAGE }}@${{ steps.digest.outputs.hub }} \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            ```
