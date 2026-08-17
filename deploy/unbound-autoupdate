@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# unbound-autoupdate — safe automatic update of the unbound-distroless container.
+#
+# Flow: pull → cosign verify → CANARY (new image + clone of the production
+# volume + the same config, on an isolated network; production is untouched)
+# → full DNS validation against the canary → only then swap production via
+# docker compose → post-swap health gate → automatic rollback on failure.
+#
+# Exit 0 + Healthchecks ping  = up to date, or update deployed and verified.
+# Exit 1 + NO ping            = something needs a human (alert via Healthchecks).
+#
+# Configuration: /etc/unbound-autoupdate.conf (see deploy/README.md).
+set -euo pipefail
+
+CONFIG=/etc/unbound-autoupdate.conf
+# shellcheck disable=SC1090
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+IMAGE="${IMAGE:-esitcparis/unbound-distroless}"
+TAG="${TAG:-1}"                          # follow the major line; a v2 needs a human
+COMPOSE_FILE="${COMPOSE_FILE:-/opt/unbound/docker-compose.yml}"
+SERVICE="${SERVICE:-unbound}"            # compose service name == container name
+PROD_VOLUME="${PROD_VOLUME:-unbound_unbound-data}"
+CONF_PATH="${CONF_PATH:-}"               # host path of the custom unbound.conf ("" = image default)
+HC_URL="${HC_URL:-}"                     # healthchecks.io ping URL ("" = disabled)
+MAIL_TO="${MAIL_TO:-}"                   # email for deploy/error notifications ("" = disabled; needs a local sendmail/msmtp)
+STRICT_BOGUS_CHECK="${STRICT_BOGUS_CHECK:-0}"  # 1 = dnssec-failed.org must SERVFAIL (needs reliable path to its auth servers)
+COSIGN_IDENTITY="${COSIGN_IDENTITY:-https://github.com/ESITC-Paris/unbound-distroless/.*}"
+COSIGN_ISSUER="https://token.actions.githubusercontent.com"
+
+CANARY=unbound-canary
+CANARY_VOL=unbound-canary-vol
+CANARY_NET=unbound-canary-net
+
+log()  { echo "[unbound-autoupdate] $*"; }
+ping_hc() { if [ -n "$HC_URL" ]; then curl -fsS -m 10 --retry 2 "$HC_URL" >/dev/null || true; fi; }
+notify() {  # notify <subject> <body> — best-effort email, never fails the run
+  [ -n "$MAIL_TO" ] || return 0
+  command -v sendmail >/dev/null || { log "MAIL_TO set but no sendmail found (install msmtp-mta)"; return 0; }
+  {
+    printf 'To: %s\n' "$MAIL_TO"
+    printf 'Subject: [unbound-autoupdate] %s: %s\n' "$(hostname -f 2>/dev/null || hostname)" "$1"
+    printf 'Content-Type: text/plain; charset=utf-8\n\n%s\n' "$2"
+  } | sendmail -t || true
+}
+
+# Single instance at a time.
+exec 9>/run/unbound-autoupdate.lock
+flock -n 9 || { log "another run is in progress"; exit 0; }
+
+cleanup_canary() {
+  docker rm -f "$CANARY" >/dev/null 2>&1 || true
+  docker volume rm "$CANARY_VOL" >/dev/null 2>&1 || true
+  docker network rm "$CANARY_NET" >/dev/null 2>&1 || true
+}
+trap cleanup_canary EXIT
+cleanup_canary   # clear leftovers from a previously interrupted run
+
+wait_healthy() {  # wait_healthy <container> [tries]
+  local tries="${2:-30}" s
+  for _ in $(seq 1 "$tries"); do
+    s=$(docker inspect -f '{{.State.Health.Status}}' "$1" 2>/dev/null || echo none)
+    [ "$s" = "healthy" ] && return 0
+    [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ] || return 1
+    sleep 2
+  done
+  return 1
+}
+
+retry_dig() {  # retry_dig <expected-grep-ERE> <dig args...> — cold resolvers may transiently SERVFAIL
+  local expect="$1" out; shift
+  for _ in 1 2 3 4; do
+    out=$(dig +time=5 +tries=2 "$@" 2>/dev/null) || out=""
+    if echo "$out" | grep -qE "$expect"; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+validate_resolver() {  # validate_resolver <ip>
+  local ip="$1"
+  retry_dig 'status: NOERROR' "@$ip" example.com A        || { log "FAIL: UDP resolution"; return 1; }
+  retry_dig 'status: NOERROR' "@$ip" +tcp example.com A   || { log "FAIL: TCP resolution"; return 1; }
+  retry_dig '^;; flags:.* ad' "@$ip" . SOA +dnssec        || { log "FAIL: DNSSEC validation (no AD flag)"; return 1; }
+  if [ "$STRICT_BOGUS_CHECK" = "1" ]; then
+    dig +time=5 +tries=2 "@$ip" dnssec-failed.org A 2>/dev/null | grep -q 'status: SERVFAIL' \
+      || { log "FAIL: bogus domain was not rejected"; return 1; }
+  fi
+  return 0
+}
+
+# ── 1. Anything new? ─────────────────────────────────────────────────────────
+command -v dig >/dev/null    || { log "dig not installed (apt install bind9-dnsutils)"; exit 1; }
+command -v cosign >/dev/null || { log "cosign not installed (see deploy/README.md)"; exit 1; }
+docker inspect "$SERVICE" >/dev/null 2>&1 || { log "production container '$SERVICE' not found"; exit 1; }
+
+RUNNING_IMG=$(docker inspect "$SERVICE" --format '{{.Image}}')
+docker pull -q "$IMAGE:$TAG" >/dev/null
+NEW_IMG=$(docker image inspect "$IMAGE:$TAG" --format '{{.Id}}')
+
+if [ "$RUNNING_IMG" = "$NEW_IMG" ]; then
+  log "up to date ($NEW_IMG)"
+  ping_hc
+  exit 0
+fi
+
+# ── 2. Supply-chain gate: the image must come from our pipeline ──────────────
+NEW_REF=$(docker image inspect "$IMAGE:$TAG" --format '{{index .RepoDigests 0}}')
+log "new image detected: $NEW_REF"
+cosign verify "$NEW_REF" \
+  --certificate-identity-regexp "$COSIGN_IDENTITY" \
+  --certificate-oidc-issuer "$COSIGN_ISSUER" >/dev/null 2>&1 \
+  || { log "cosign verification FAILED — refusing to deploy"
+       notify "signature verification FAILED" "The image $NEW_REF is NOT signed by the release pipeline. Deployment refused; production untouched. Investigate immediately."
+       exit 1; }
+log "cosign signature verified"
+
+# ── 3. Canary: new image + clone of prod state + same config, prod untouched ─
+docker network create "$CANARY_NET" >/dev/null
+docker volume create "$CANARY_VOL" >/dev/null
+docker run --rm -v "$PROD_VOLUME":/src:ro -v "$CANARY_VOL":/dst \
+  busybox sh -c 'cp -a /src/. /dst/' \
+  || { log "volume clone failed"; exit 1; }
+
+CONF_MOUNT=()
+[ -n "$CONF_PATH" ] && CONF_MOUNT=(-v "$CONF_PATH":/etc/unbound/unbound.conf:ro)
+docker run -d --name "$CANARY" --network "$CANARY_NET" \
+  --cap-drop=ALL --cap-add=NET_BIND_SERVICE --security-opt no-new-privileges \
+  -v "$CANARY_VOL":/var/lib/unbound "${CONF_MOUNT[@]}" \
+  "$IMAGE:$TAG" >/dev/null
+
+wait_healthy "$CANARY" || { log "canary never became healthy — production untouched"; docker logs "$CANARY" 2>&1 | tail -15
+  notify "update blocked by canary (unhealthy)" "New image $NEW_REF never became healthy in the canary test. Production untouched; will retry next hour."
+  exit 1; }
+CANARY_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$CANARY_NET\").IPAddress}}" "$CANARY")
+validate_resolver "$CANARY_IP" || { log "canary validation FAILED — production untouched"; docker logs "$CANARY" 2>&1 | tail -15
+  notify "update blocked by canary (validation failed)" "New image $NEW_REF failed DNS validation in the canary test (with production state and configuration). Production untouched; will retry next hour."
+  exit 1; }
+log "canary validated (image + prod state + prod config all work together)"
+cleanup_canary
+trap - EXIT
+
+# ── 4. Swap production, with rollback safety net ─────────────────────────────
+rollback() {
+  log "ROLLBACK: restoring previous image"
+  docker tag "$RUNNING_IMG" "$IMAGE:$TAG"
+  docker compose -f "$COMPOSE_FILE" up -d "$SERVICE" >/dev/null 2>&1 || true
+  if wait_healthy "$SERVICE" && validate_resolver 127.0.0.1; then
+    log "rollback successful — production restored on the previous image"
+    notify "ROLLBACK performed" "The swap to $NEW_REF failed its post-swap validation. Production was rolled back to the previous image and is healthy. Will retry next hour."
+  else
+    log "rollback did NOT restore a healthy resolver — MANUAL INTERVENTION REQUIRED"
+    notify "CRITICAL: rollback failed" "The swap to $NEW_REF failed AND the rollback did not restore a healthy resolver. MANUAL INTERVENTION REQUIRED on this server."
+  fi
+  exit 1   # no Healthchecks ping → alert
+}
+
+log "swapping production (brief restart)"
+docker compose -f "$COMPOSE_FILE" up -d "$SERVICE" >/dev/null
+wait_healthy "$SERVICE"      || rollback
+validate_resolver 127.0.0.1  || rollback
+
+VERSION=$(docker exec "$SERVICE" /usr/local/sbin/unbound -V 2>/dev/null | head -1 || true)
+log "production updated and verified: $NEW_REF ($VERSION)"
+notify "updated successfully" "Production was updated to $NEW_REF and passed all post-deployment checks. $VERSION"
+docker image prune -f >/dev/null 2>&1 || true
+ping_hc
+exit 0

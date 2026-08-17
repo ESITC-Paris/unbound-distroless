@@ -100,3 +100,9 @@ gh workflow run release.yml --repo ESITC-Paris/unbound-distroless \
 Only stable upstream versions are ever published: the version detector
 matches `release-X.Y.Z` tags exactly, so release candidates and pre-releases
 never trigger a build.
+
+## Automatic server-side updates
+
+Production servers keep themselves current with the same rigor as the
+publishing pipeline (cosign verification, canary with cloned state, health
+gates, automatic rollback): see [deploy/README.md](../deploy/README.md).

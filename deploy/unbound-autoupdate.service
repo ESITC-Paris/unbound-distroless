@@ -1,0 +1,9 @@
+[Unit]
+Description=Unbound container auto-update (canary, verify, swap, rollback)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/unbound-autoupdate

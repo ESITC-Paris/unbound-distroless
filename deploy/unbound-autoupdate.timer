@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly unbound container auto-update
+
+[Timer]
+# Stagger this minute per server (e.g. :45 on the first resolver, :55 on the
+# second) so two resolvers are never updating at the same time.
+OnCalendar=*-*-* *:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
