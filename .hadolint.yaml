@@ -1,0 +1,12 @@
+# Deliberate deviations, with rationale:
+ignored:
+  # DL3008 (pin apt versions): package versions are governed by the
+  # digest-pinned debian base (.build-state.json, updated by the monitor),
+  # not by apt pins that would go stale between base bumps.
+  - DL3008
+  # DL3003 (use WORKDIR instead of cd): the download/verify/configure/make
+  # chain is intentionally one layer with a cd into the versioned source dir.
+  - DL3003
+  # DL3066 (non-numeric USER): "nonroot" is the distroless convention; the
+  # structure test suite independently asserts UID 65532.
+  - DL3066

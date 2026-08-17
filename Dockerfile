@@ -11,14 +11,27 @@ FROM ${DEBIAN_BASE} AS build
 
 ARG UNBOUND_VERSION
 ARG UNBOUND_SHA256
+# Root data sources are overridable for mirrors/outages; the FTP fallbacks are
+# InterNIC's documented alternate service (see the header of named.cache).
+ARG ROOT_HINTS_URL=https://www.internic.net/domain/named.cache
+ARG ROOT_HINTS_URL_FALLBACK=ftp://ftp.internic.net/domain/named.cache
+ARG ROOT_ZONE_URL=https://www.internic.net/domain/root.zone
+ARG ROOT_ZONE_URL_FALLBACK=ftp://ftp.internic.net/domain/root.zone
 ENV DEBIAN_FRONTEND=noninteractive
+# Pipelines in RUN must fail on the first broken stage, not the last.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Cache mounts keep apt archives/lists out of the image layers and speed up
+# rebuilds; sharing=locked serialises the parallel amd64/arm64 builds.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+ && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
       build-essential curl ca-certificates \
       libevent-dev libssl-dev libexpat1-dev \
       libnghttp2-dev libhiredis-dev \
-      libcap2-bin \
-    && rm -rf /var/lib/apt/lists/*
+      libcap2-bin
 
 WORKDIR /build
 
@@ -46,7 +59,8 @@ RUN setcap 'cap_net_bind_service=+ep' /opt/unbound/sbin/unbound
 
 # Config, root hints, build-time validation.
 COPY unbound.conf /etc/unbound/unbound.conf
-RUN curl -fsSL -o /etc/unbound/root.hints https://www.internic.net/domain/named.cache
+RUN curl -fsSL --retry 3 --retry-delay 5 -o /etc/unbound/root.hints "$ROOT_HINTS_URL" \
+ || curl -fsSL --retry 3 --retry-delay 5 -o /etc/unbound/root.hints "$ROOT_HINTS_URL_FALLBACK"
 
 # Stage writable runtime dirs; generate the DNSSEC trust anchor fresh at build
 # (unbound-anchor exits 1 when it updates the anchor — that is success).
@@ -57,7 +71,8 @@ RUN curl -fsSL -o /etc/unbound/root.hints https://www.internic.net/domain/named.
 RUN mkdir -p /staging/var-lib-unbound /staging/run-unbound \
  && ( /opt/unbound/sbin/unbound-anchor -a /staging/var-lib-unbound/root.key -v || true ) \
  && test -s /staging/var-lib-unbound/root.key \
- && curl -fsSL -o /staging/var-lib-unbound/root.zone https://www.internic.net/domain/root.zone \
+ && ( curl -fsSL --retry 3 --retry-delay 5 -o /staging/var-lib-unbound/root.zone "$ROOT_ZONE_URL" \
+      || curl -fsSL --retry 3 --retry-delay 5 -o /staging/var-lib-unbound/root.zone "$ROOT_ZONE_URL_FALLBACK" ) \
  && head -1 /staging/var-lib-unbound/root.zone | grep -q 'IN.*SOA' \
  && chown -R 65532:65532 /staging/var-lib-unbound /staging/run-unbound \
  && ln -s /staging/var-lib-unbound /var/lib/unbound \

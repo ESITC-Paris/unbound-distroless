@@ -1,0 +1,13 @@
+# Automated PRs to keep the SHA-pinned GitHub Actions current. Dependabot
+# understands the `uses: <sha> # vX.Y.Z` convention and updates both parts.
+# PRs run through CI; a human merges.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Paris
+    labels: []

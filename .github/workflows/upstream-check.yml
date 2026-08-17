@@ -114,15 +114,14 @@ jobs:
 
           # Fail-closed OpenPGP verification, before the hash is recorded: a
           # recorded hash is a trusted-forever pin, so it must never be minted
-          # from an unverified download. The key comes from a keyserver that is
-          # independent of the download host (nlnetlabs.nl only as fallback) and
-          # its fingerprint is pinned above, so whoever serves the tarball cannot
-          # also serve the key that vouches for it.
+          # from an unverified download. The public key is vendored in the
+          # repository (.github/keys/) — no keyserver dependency, no network
+          # flake — and its fingerprint is pinned above, so whoever serves the
+          # tarball cannot also supply the key that vouches for it. (Note:
+          # keys.openpgp.org is NOT a viable fallback — it strips UIDs, which
+          # GnuPG refuses to import.)
           GNUPGHOME=$(mktemp -d); export GNUPGHOME; chmod 700 "$GNUPGHOME"
-          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/nlnetlabs.asc \
-            "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${UNBOUND_SIGNING_KEY}" \
-            || curl -fsSL --retry 3 --retry-delay 5 -o /tmp/nlnetlabs.asc https://nlnetlabs.nl/downloads/keys/releases-g2.asc
-          gpg --batch --import /tmp/nlnetlabs.asc
+          gpg --batch --import .github/keys/nlnetlabs-releases-g2.asc
           gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print $10}' \
             | grep -qx "$UNBOUND_SIGNING_KEY" \
             || { echo "::error::imported key is not the pinned NLnet Labs signing key"; exit 1; }
