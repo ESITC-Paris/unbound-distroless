@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   actions: write
+  issues: write
 
 concurrency:
   group: upstream-check
@@ -19,10 +20,13 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A hung network call must not hold the concurrency group for the default
+    # 6 hours: everything this job does normally completes in under a minute.
+    timeout-minutes: 15
     steps:
       # Pinned to a full commit SHA (trailing comment records the tag it came
       # from): this job pushes to main, tags, and dispatches the release.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Load current pins
         run: cat versions.env >> "$GITHUB_ENV"
@@ -33,9 +37,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Authenticated so the shared runner IP's 60 req/h anonymous quota can't
-          # flake the daily check. Release candidates (release-1.2.3rc1) are
-          # excluded by requiring the closing quote right after the patch number.
-          LATEST=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+          # flake the hourly check; retried so a transient 5xx can't either.
+          # Release candidates (release-1.2.3rc1) are excluded by requiring the
+          # closing quote right after the patch number.
+          LATEST=$(curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
+            -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/NLnetLabs/unbound/tags \
             | grep -oE '"name": *"release-[0-9]+\.[0-9]+\.[0-9]+"' \
             | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
@@ -46,8 +52,18 @@ jobs:
       - name: Check base image digests
         id: digests
         run: |
-          DEBIAN=$(docker buildx imagetools inspect debian:trixie --format '{{println .Manifest.Digest}}' | head -1)
-          DISTROLESS=$(docker buildx imagetools inspect gcr.io/distroless/base-debian13:nonroot --format '{{println .Manifest.Digest}}' | head -1)
+          # Registry reads are retried: Docker Hub and gcr.io occasionally
+          # rate-limit or hiccup, and a red run every time would be noise.
+          resolve() {
+            for _ in 1 2 3; do
+              D=$(docker buildx imagetools inspect "$1" --format '{{println .Manifest.Digest}}' 2>/dev/null | head -1)
+              [ -n "$D" ] && { echo "$D"; return 0; }
+              sleep 10
+            done
+            return 1
+          }
+          DEBIAN=$(resolve debian:trixie) || { echo "debian digest resolution failed"; exit 1; }
+          DISTROLESS=$(resolve gcr.io/distroless/base-debian13:nonroot) || { echo "distroless digest resolution failed"; exit 1; }
           # An empty digest would compare unequal to the stored one, triggering a
           # spurious revision release and then writing "" into .build-state.json —
           # which makes every subsequent run bump again. Fail loudly instead.
@@ -94,8 +110,8 @@ jobs:
           UNBOUND_SIGNING_KEY: 231018690C4D903EF419146AA144323DEAACDF45
         run: |
           BASE=https://nlnetlabs.nl/downloads/unbound
-          curl -fsSL -o /tmp/unbound.tar.gz     "$BASE/unbound-${LATEST}.tar.gz"
-          curl -fsSL -o /tmp/unbound.tar.gz.asc "$BASE/unbound-${LATEST}.tar.gz.asc"
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/unbound.tar.gz     "$BASE/unbound-${LATEST}.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/unbound.tar.gz.asc "$BASE/unbound-${LATEST}.tar.gz.asc"
 
           # Fail-closed OpenPGP verification, before the hash is recorded: a
           # recorded hash is a trusted-forever pin, so it must never be minted
@@ -104,9 +120,9 @@ jobs:
           # its fingerprint is pinned above, so whoever serves the tarball cannot
           # also serve the key that vouches for it.
           GNUPGHOME=$(mktemp -d); export GNUPGHOME; chmod 700 "$GNUPGHOME"
-          curl -fsSL -o /tmp/nlnetlabs.asc \
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/nlnetlabs.asc \
             "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${UNBOUND_SIGNING_KEY}" \
-            || curl -fsSL -o /tmp/nlnetlabs.asc https://nlnetlabs.nl/downloads/keys/releases-g2.asc
+            || curl -fsSL --retry 3 --retry-delay 5 -o /tmp/nlnetlabs.asc https://nlnetlabs.nl/downloads/keys/releases-g2.asc
           gpg --batch --import /tmp/nlnetlabs.asc
           gpg --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print $10}' \
             | grep -qx "$UNBOUND_SIGNING_KEY" \
@@ -119,7 +135,7 @@ jobs:
           # Cheap second opinion: upstream also publishes a .sha256 next to the
           # tarball. Disagreement means the two artefacts came from different
           # trees; refuse to pin either.
-          PUBLISHED=$(curl -fsSL "$BASE/unbound-${LATEST}.tar.gz.sha256" | tr -d '[:space:]')
+          PUBLISHED=$(curl -fsSL --retry 3 --retry-delay 5 "$BASE/unbound-${LATEST}.tar.gz.sha256" | tr -d '[:space:]')
           [ "$PUBLISHED" = "$SHA" ] \
             || { echo "::error::published .sha256 ($PUBLISHED) does not match the downloaded tarball ($SHA)"; exit 1; }
 
@@ -170,3 +186,43 @@ jobs:
           done
           echo "::error::release dispatch failed after 5 attempts — run manually: gh workflow run release.yml --ref $TAG -f tag=$TAG"
           exit 1
+
+      - name: Keep scheduled workflows alive
+        if: steps.decide.outputs.action == 'none'
+        run: |
+          # GitHub disables cron-scheduled workflows after 60 days without any
+          # repository activity. A quiet upstream (no Unbound release, no base
+          # update) for two months would silently kill this monitor — and with
+          # it, all future automatic security updates. An empty keepalive commit
+          # every ~45 quiet days prevents that.
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          AGE_DAYS=$(( (NOW - LAST) / 86400 ))
+          if [ "$AGE_DAYS" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: scheduler keepalive [skip ci]"
+            git push origin main
+            echo "keepalive commit pushed (last activity ${AGE_DAYS} days ago)"
+          else
+            echo "repo active ${AGE_DAYS} days ago — no keepalive needed"
+          fi
+
+      - name: Notify admin on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # One open issue per problem, assigned to the admin (guaranteed email /
+          # mobile notification). Repeated failures add comments to the same
+          # issue instead of flooding the tracker.
+          TITLE="Upstream check is failing"
+          NUM=$(gh issue list --state open --json number,title \
+            -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
+          BODY="The scheduled upstream check failed. Investigate: $RUN_URL"
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --assignee euca01 --body "$BODY"
+          fi

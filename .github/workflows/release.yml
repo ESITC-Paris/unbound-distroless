@@ -13,6 +13,7 @@ permissions:
   contents: write
   packages: write
   id-token: write
+  issues: write
 
 concurrency:
   group: release
@@ -67,7 +68,7 @@ jobs:
             echo "major=$MAJOR"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
@@ -100,7 +101,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
@@ -285,7 +286,7 @@ jobs:
           cosign sign --yes "${GHCR_IMAGE}@${DIGEST_GHCR}"
 
       - name: Checkout for Docker Hub description
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
@@ -329,3 +330,42 @@ jobs:
               --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.*' \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com
             ```
+
+      - name: Notify admin (release published)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DIGEST_HUB: ${{ steps.digest.outputs.hub }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Assigned issue = guaranteed email/mobile notification for the admin.
+          # Informational only — close it after reading.
+          gh issue create \
+            --title "Published $TAG" \
+            --assignee euca01 \
+            --body "$(printf 'Release %s was published automatically.\n\nImage: %s:%s\nDigest: %s\nRun: %s\n\nThis is a notification issue — close it after reading.' \
+              "$TAG" "$DOCKERHUB_IMAGE" "${TAG#v}" "$DIGEST_HUB" "$RUN_URL")"
+
+  notify-failure:
+    needs: [prepare, build, merge]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Notify admin (release failed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAW_TAG: ${{ needs.prepare.outputs.tag || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # One open issue per broken tag; repeats add comments instead of
+          # flooding the tracker.
+          TITLE="Release pipeline failed for $RAW_TAG"
+          NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title \
+            -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --assignee euca01 \
+              --body "$(printf 'The release pipeline failed — nothing was published.\n\nInvestigate: %s' "$RUN_URL")"
+          fi

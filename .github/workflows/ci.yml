@@ -13,11 +13,12 @@ permissions:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Every action is pinned to a full commit SHA (the trailing comment records
       # the tag that SHA was resolved from). A moving tag is a mutable dependency
       # that runs with the job's token; a SHA is not.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Load pinned versions
         run: cat versions.env >> "$GITHUB_ENV"
