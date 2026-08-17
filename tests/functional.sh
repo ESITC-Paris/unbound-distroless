@@ -88,7 +88,13 @@ CAPS=$(docker exec "$NAME" /usr/local/sbin/unbound -V)
 echo "$CAPS" | grep -q -- '--with-libnghttp2' || fail "unbound not built with libnghttp2 (DoH)"
 echo "$CAPS" | grep -q -- '--enable-cachedb' || fail "unbound not built with cachedb"
 echo "$CAPS" | grep -q -- '--with-libhiredis' || fail "unbound not built with libhiredis (Redis/Valkey)"
-pass "DoH + cachedb/Redis capabilities compiled in"
+# Inverse guard: the library harvest is ldd-based and cannot see dlopen()'d
+# objects. These modules load libraries at runtime via dlopen, so enabling
+# them without extending the harvest would ship an image that breaks only
+# when the feature is first used. Fail loudly here instead.
+echo "$CAPS" | grep -q -- '--with-pythonmodule' && fail "pythonmodule enabled but the ldd harvest cannot ship its dlopen deps" || true
+echo "$CAPS" | grep -q -- '--with-dynlibmodule' && fail "dynlibmodule enabled but the ldd harvest cannot ship its dlopen deps" || true
+pass "DoH + cachedb/Redis capabilities compiled in (dlopen-based modules confirmed off)"
 
 # 7b. Hyperlocal root zone (RFC 8806) is loaded with a real serial
 docker exec "$NAME" /usr/local/sbin/unbound-control -c /etc/unbound/unbound.conf list_auth_zones \

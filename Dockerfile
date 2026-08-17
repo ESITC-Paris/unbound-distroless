@@ -82,6 +82,14 @@ RUN mkdir -p /staging/var-lib-unbound /staging/run-unbound \
 # Harvest runtime shared libraries as SONAME-named regular files, plus their
 # dpkg metadata so vulnerability scanners can see them, plus the CA bundle.
 #
+# LIMITATION — ldd only sees link-time (DT_NEEDED) dependencies, never
+# libraries loaded at runtime via dlopen(). All currently enabled configure
+# options are link-time, and the functional gate enforces that the
+# dlopen-based ones stay off (see tests/functional.sh). If you ever enable
+# --with-pythonmodule, --with-dynlibmodule, or non-default OpenSSL
+# providers/engines, this harvest must be extended by hand with their
+# runtime-loaded objects — and the gate assertion relaxed deliberately.
+#
 # Everything lands in the multiarch triplet directory (e.g. lib/x86_64-linux-gnu/)
 # so that `COPY /deps/lib /usr/lib` in the runtime stage merges the harvest INTO
 # /usr/lib/<triplet>, replacing the distroless base's own copies as one coherent
