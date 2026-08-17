@@ -187,25 +187,31 @@ jobs:
           echo "::error::release dispatch failed after 5 attempts — run manually: gh workflow run release.yml --ref $TAG -f tag=$TAG"
           exit 1
 
-      - name: Keep scheduled workflows alive
+      - name: Warn before the scheduler auto-disables
         if: steps.decide.outputs.action == 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # GitHub disables cron-scheduled workflows after 60 days without any
-          # repository activity. A quiet upstream (no Unbound release, no base
-          # update) for two months would silently kill this monitor — and with
-          # it, all future automatic security updates. An empty keepalive commit
-          # every ~45 quiet days prevents that.
+          # repository activity. In practice every automatic release resets the
+          # clock (base images update every few weeks), so this should never
+          # fire — but if the repo does go quiet for 45+ days, warn the admin
+          # via an assigned issue instead of polluting history with an
+          # artificial commit. Any commit (or an external workflow_dispatch
+          # trigger, which is never subject to the 60-day rule) resets it.
           LAST=$(git log -1 --format=%ct)
           NOW=$(date +%s)
           AGE_DAYS=$(( (NOW - LAST) / 86400 ))
           if [ "$AGE_DAYS" -ge 45 ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit --allow-empty -m "chore: scheduler keepalive [skip ci]"
-            git push origin main
-            echo "keepalive commit pushed (last activity ${AGE_DAYS} days ago)"
+            TITLE="Scheduler will auto-disable soon — repo inactive ${AGE_DAYS} days"
+            NUM=$(gh issue list --state open --json number,title \
+              -q '.[] | select(.title | startswith("Scheduler will auto-disable")) | .number' | head -1)
+            if [ -z "$NUM" ]; then
+              gh issue create --title "$TITLE" --assignee euca01 --body \
+                "No repository activity for ${AGE_DAYS} days. GitHub disables cron-scheduled workflows at 60 days of inactivity, which would stop the automatic update monitor. Push any commit (or set up an external workflow_dispatch trigger) before then, and close this issue."
+            fi
           else
-            echo "repo active ${AGE_DAYS} days ago — no keepalive needed"
+            echo "repo active ${AGE_DAYS} days ago — scheduler safe"
           fi
 
       - name: Notify admin on failure
