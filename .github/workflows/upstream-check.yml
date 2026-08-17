@@ -1,11 +1,10 @@
 name: Upstream check
 
+# Triggered hourly by an external scheduler (cron on ESITC infrastructure —
+# see docs/operations.md) via the workflow_dispatch API. No GitHub `schedule`
+# trigger on purpose: external dispatch is exempt from GitHub's 60-day
+# inactivity auto-disable and is not subject to scheduler congestion delays.
 on:
-  schedule:
-    # Hourly at minute 17 (off-peak minute to avoid the top-of-hour GitHub
-    # scheduler congestion). A new upstream release or base-image update is
-    # therefore picked up within ~1 hour.
-    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -186,33 +185,6 @@ jobs:
           done
           echo "::error::release dispatch failed after 5 attempts — run manually: gh workflow run release.yml --ref $TAG -f tag=$TAG"
           exit 1
-
-      - name: Warn before the scheduler auto-disables
-        if: steps.decide.outputs.action == 'none'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # GitHub disables cron-scheduled workflows after 60 days without any
-          # repository activity. In practice every automatic release resets the
-          # clock (base images update every few weeks), so this should never
-          # fire — but if the repo does go quiet for 45+ days, warn the admin
-          # via an assigned issue instead of polluting history with an
-          # artificial commit. Any commit (or an external workflow_dispatch
-          # trigger, which is never subject to the 60-day rule) resets it.
-          LAST=$(git log -1 --format=%ct)
-          NOW=$(date +%s)
-          AGE_DAYS=$(( (NOW - LAST) / 86400 ))
-          if [ "$AGE_DAYS" -ge 45 ]; then
-            TITLE="Scheduler will auto-disable soon — repo inactive ${AGE_DAYS} days"
-            NUM=$(gh issue list --state open --json number,title \
-              -q '.[] | select(.title | startswith("Scheduler will auto-disable")) | .number' | head -1)
-            if [ -z "$NUM" ]; then
-              gh issue create --title "$TITLE" --assignee euca01 --body \
-                "No repository activity for ${AGE_DAYS} days. GitHub disables cron-scheduled workflows at 60 days of inactivity, which would stop the automatic update monitor. Push any commit (or set up an external workflow_dispatch trigger) before then, and close this issue."
-            fi
-          else
-            echo "repo active ${AGE_DAYS} days ago — scheduler safe"
-          fi
 
       - name: Notify admin on failure
         if: failure()

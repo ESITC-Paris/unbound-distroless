@@ -29,7 +29,8 @@ records the exact image digests with a ready-to-run verification command.
 
 ## Automatic updates
 
-A scheduled job checks **every hour** for:
+An update check runs **every hour** (triggered from ESITC-operated
+infrastructure — see [operations.md](operations.md)) and looks for:
 
 1. **New Unbound releases** (NLnet Labs) → new `X.Y.Z-r0` release
 2. **Updated base images** — the Debian build stage or the distroless runtime
