@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Lint tools run as digest-pinned container images (same immutability
       # policy as SHA-pinned actions).
@@ -32,7 +32,7 @@ jobs:
       # Every action is pinned to a full commit SHA (the trailing comment records
       # the tag that SHA was resolved from). A moving tag is a mutable dependency
       # that runs with the job's token; a SHA is not.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load pinned versions
         run: cat versions.env >> "$GITHUB_ENV"
