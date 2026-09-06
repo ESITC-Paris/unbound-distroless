@@ -109,8 +109,30 @@ t_config_fingerprint_handles_spaces() {
   pass "config_fingerprint hashes correctly and changes on edit under a path containing a space"
 }
 
+t_validate() {
+  local dir="$TEST_TMPDIR/upd-validate-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/validate.sh
+    discover_target
+    ip=$(target_probe_ip)
+    wait_resolver "$ip" 90    || { echo "readiness failed"; exit 1; }
+    validate_resolver "$ip"   || { echo "validation failed"; exit 1; }
+    validate_resolver 192.0.2.1 && { echo "dead address must not validate"; exit 1; }
+    echo OK') || fail "validation failed: $out"
+  grep -q '^OK$' <<<"$out" || fail "validate did not reach OK: $out"
+  pass "readiness probe and DNS criteria (UDP, TCP, AD flag); dead address rejected"
+}
+
 t0_image_sane
 t0_state_unit
 t_discover
 t_config_fingerprint_handles_spaces
+t_validate
 echo "ALL UPDATER TESTS PASSED"
