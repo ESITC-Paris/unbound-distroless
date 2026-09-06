@@ -130,9 +130,91 @@ t_validate() {
   pass "readiness probe and DNS criteria (UDP, TCP, AD flag); dead address rejected"
 }
 
+t4_invalid_conf_rejected() {
+  local dir="$TEST_TMPDIR/upd-t4-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  local before; before=$(running_ref "$dir")
+  printf 'server:\n  this-is-not-a-directive: 1\n' > "$dir/unbound.conf"
+  local out rc=0
+  out=$(updater_exec "$dir" /bin/bash -c '
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/canary.sh
+    discover_target
+    preflight_checkconf "$DECLARED_IMAGE_REF"' 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "preflight accepted an invalid configuration"
+  grep -qi 'unknown keyword\|error' <<<"$out" || fail "preflight did not surface unbound's own error: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "production container was touched by a failed preflight"
+  pass "T4: invalid configuration rejected in preflight, production untouched"
+}
+
+t5_healthcheck_breaking_conf() {
+  local dir="$TEST_TMPDIR/upd-t5-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  # The exact trap in this project's own unbound.conf.local: remote-control
+  # over TCP/TLS, whose key and certificate files are deliberately absent
+  # from the image.
+  cat >> "$dir/unbound.conf" <<'CONF'
+remote-control:
+  control-enable: yes
+  control-interface: 127.0.0.1
+  control-port: 8953
+  server-key-file: "/etc/unbound/unbound_server.key"
+  server-cert-file: "/etc/unbound/unbound_server.pem"
+  control-key-file: "/etc/unbound/unbound_control.key"
+  control-cert-file: "/etc/unbound/unbound_control.pem"
+CONF
+  local out rc=0 start elapsed
+  start=$(date -u +%s)
+  out=$(updater_exec "$dir" /bin/bash -c '
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/canary.sh
+    discover_target
+    preflight_checkconf "$DECLARED_IMAGE_REF"' 2>&1) || rc=$?
+  elapsed=$(( $(date -u +%s) - start ))
+  [ "$rc" -ne 0 ] || fail "preflight accepted a config whose control files do not exist"
+  grep -q 'unbound_server.key' <<<"$out" || fail "preflight did not name the missing file: $out"
+  [ "$elapsed" -lt 30 ] || fail "preflight took ${elapsed}s — it timed out instead of reporting precisely"
+  pass "T5: control-file trap reported precisely by checkconf, not as a timeout"
+}
+
+t_canary_lifecycle() {
+  local dir="$TEST_TMPDIR/upd-canary-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/validate.sh
+    . /usr/local/lib/unbound-autoupdate/canary.sh
+    discover_target
+    trap canary_down EXIT
+    canary_up "$DECLARED_IMAGE_REF"
+    wait_resolver "$CANARY_IP" 90
+    validate_resolver "$CANARY_IP"
+    echo OK') || fail "canary lifecycle failed: $out"
+  grep -q '^OK$' <<<"$out" || fail "canary did not validate: $out"
+  # Nothing must survive the run.
+  docker ps -a --format '{{.Names}}' | grep -q 'unbound-canary' && fail "canary container leaked"
+  docker volume ls --format '{{.Name}}'  | grep -q 'unbound-canary' && fail "canary volume leaked"
+  docker network ls --format '{{.Name}}' | grep -q 'unbound-canary' && fail "canary network leaked"
+  pass "canary starts on cloned state, validates, and leaves nothing behind"
+}
+
 t0_image_sane
 t0_state_unit
 t_discover
 t_config_fingerprint_handles_spaces
 t_validate
+t4_invalid_conf_rejected
+t5_healthcheck_breaking_conf
+t_canary_lifecycle
 echo "ALL UPDATER TESTS PASSED"
