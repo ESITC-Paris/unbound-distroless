@@ -253,14 +253,18 @@ t1b_moved_tag_update_actually_lands() {
   # production: the string stays "$MOVING_REF" and the TAG MOVES underneath
   # it. This is the scenario T1 cannot see, and the one that actually matters.
   local dir="$TEST_TMPDIR/upd-t1b-$$"
-  trap 'fixture_destroy "$dir"; docker pull -q "$MOVING_REF" >/dev/null 2>&1 || true' RETURN
+  trap 'fixture_destroy "$dir"' RETURN
 
   # Point $MOVING_REF's LOCAL tag at the older digest so the fixture starts
   # on it — without the compose file ever mentioning anything but
-  # "$MOVING_REF".
+  # "$MOVING_REF". retag_track (not this function's own RETURN trap) is what
+  # guarantees the host's real tag gets restored even if a setup assertion
+  # below trips: fail() calls `exit`, which skips a `trap ... RETURN`, but
+  # not the suite-wide EXIT-time reaper that consults _MOVED_TAGS.
   docker pull -q "$OLD_REF" >/dev/null
   local old_id; old_id=$(docker image inspect "$OLD_REF" --format '{{.Id}}')
   docker tag "$old_id" "$MOVING_REF"
+  retag_track "$MOVING_REF"
 
   fixture_create "$dir" "$MOVING_REF"
   local before; before=$(running_ref "$dir")

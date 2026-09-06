@@ -14,6 +14,18 @@ TEST_TMPDIR="${TEST_TMPDIR:-/tmp}"
 # poison every test that runs after it.
 declare -a _FIXTURE_DIRS=()
 
+# Every image reference a test has locally `docker tag`-ed to a digest other
+# than what the registry actually serves (to simulate a moved tag without
+# ever editing a compose file). Same reasoning as _FIXTURE_DIRS: fail()'s
+# `exit` skips a test's own `trap ... RETURN`, so a setup assertion tripping
+# between the `docker tag` and the test's own restore would otherwise leave
+# the HOST's real tag rewritten — outliving the test run entirely, since this
+# mutates a global Docker daemon-wide reference, not anything scoped to a
+# fixture. retag_track records it here instead of relying on the test's own
+# cleanup to run.
+declare -a _MOVED_TAGS=()
+retag_track() { _MOVED_TAGS+=("$1"); }
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 info() { echo "---- $*"; }
@@ -107,10 +119,16 @@ updater_run() {
 # with the original status: an EXIT trap's own exit status otherwise becomes
 # the script's, which would silently turn a passing run into a failing one
 # whenever the loop's last command (an already-cleaned-up fixture) is false.
+# Also restores every tag a test rewrote via retag_track, for the same
+# reason — this fires on EXIT, which fail()'s own `exit` cannot skip, unlike
+# a test's `trap ... RETURN`.
 _fixture_reap_leftovers() {
-  local status=$? d
+  local status=$? d ref
   for d in "${_FIXTURE_DIRS[@]:-}"; do
     [ -n "$d" ] && [ -d "$d" ] && fixture_destroy "$d"
+  done
+  for ref in "${_MOVED_TAGS[@]:-}"; do
+    [ -n "$ref" ] && docker pull -q "$ref" >/dev/null 2>&1 || true
   done
   exit "$status"
 }

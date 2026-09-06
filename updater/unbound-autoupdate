@@ -34,6 +34,11 @@ flock -n 9 || { log_info "another cycle is already running"; exit 2; }
 
 hc_start
 discover_target
+# Captured before anything else touches the service: whatever Compose does,
+# a genuine recreation always yields a brand new container ID. This is what
+# lets the post-swap gate detect "nothing happened" even on a config-only
+# change, where the image digest comparison alone is a tautology (see below).
+PRE_SWAP_CONTAINER="$TARGET_CONTAINER"
 
 RUNNING=$(running_digest)
 # Output captured rather than discarded: when this fails, the operator needs
@@ -87,9 +92,15 @@ fi
 # digest: a config-only failure has no image worth quarantining (the image
 # never changed and is still good), so without this axis the cycle would
 # either quarantine the wrong thing or retry — and break DNS — every hour.
-# Only relevant when the image itself is unchanged: a mixed image+config
-# failure is already gated above via the image's own quarantine.
-if [ "$image_changed" = 0 ] && [ "$conf_changed" = 1 ] && config_quarantine_active "$CONF_HASH"; then
+# Checked independently of image_changed (NOT only when the image is
+# unchanged): a mixed image+config failure quarantines BOTH axes on the way
+# out (below), and this fingerprint match is what makes that write side mean
+# something — otherwise, the moment the image's own quarantine window lapses
+# or a new digest is published, the cycle would retry with the SAME still-
+# broken configuration and re-break DNS. A different (edited) configuration
+# always gets a fresh attempt regardless of what the image is doing, exactly
+# as a different image digest does on its own axis.
+if [ "$conf_changed" = 1 ] && config_quarantine_active "$CONF_HASH"; then
   log_warn "configuration $CONF_HASH is quarantined after a failed deployment — not retrying yet"
   notify skipped "update skipped (quarantine)" "The current configuration (fingerprint $CONF_HASH) previously failed its post-swap validation and was rolled back; the image is unaffected and unchanged. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until the configuration is edited again."
   hc_fail "quarantined configuration"
@@ -173,13 +184,22 @@ if [ "$swap_ok" = 1 ]; then
   # makes this test false instead of exiting the script mid-way with no
   # rollback and no notification.
   #
-  # The running_digest comparison is the load-bearing check: Compose
-  # returning 0 is not proof the swap happened. If Compose ever declines to
-  # recreate the container (a stale config hash, an unexpected interaction
-  # between --no-deps and its diff logic, anything), the OLD container is
-  # still there, answers DNS perfectly, and the old bug this project exists
-  # to remove — "success" reported on an untouched image — comes right back.
+  # The running_digest comparison is the load-bearing check on the IMAGE
+  # path: Compose returning 0 is not proof the swap happened. If Compose
+  # ever declines to recreate the container (a stale config hash, an
+  # unexpected interaction between --no-deps and its diff logic, anything),
+  # the OLD container is still there, answers DNS perfectly, and the old bug
+  # this project exists to remove — "success" reported on an untouched image
+  # — comes right back.
+  #
+  # On a CONFIG-ONLY cycle, though, DECLARED == RUNNING, so the digest
+  # comparison alone is a tautology — it asserts nothing about whether
+  # --force-recreate actually fired. The container-id comparison closes that
+  # symmetrically: a genuine Compose recreation ALWAYS yields a new
+  # container id, on both the image path and the config-only path, so
+  # requiring it here covers the config door the digest check cannot see.
   if TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE") && [ -n "$TARGET_CONTAINER" ] \
+     && [ "$TARGET_CONTAINER" != "$PRE_SWAP_CONTAINER" ] \
      && [ "$(running_digest)" = "$DECLARED" ] \
      && probe=$(target_probe_ip) \
      && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
@@ -217,15 +237,16 @@ fi
 TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE" || true)
 unset COMPOSE_EXTRA_FILE
 
-# Quarantine the axis that actually failed: an unchanged image is never the
-# culprit in a config-only cycle, and quarantining it would both be wrong
-# and be silently ignored (the image quarantine check only ever runs when
-# image_changed=1).
-if [ "$image_changed" = 1 ]; then
-  quarantine_set "$DECLARED"
-else
-  config_quarantine_set "$CONF_HASH"
-fi
+# Quarantine every axis that actually changed for this cycle — independently,
+# not either/or: when both the image and the configuration changed together
+# and the deployment failed, either one could be the culprit (or both), and
+# quarantining only one leaves the cycle free to retry — and re-break DNS —
+# on the other the moment its own window lapses or its tag moves again. An
+# axis that did NOT change is never quarantined: quarantining an unchanged,
+# still-good image or configuration would be wrong, and would be silently
+# ignored anyway (both quarantine checks are gated on their own *_changed).
+[ "$image_changed" = 1 ] && quarantine_set "$DECLARED"
+[ "$conf_changed" = 1 ] && config_quarantine_set "$CONF_HASH"
 
 # The rollback override pins only the image reference — it cannot revert a
 # bind-mounted configuration file's CONTENTS. Whenever the configuration
