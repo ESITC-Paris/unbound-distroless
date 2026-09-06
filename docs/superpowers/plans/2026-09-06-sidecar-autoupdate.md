@@ -345,13 +345,13 @@ git commit -m "feat(updater): sidecar image skeleton with logging and state"
   - `TARGET_CONTAINER`, `TARGET_SERVICE`, `COMPOSE_PROJECT`, `COMPOSE_WORKDIR`
   - `COMPOSE_FILE_ARGS` (tableau bash `-f a -f b`)
   - `DECLARED_IMAGE_REF` — la référence écrite dans le compose file
-  - `DECLARED_CONF_MOUNTS` (tableau bash `-v src:dst:ro …`) — montages **déclarés** sous `/etc/unbound`
+  - `DECLARED_BIND_MOUNTS` (tableau bash `-v src:dst:ro …`) — montages **déclarés** sous `/etc/unbound`
   - `TARGET_STATE_VOLUME` — nom du volume monté sur `/var/lib/unbound`
 - Produces (fonctions) :
   - `compose <args…>` — invoque `docker compose` avec projet, `--project-directory` et `-f`, plus `$COMPOSE_EXTRA_FILE` si défini
   - `running_digest` — `repo@sha256:…` du conteneur en service
   - `declared_digest` — `repo@sha256:…` de l'image déclarée, après `compose pull`
-  - `config_fingerprint` — sha256 des contenus de `DECLARED_CONF_MOUNTS`
+  - `config_fingerprint` — sha256 des contenus de `DECLARED_BIND_MOUNTS`
   - `image_version_label <ref>` — valeur de `org.opencontainers.image.version`, vide si absente
   - `target_probe_ip` — IP à interroger pour la production (gère `network_mode: host`)
 
@@ -455,7 +455,7 @@ t_discover() {
     echo "workdir=$COMPOSE_WORKDIR"
     echo "declared=$DECLARED_IMAGE_REF"
     echo "volume=$TARGET_STATE_VOLUME"
-    echo "confmounts=${DECLARED_CONF_MOUNTS[*]}"
+    echo "confmounts=${DECLARED_BIND_MOUNTS[*]}"
     echo "fp=$(config_fingerprint)"
     echo "running=$(running_digest)"') || fail "discover_target failed: $out"
 
@@ -555,7 +555,7 @@ compose() {
   docker compose "${args[@]}" "$@"
 }
 
-# _read_declared — DECLARED_IMAGE_REF and DECLARED_CONF_MOUNTS, from the
+# _read_declared — DECLARED_IMAGE_REF and DECLARED_BIND_MOUNTS, from the
 # compose project itself rather than from the running container.
 _read_declared() {
   local cfg
@@ -564,12 +564,12 @@ _read_declared() {
   DECLARED_IMAGE_REF=$(jq -r --arg s "$TARGET_SERVICE" '.services[$s].image // empty' <<<"$cfg")
   [ -n "$DECLARED_IMAGE_REF" ] || log_die "service '$TARGET_SERVICE' declares no image"
 
-  DECLARED_CONF_MOUNTS=()
+  DECLARED_BIND_MOUNTS=()
   local src dst
   while IFS=$'\t' read -r src dst; do
     [ -n "$src" ] || continue
     [ -r "$src" ] || log_die "declared config file '$src' is not readable from inside the sidecar — it must be mounted read-only at the same absolute path"
-    DECLARED_CONF_MOUNTS+=(-v "$src:$dst:ro")
+    DECLARED_BIND_MOUNTS+=(-v "$src:$dst:ro")
   done < <(jq -r --arg s "$TARGET_SERVICE" '
       .services[$s].volumes // []
       | .[] | select(.type == "bind")
@@ -605,9 +605,9 @@ declared_digest() {
 config_fingerprint() {
   local src paths=()
   local i
-  for (( i = 0; i < ${#DECLARED_CONF_MOUNTS[@]}; i++ )); do
-    [ "${DECLARED_CONF_MOUNTS[$i]}" = "-v" ] || continue
-    src="${DECLARED_CONF_MOUNTS[$((i+1))]%%:*}"
+  for (( i = 0; i < ${#DECLARED_BIND_MOUNTS[@]}; i++ )); do
+    [ "${DECLARED_BIND_MOUNTS[$i]}" = "-v" ] || continue
+    src="${DECLARED_BIND_MOUNTS[$((i+1))]%%:*}"
     paths+=("$src")
   done
   if [ "${#paths[@]}" -eq 0 ]; then
@@ -903,7 +903,7 @@ _canary_names() {
 preflight_checkconf() {
   local ref="$1" out rc=0
   out=$(docker run --rm --entrypoint /usr/local/sbin/unbound-checkconf \
-        "${DECLARED_CONF_MOUNTS[@]}" "$ref" /etc/unbound/unbound.conf 2>&1) || rc=$?
+        "${DECLARED_BIND_MOUNTS[@]}" "$ref" /etc/unbound/unbound.conf 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
     log_error "preflight: the declared configuration is not valid for $ref"
     printf '%s\n' "$out" >&2
@@ -939,7 +939,7 @@ canary_up() {
 
   docker run -d --name "$CANARY_NAME" --network "$CANARY_NET" \
     --cap-drop=ALL --cap-add=NET_BIND_SERVICE --security-opt no-new-privileges \
-    -v "$CANARY_VOL":/var/lib/unbound "${DECLARED_CONF_MOUNTS[@]}" \
+    -v "$CANARY_VOL":/var/lib/unbound "${DECLARED_BIND_MOUNTS[@]}" \
     "$ref" >/dev/null \
     || { log_error "canary: container failed to start"; return 1; }
 
@@ -1203,7 +1203,11 @@ if [ "$swap_ok" = 1 ]; then
   TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE")
   if [ -n "$TARGET_CONTAINER" ]; then
     probe=$(target_probe_ip)
-    if wait_resolver "$probe" 90 && validate_resolver "$probe"; then
+    # 45s here, not the canary's 90s: the canary starts cold from a freshly
+    # cloned volume, production restarts warm on an existing one. A resolver
+    # silent for 45s after a swap is broken, and every extra second is broken
+    # DNS. A spurious rollback is itself safe — it restores the working image.
+    if wait_resolver "$probe" 45 && validate_resolver "$probe"; then
       state_set LAST_IMAGE_DIGEST "$DECLARED"
       state_set LAST_CONFIG_HASH "$CONF_HASH"
       quarantine_clear
@@ -1227,7 +1231,7 @@ unset COMPOSE_EXTRA_FILE
 quarantine_set "$DECLARED"
 
 if [ "$rollback_ok" = 1 ] && [ -n "$TARGET_CONTAINER" ] \
-   && probe=$(target_probe_ip) && wait_resolver "$probe" 90 && validate_resolver "$probe"; then
+   && probe=$(target_probe_ip) && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
   log_info "rollback successful — production restored on $RUNNING"
   notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.
 
@@ -1423,7 +1427,7 @@ Dans `updater/unbound-autoupdate`, remplacer la condition de succès post-swap :
 
 ```bash
     if [ "${_TEST_FORCE_POSTSWAP_FAIL:-0}" != 1 ] \
-       && wait_resolver "$probe" 90 && validate_resolver "$probe"; then
+       && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
 ```
 
 et ajouter juste au-dessus du bloc `# ── Rollback ──` :
@@ -1887,7 +1891,7 @@ git commit -m "docs(updater): user guide, compose snippet, and retire the host-s
 | §10 impact dépôt | Tasks 9 et 10 |
 | §11 prérequis | Ci-dessous |
 
-**Cohérence des noms** — `DECLARED_CONF_MOUNTS`, `TARGET_STATE_VOLUME`, `COMPOSE_FILE_ARGS`, `CANARY_IP`, `SELF_ID`, `SELF_IMAGE` sont définis en Task 2/4 et utilisés sous ces noms exacts ensuite. `to_seconds` est défini en Task 1 (`state.sh`) et consommé en Task 8 (`entrypoint.sh`), qui source bien `state.sh`.
+**Cohérence des noms** — `DECLARED_BIND_MOUNTS`, `TARGET_STATE_VOLUME`, `COMPOSE_FILE_ARGS`, `CANARY_IP`, `SELF_ID`, `SELF_IMAGE` sont définis en Task 2/4 et utilisés sous ces noms exacts ensuite. `to_seconds` est défini en Task 1 (`state.sh`) et consommé en Task 8 (`entrypoint.sh`), qui source bien `state.sh`.
 
 **Écart assumé** — trois digests d'images (`alpine`, `cosign`, `shellcheck-alpine`) sont résolus par une commande explicite au moment de l'implémentation plutôt qu'inscrits ici : une valeur inventée serait pire qu'une commande à exécuter.
 
