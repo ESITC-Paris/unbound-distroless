@@ -85,6 +85,21 @@ running_ref() {
   docker inspect "$cid" --format '{{.Image}}'
 }
 
+# OLD_REF is an immutable published revision; MOVING_REF is the tag users
+# actually track. A cycle must move the container from one to the other.
+OLD_REF="${OLD_REF:-esitcparis/unbound-distroless:1.26.0-r0}"
+MOVING_REF="${MOVING_REF:-esitcparis/unbound-distroless:1}"
+
+# updater_run <dir> [env=value…] — runs one cycle; echoes exit code on stdout.
+updater_run() {
+  local dir="$1"; shift
+  local envs=()
+  local kv; for kv in "$@"; do envs+=(-e "$kv"); done
+  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" \
+    -f "$dir/docker-compose.yml" exec -T "${envs[@]}" updater \
+    /usr/local/bin/unbound-autoupdate
+}
+
 # _fixture_reap_leftovers — safety net run at script exit. A fixture whose
 # test already tore it down via its own RETURN trap has no directory left,
 # so it is skipped here; anything still on disk (an aborted or failed test)

@@ -218,6 +218,55 @@ t_canary_lifecycle() {
   pass "canary starts on cloned state, validates, and leaves nothing behind"
 }
 
+t1_image_update_actually_lands() {
+  local dir="$TEST_TMPDIR/upd-t1-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$OLD_REF"
+  local before; before=$(running_ref "$dir")
+
+  # A new release appears: the declared tag now resolves to a newer digest.
+  fixture_set_image "$dir" "$MOVING_REF"
+  updater_run "$dir" || fail "cycle failed"
+
+  local after declared
+  after=$(running_ref "$dir")
+  docker pull -q "$MOVING_REF" >/dev/null
+  declared=$(docker image inspect "$MOVING_REF" --format '{{.Id}}')
+
+  [ "$after" != "$before" ] || fail "T1: the container is still on the old image — the swap was a no-op"
+  [ "$after" = "$declared" ] || fail "T1: running image ($after) is not the declared image ($declared)"
+  pass "T1: after a cycle the container really runs the declared image"
+}
+
+t2_noop_second_cycle() {
+  local dir="$TEST_TMPDIR/upd-t2-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "first cycle failed"
+  local cid_before cid_after
+  cid_before=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q unbound)
+  updater_run "$dir" >/dev/null || fail "second cycle failed"
+  cid_after=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q unbound)
+  [ "$cid_before" = "$cid_after" ] || fail "T2: an unchanged cycle recreated the container"
+  pass "T2: an unchanged cycle recreates nothing"
+}
+
+t3_config_change_triggers() {
+  local dir="$TEST_TMPDIR/upd-t3-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  local cid_before; cid_before=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q unbound)
+
+  # A harmless, valid configuration edit.
+  printf '\nserver:\n  cache-min-ttl: 120\n' >> "$dir/unbound.conf"
+  updater_run "$dir" || fail "config-change cycle failed"
+
+  local cid_after; cid_after=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q unbound)
+  [ "$cid_before" != "$cid_after" ] || fail "T3: editing the configuration did not redeploy"
+  pass "T3: a configuration change is canaried and deployed"
+}
+
 t0_image_sane
 t0_state_unit
 t_discover
@@ -226,4 +275,7 @@ t_validate
 t4_invalid_conf_rejected
 t5_healthcheck_breaking_conf
 t_canary_lifecycle
+t1_image_update_actually_lands
+t2_noop_second_cycle
+t3_config_change_triggers
 echo "ALL UPDATER TESTS PASSED"

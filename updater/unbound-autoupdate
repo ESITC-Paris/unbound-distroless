@@ -1,8 +1,174 @@
 #!/usr/bin/env bash
-# One-shot CLI invocation of the updater. Populated in a later task; Task 1
-# only ships the base image and the logging/state libraries.
+# One update cycle: discover → compare → verify → preflight → canary →
+# validate → swap → post-swap gate → rollback on failure.
+#
+# Exit 0 = up to date, or updated and verified.
+# Exit 1 = a human is needed (no Healthchecks success ping).
+# Exit 2 = deliberately skipped (quarantine, or a refused major bump).
 set -euo pipefail
 
-. /usr/local/lib/unbound-autoupdate/log.sh
+LIB=/usr/local/lib/unbound-autoupdate
+# shellcheck source=updater/lib/log.sh
+. "$LIB/log.sh"
+# shellcheck source=updater/lib/state.sh
+. "$LIB/state.sh"
+# shellcheck source=updater/lib/discover.sh
+. "$LIB/discover.sh"
+# shellcheck source=updater/lib/validate.sh
+. "$LIB/validate.sh"
+# shellcheck source=updater/lib/canary.sh
+. "$LIB/canary.sh"
 
-log_info "unbound-autoupdate: not yet implemented (skeleton image only)"
+WATCH_CONFIG="${WATCH_CONFIG:-1}"
+ALLOW_MAJOR="${ALLOW_MAJOR:-0}"
+CHECK_ONLY="${CHECK_ONLY:-0}"
+COSIGN_IDENTITY_REGEXP="${COSIGN_IDENTITY_REGEXP:-https://github.com/ESITC-Paris/unbound-distroless/.*}"
+COSIGN_ISSUER="${COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
+
+state_init
+exec 9>"$LOCK_FILE"
+flock -n 9 || { log_info "another cycle is already running"; exit 0; }
+
+hc_start
+discover_target
+
+RUNNING=$(running_digest)
+compose pull --quiet "$TARGET_SERVICE" >/dev/null 2>&1 \
+  || { log_error "docker compose pull failed"; hc_fail "pull failed"; exit 1; }
+DECLARED=$(declared_digest)
+CONF_HASH=$(config_fingerprint)
+LAST_CONF=$(state_get LAST_CONFIG_HASH)
+
+image_changed=0; conf_changed=0
+[ "$DECLARED" != "$RUNNING" ] && image_changed=1
+if [ "$WATCH_CONFIG" = 1 ] && [ -n "$LAST_CONF" ] && [ "$CONF_HASH" != "$LAST_CONF" ]; then
+  conf_changed=1
+fi
+
+# First ever run: record the baseline instead of canarying a system that is
+# already running fine. `check` mode is there for validating on demand.
+if [ -z "$LAST_CONF" ]; then
+  state_set LAST_CONFIG_HASH "$CONF_HASH"
+  state_set LAST_IMAGE_DIGEST "$RUNNING"
+  log_info "baseline recorded (image $RUNNING)"
+  notify baseline "baseline recorded" "The updater is now watching $TARGET_SERVICE in project $COMPOSE_PROJECT."
+fi
+
+if [ "$image_changed" = 0 ] && [ "$conf_changed" = 0 ] && [ "$CHECK_ONLY" != 1 ]; then
+  log_info "up to date ($RUNNING)"
+  hc_success
+  exit 0
+fi
+
+if [ "$image_changed" = 1 ] && quarantine_active "$DECLARED"; then
+  log_warn "image $DECLARED is quarantined after a failed deployment — not retrying yet"
+  notify skipped "update skipped (quarantine)" "Image $DECLARED previously failed its post-swap validation and was rolled back. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until a different image is published."
+  hc_fail "quarantined image"
+  exit 2
+fi
+
+if [ "$image_changed" = 1 ]; then
+  old_v=$(image_version_label "$RUNNING"); new_v=$(image_version_label "$DECLARED")
+  if [ -n "$old_v" ] && [ -n "$new_v" ] && [ "${old_v%%.*}" != "${new_v%%.*}" ] && [ "$ALLOW_MAJOR" != 1 ]; then
+    log_warn "major version bump $old_v -> $new_v refused (set ALLOW_MAJOR=1 to accept)"
+    notify skipped "major version bump not deployed" "The declared image moves Unbound from $old_v to $new_v. Major bumps are a deliberate human decision; set ALLOW_MAJOR=1 to allow them."
+    hc_fail "major bump refused"
+    exit 2
+  fi
+  [ -n "$old_v" ] && [ -n "$new_v" ] || log_warn "one of the images carries no version label — major-version guard skipped"
+
+  if ! cosign verify "$DECLARED" \
+        --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" \
+        --certificate-oidc-issuer "$COSIGN_ISSUER" >/dev/null 2>&1; then
+    log_error "cosign verification FAILED for $DECLARED — refusing to deploy"
+    notify blocked "signature verification FAILED" "Image $DECLARED is not signed by the expected release pipeline. Deployment refused; production untouched. Investigate immediately."
+    hc_fail "signature verification failed"
+    exit 1
+  fi
+  log_info "cosign signature verified for $DECLARED"
+fi
+
+if ! preflight_checkconf "$DECLARED"; then
+  notify blocked "configuration rejected in preflight" "The declared configuration is not valid for image $DECLARED. Production untouched. See the updater logs for unbound-checkconf's own message."
+  hc_fail "preflight failed"
+  exit 1
+fi
+
+trap canary_down EXIT
+if ! canary_up "$DECLARED"; then
+  notify blocked "canary could not start" "Image $DECLARED with the declared configuration failed to start in the canary. Production untouched."
+  canary_logs >&2
+  hc_fail "canary start failed"
+  exit 1
+fi
+if ! wait_resolver "$CANARY_IP" 90 || ! validate_resolver "$CANARY_IP"; then
+  log_error "canary validation FAILED — production untouched"
+  canary_logs >&2
+  notify blocked "canary rejected the update" "Image $DECLARED with the declared configuration and a clone of production state failed DNS validation. Production untouched; the cycle will retry."
+  hc_fail "canary validation failed"
+  exit 1
+fi
+log_info "canary validated: image, production state and configuration work together"
+canary_down
+trap - EXIT
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  log_info "check mode: everything validated, no swap performed"
+  hc_success
+  exit 0
+fi
+
+# Compose keys recreation on the service's config hash, which the CONTENTS of
+# a bind-mounted file do not affect. Without --force-recreate a config-only
+# change would be a silent no-op that still reported success — the exact
+# failure mode this project exists to remove.
+recreate=()
+[ "$image_changed" = 0 ] && recreate=(--force-recreate)
+
+log_info "swapping $TARGET_SERVICE (brief restart)"
+swap_ok=1
+compose up -d --no-deps "${recreate[@]}" "$TARGET_SERVICE" >/dev/null 2>&1 || swap_ok=0
+
+if [ "$swap_ok" = 1 ]; then
+  TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE")
+  if [ -n "$TARGET_CONTAINER" ]; then
+    probe=$(target_probe_ip)
+    # 45s here, not the canary's 90s: the canary starts cold from a freshly
+    # cloned volume, production restarts warm on an existing one. A resolver
+    # silent for 45s after a swap is broken, and every extra second is broken
+    # DNS. A spurious rollback is itself safe — it restores the working image.
+    if wait_resolver "$probe" 45 && validate_resolver "$probe"; then
+      state_set LAST_IMAGE_DIGEST "$DECLARED"
+      state_set LAST_CONFIG_HASH "$CONF_HASH"
+      quarantine_clear
+      version=$(image_version_label "$DECLARED")
+      log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
+      notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
+      hc_success
+      exit 0
+    fi
+  fi
+fi
+
+# ── Rollback ────────────────────────────────────────────────────────────────
+log_error "post-swap validation failed — rolling back to $RUNNING"
+COMPOSE_EXTRA_FILE="$STATE_DIR/rollback.yml"
+printf 'services:\n  %s:\n    image: %s\n' "$TARGET_SERVICE" "$RUNNING" > "$COMPOSE_EXTRA_FILE"
+rollback_ok=1
+compose up -d --no-deps "$TARGET_SERVICE" >/dev/null 2>&1 || rollback_ok=0
+TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE" || true)
+unset COMPOSE_EXTRA_FILE
+quarantine_set "$DECLARED"
+
+if [ "$rollback_ok" = 1 ] && [ -n "$TARGET_CONTAINER" ] \
+   && probe=$(target_probe_ip) && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
+  log_info "rollback successful — production restored on $RUNNING"
+  notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.
+
+WARNING: the compose file still declares the failing image. Running 'docker compose up -d' by hand would redeploy it. The updater will not retry before RETRY_AFTER=${RETRY_AFTER:-24h}."
+else
+  log_error "rollback did NOT restore a healthy resolver — MANUAL INTERVENTION REQUIRED"
+  notify critical "CRITICAL: rollback failed" "The swap to $DECLARED failed AND the rollback to $RUNNING did not restore a working resolver. DNS is likely down on this host. MANUAL INTERVENTION REQUIRED."
+fi
+hc_fail "post-swap validation failed"
+exit 1
