@@ -135,7 +135,11 @@ config_fingerprint() {
     printf '%s\n' "$(printf '' | sha256sum | cut -d' ' -f1)"
     return 0
   fi
-  printf '%s\n' "$(printf '%s\n' "${paths[@]}" | sort | xargs cat | sha256sum | cut -d' ' -f1)"
+  # NUL-delimited throughout: a declared path may contain spaces (a compose
+  # project can live anywhere on the host), and `sort`/`xargs`'s default
+  # whitespace splitting would silently hash the wrong files instead of
+  # failing loudly.
+  printf '%s\n' "$(printf '%s\0' "${paths[@]}" | sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1)"
 }
 
 image_version_label() {

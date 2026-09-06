@@ -77,7 +77,40 @@ t_discover() {
   pass "discovery derives service, workdir, declared ref, volume, conf mounts"
 }
 
+t_config_fingerprint_handles_spaces() {
+  # A compose project can live anywhere on the host, including under a path
+  # containing a space. config_fingerprint must hash the declared file
+  # correctly there too, rather than let sort/xargs's default whitespace
+  # splitting silently feed the wrong (or no) file to sha256sum.
+  local dir="$TEST_TMPDIR/upd discover space-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+
+  local discover_and_fingerprint='
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    discover_target
+    config_fingerprint'
+
+  local fp1 fp2
+  fp1=$(updater_exec "$dir" /bin/bash -c "$discover_and_fingerprint") \
+    || fail "discovery/fingerprint failed under a space-containing path: $fp1"
+  grep -qE '^[0-9a-f]{64}$' <<<"$fp1" || fail "fingerprint is not a real sha256 digest: $fp1"
+
+  # Perturb the declared config's content; the fingerprint must move.
+  echo '# comment added to change content-hash' >> "$dir/unbound.conf"
+  fp2=$(updater_exec "$dir" /bin/bash -c "$discover_and_fingerprint") \
+    || fail "discovery/fingerprint failed after editing config: $fp2"
+  grep -qE '^[0-9a-f]{64}$' <<<"$fp2" || fail "fingerprint is not a real sha256 digest: $fp2"
+
+  [ "$fp1" != "$fp2" ] || fail "fingerprint did not change after the config file's contents changed"
+  pass "config_fingerprint hashes correctly and changes on edit under a path containing a space"
+}
+
 t0_image_sane
 t0_state_unit
 t_discover
+t_config_fingerprint_handles_spaces
 echo "ALL UPDATER TESTS PASSED"
