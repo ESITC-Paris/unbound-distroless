@@ -6,6 +6,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 UPDATER_IMAGE="${UPDATER_IMAGE:-unbound-autoupdate:test}"
 TEST_TMPDIR="${TEST_TMPDIR:-/tmp}"
 
+REGISTRY_NAME="upd-test-registry"
+REGISTRY_HOST="127.0.0.1:5000"
+
 # Every fixture directory ever created, so a leftover one can be reaped at
 # script exit. This matters because fail() below calls `exit`, which skips
 # any `trap ... RETURN` a test registered on its own fixture: a `return`
@@ -29,6 +32,13 @@ retag_track() { _MOVED_TAGS+=("$1"); }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 info() { echo "---- $*"; }
+
+# _log_unescape — log.sh's _log renders its msg field through `printf '%q'`
+# (so an embedded newline can never split a structured log line), which
+# backslash-escapes every space. A test that greps captured output for a
+# guard's own multi-word message must undo that first, or a perfectly
+# correct, present message never matches a plain-English grep pattern.
+_log_unescape() { sed -E 's/\\(.)/\1/g'; }
 
 # fixture_create <dir> <image-ref> [host-udp-port] — writes a compose project
 # and starts it. When a port is given the resolver publishes it on loopback,
@@ -82,6 +92,42 @@ fixture_set_image() {
   rm -f "$1/docker-compose.yml.bak"
 }
 
+# fixture_set_image_raw <dir> <old-substring> <new-ref> — like
+# fixture_set_image, but matches on a caller-supplied substring instead of
+# the literal "unbound-distroless", so it also works on refs pointing at the
+# throwaway registry (registry_publish's crafted images).
+fixture_set_image_raw() {
+  sed -i.bak "s|^    image: .*$2.*|    image: $3|" "$1/docker-compose.yml"
+  rm -f "$1/docker-compose.yml.bak"
+}
+
+# registry_up — a throwaway registry so crafted images are genuinely pullable.
+# Without it `compose pull` fails first and the guard under test is never
+# reached (see T6/T8 below).
+registry_up() {
+  docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$REGISTRY_NAME" -p 127.0.0.1:5000:5000 \
+    registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 >/dev/null
+  local _i
+  for _i in $(seq 1 30); do
+    curl -fsS "http://$REGISTRY_HOST/v2/" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  fail "local registry never became ready"
+}
+
+registry_down() { docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true; }
+
+# registry_publish <dockerfile-text> <repo:tag> — builds and pushes, echoes
+# the ref. The repo name must contain "unbound", which discovery requires to
+# recognise the target service.
+registry_publish() {
+  local ref="$REGISTRY_HOST/$2"
+  printf '%s\n' "$1" | docker build -q -t "$ref" - >/dev/null
+  docker push -q "$ref" >/dev/null
+  printf '%s\n' "$ref"
+}
+
 # updater_exec <dir> <command…> — runs a command inside the fixture's sidecar.
 updater_exec() {
   local dir="$1"; shift
@@ -121,7 +167,10 @@ updater_run() {
 # whenever the loop's last command (an already-cleaned-up fixture) is false.
 # Also restores every tag a test rewrote via retag_track, for the same
 # reason — this fires on EXIT, which fail()'s own `exit` cannot skip, unlike
-# a test's `trap ... RETURN`.
+# a test's `trap ... RETURN`. And always tears down the throwaway registry:
+# a test that fails between registry_up and its own (skipped) RETURN trap
+# would otherwise leave it holding port 5000, breaking every subsequent run
+# on this machine. registry_down is a no-op if nothing was ever started.
 _fixture_reap_leftovers() {
   local status=$? d ref
   for d in "${_FIXTURE_DIRS[@]:-}"; do
@@ -130,6 +179,7 @@ _fixture_reap_leftovers() {
   for ref in "${_MOVED_TAGS[@]:-}"; do
     [ -n "$ref" ] && docker pull -q "$ref" >/dev/null 2>&1 || true
   done
+  registry_down
   exit "$status"
 }
 trap _fixture_reap_leftovers EXIT

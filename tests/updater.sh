@@ -226,6 +226,77 @@ t_canary_lifecycle() {
   pass "canary starts on cloned state, validates, and leaves nothing behind"
 }
 
+t6_unsigned_image_refused() {
+  local dir="$TEST_TMPDIR/upd-t6-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  # Same bits as a real release, but pushed to a registry we control and
+  # therefore never signed by the release pipeline. It must not reach production.
+  local fake
+  fake=$(registry_publish "FROM $MOVING_REF" "unbound-unsigned:1")
+
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  local before; before=$(running_ref "$dir")
+
+  fixture_set_image_raw "$dir" 'unbound-distroless' "$fake"
+  local rc=0 out
+  out=$(updater_run "$dir" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted"
+  # _log_unescape undoes log.sh's printf '%q' encoding of the msg field
+  # (which backslash-escapes every space) so this plain-English grep can
+  # match it.
+  grep -qi 'cosign verification FAILED' < <(_log_unescape <<<"$out") \
+    || fail "T6: the run failed, but not at the signature gate — the test proves nothing: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "T6: production changed despite a failed signature check"
+  pass "T6: unsigned image refused at the cosign gate, production untouched"
+}
+
+t8_major_bump_refused() {
+  local dir="$TEST_TMPDIR/upd-t8-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  # Same bits, relabelled as a new major. The guard reads the OCI version
+  # label rather than the tag, because a user tracking :latest has no major
+  # version anywhere in their compose file.
+  local fakemajor
+  fakemajor=$(registry_publish \
+    "FROM $MOVING_REF
+LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
+
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  local before; before=$(running_ref "$dir")
+
+  fixture_set_image_raw "$dir" 'unbound-distroless' "$fakemajor"
+  local rc=0 out
+  out=$(updater_run "$dir" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "T8: a major bump was deployed without ALLOW_MAJOR"
+  # See T6's comment: _log_unescape undoes log.sh's printf '%q' encoding.
+  grep -qi 'major version bump' < <(_log_unescape <<<"$out") \
+    || fail "T8: the run failed, but not at the major-version guard: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production moved to a new major version"
+
+  # And the guard is a guard, not a wall: ALLOW_MAJOR=1 lets the bump past
+  # the version guard. This test image is unsigned too, though (registry_up
+  # never signs anything it serves), and the cosign gate sits right after
+  # the major-version guard — deliberately, since there is no point
+  # verifying the signature of something already refused. So this half
+  # cannot reach a successful deployment: it dies one guard further in.
+  # Assert that precisely: the major-version message is gone and the
+  # cosign failure is what's left, per the brief's own note on this case.
+  rc=0
+  out=$(updater_run "$dir" ALLOW_MAJOR=1 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "T8: ALLOW_MAJOR=1 unexpectedly succeeded against an unsigned image"
+  local out_plain; out_plain=$(_log_unescape <<<"$out")
+  grep -qi 'major version bump' <<<"$out_plain" \
+    && fail "T8: ALLOW_MAJOR=1 was still refused at the major-version guard: $out"
+  grep -qi 'cosign verification FAILED' <<<"$out_plain" \
+    || fail "T8: ALLOW_MAJOR=1 failed, but not at the cosign gate: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production changed even though the bump was never actually deployed"
+  pass "T8: major bump refused by default; ALLOW_MAJOR=1 passes the version guard and is stopped only by the cosign gate"
+}
+
 t1_image_update_actually_lands() {
   local dir="$TEST_TMPDIR/upd-t1-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -325,4 +396,6 @@ t1_image_update_actually_lands
 t1b_moved_tag_update_actually_lands
 t2_noop_second_cycle
 t3_config_change_triggers
+t6_unsigned_image_refused
+t8_major_bump_refused
 echo "ALL UPDATER TESTS PASSED"
