@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# One-shot CLI invocation of the updater. Populated in a later task; Task 1
+# only ships the base image and the logging/state libraries.
+set -euo pipefail
+
+. /usr/local/lib/unbound-autoupdate/log.sh
+
+log_info "unbound-autoupdate: not yet implemented (skeleton image only)"
