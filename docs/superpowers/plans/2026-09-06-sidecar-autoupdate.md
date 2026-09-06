@@ -358,17 +358,20 @@ git commit -m "feat(updater): sidecar image skeleton with logging and state"
 - [ ] **Step 1: Étendre `tests/updater/lib.sh` avec la fabrique de fixtures**
 
 ```bash
-# fixture_create <dir> <image-ref> — writes a compose project and starts it.
+# fixture_create <dir> <image-ref> [host-udp-port] — writes a compose project
+# and starts it. When a port is given the resolver publishes it on loopback,
+# which is the one axis on which a canary and production genuinely differ.
 # The project dir is bind-mounted into the sidecar at the SAME absolute path,
 # which is what makes Compose's relative bind-mount resolution line up.
 fixture_create() {
-  local dir="$1" ref="$2"
+  local dir="$1" ref="$2" port="${3:-}" ports=""
+  [ -n "$port" ] && ports=$'\n    ports:\n      - "127.0.0.1:'"$port"$':53/udp"'
   mkdir -p "$dir"
   cp "$REPO_ROOT/unbound.conf" "$dir/unbound.conf"
   cat > "$dir/docker-compose.yml" <<YML
 services:
   unbound:
-    image: $ref
+    image: $ref$ports
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
     security_opt: ["no-new-privileges:true"]
@@ -782,7 +785,7 @@ git commit -m "feat(updater): shared DNS readiness and validation gate"
   - `preflight_checkconf <image_ref>` — 0 si la conf déclarée est valide pour cette image ; l'erreur d'Unbound est journalisée telle quelle
   - `canary_up <image_ref>` — positionne `CANARY_IP`
   - `canary_down` — idempotent, détache le sidecar du réseau
-  - Constantes : `CANARY_NAME`, `CANARY_VOL`, `CANARY_NET` dérivées de `$COMPOSE_PROJECT`
+  - `_canary_names` — dérive `CANARY_NAME`, `CANARY_VOL`, `CANARY_NET` de `$COMPOSE_PROJECT` **au moment de l'appel**, jamais au source
 
 - [ ] **Step 1: Écrire T4 et T5 (échouent)**
 
@@ -884,9 +887,14 @@ Attendu : `canary.sh: No such file or directory`.
 # production state, on an isolated bridge network. Production keeps serving
 # throughout and is never touched.
 
-CANARY_NAME="unbound-canary-${COMPOSE_PROJECT:-x}"
-CANARY_VOL="unbound-canary-vol-${COMPOSE_PROJECT:-x}"
-CANARY_NET="unbound-canary-net-${COMPOSE_PROJECT:-x}"
+# Names are derived at call time, not at source time: COMPOSE_PROJECT is set
+# by discover_target, which necessarily runs after this file is sourced.
+_canary_names() {
+  [ -n "${COMPOSE_PROJECT:-}" ] || log_die "canary: COMPOSE_PROJECT is unset — discover_target must run first"
+  CANARY_NAME="unbound-canary-$COMPOSE_PROJECT"
+  CANARY_VOL="unbound-canary-vol-$COMPOSE_PROJECT"
+  CANARY_NET="unbound-canary-net-$COMPOSE_PROJECT"
+}
 
 # preflight_checkconf <image_ref>
 # Runs the new image's own unbound-checkconf against the declared config.
@@ -906,6 +914,7 @@ preflight_checkconf() {
 }
 
 canary_down() {
+  _canary_names
   docker network disconnect -f "$CANARY_NET" "$SELF_ID" >/dev/null 2>&1 || true
   docker rm -f "$CANARY_NAME"      >/dev/null 2>&1 || true
   docker volume rm "$CANARY_VOL"   >/dev/null 2>&1 || true
@@ -915,6 +924,7 @@ canary_down() {
 # canary_up <image_ref> — sets CANARY_IP.
 canary_up() {
   local ref="$1"
+  _canary_names
   canary_down   # clear leftovers from an interrupted run
 
   docker network create "$CANARY_NET" >/dev/null || { log_error "canary: cannot create network"; return 1; }
@@ -944,7 +954,7 @@ canary_up() {
   return 0
 }
 
-canary_logs() { docker logs "$CANARY_NAME" 2>&1 | tail -20 || true; }
+canary_logs() { _canary_names; docker logs "$CANARY_NAME" 2>&1 | tail -20 || true; }
 ```
 
 - [ ] **Step 4: Reconstruire, relancer, vérifier T4, T5 et le cycle de vie**
@@ -1091,10 +1101,6 @@ flock -n 9 || { log_info "another cycle is already running"; exit 0; }
 
 hc_start
 discover_target
-# CANARY_* are derived from COMPOSE_PROJECT, which discovery has just set.
-CANARY_NAME="unbound-canary-$COMPOSE_PROJECT"
-CANARY_VOL="unbound-canary-vol-$COMPOSE_PROJECT"
-CANARY_NET="unbound-canary-net-$COMPOSE_PROJECT"
 
 RUNNING=$(running_digest)
 compose pull --quiet "$TARGET_SERVICE" >/dev/null 2>&1 \
@@ -1182,9 +1188,16 @@ if [ "$CHECK_ONLY" = 1 ]; then
   exit 0
 fi
 
+# Compose keys recreation on the service's config hash, which the CONTENTS of
+# a bind-mounted file do not affect. Without --force-recreate a config-only
+# change would be a silent no-op that still reported success — the exact
+# failure mode this project exists to remove.
+recreate=()
+[ "$image_changed" = 0 ] && recreate=(--force-recreate)
+
 log_info "swapping $TARGET_SERVICE (brief restart)"
 swap_ok=1
-compose up -d --no-deps "$TARGET_SERVICE" >/dev/null 2>&1 || swap_ok=0
+compose up -d --no-deps "${recreate[@]}" "$TARGET_SERVICE" >/dev/null 2>&1 || swap_ok=0
 
 if [ "$swap_ok" = 1 ]; then
   TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE")
@@ -1253,32 +1266,45 @@ git commit -m "feat(updater): cycle orchestrator with canary gate and rollback"
 - Consumes: l'orchestrateur de la Task 5.
 - Produces: aucun nouveau symbole. Cette tâche **vérifie** les garde-fous déjà écrits ; si un test échoue, c'est l'orchestrateur qui est corrigé.
 
-- [ ] **Step 1: Écrire T6 et T8**
+- [ ] **Step 1: Ajouter le registre jetable aux helpers**
+
+Les images fabriquées pour T6 et T8 doivent être **tirables**. Une image construite
+localement n'a pas de `RepoDigests` et `compose pull` échoue : le cycle s'arrêterait
+au pull et ni la barrière cosign ni le garde-fou de majeure ne seraient jamais
+atteints — les deux tests passeraient pour la mauvaise raison. On les publie donc
+dans un registre local jetable, que Docker traite comme non sécurisé d'office
+sur `127.0.0.1`.
+
+Dans `tests/updater/lib.sh` :
 
 ```bash
-t6_unsigned_image_refused() {
-  local dir="$TEST_TMPDIR/upd-t6-$$" fake="unbound-fake/unsigned:1"
-  trap 'fixture_destroy "$dir"; docker rmi -f "$fake" >/dev/null 2>&1 || true' RETURN
-  # A locally built image, never signed, presented under a repo name our
-  # discovery accepts. It must not reach production.
-  docker pull -q "$OLD_REF" >/dev/null
-  printf 'FROM %s\n' "$OLD_REF" | docker build -q -t "$fake" - >/dev/null
-  fixture_create "$dir" "$MOVING_REF"
-  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
-  local before; before=$(running_ref "$dir")
+REGISTRY_NAME="upd-test-registry"
+REGISTRY_HOST="127.0.0.1:5000"
 
-  fixture_set_image "$dir" "$fake"
-  local rc=0
-  updater_run "$dir" >/dev/null 2>&1 || rc=$?
-  [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted"
-  [ "$(running_ref "$dir")" = "$before" ] || fail "T6: production was changed despite a failed signature check"
-  pass "T6: unsigned image refused, production untouched"
+# registry_up — a throwaway registry so crafted images are genuinely pullable.
+# Without it `compose pull` fails first and the guard under test is never reached.
+registry_up() {
+  docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$REGISTRY_NAME" -p 127.0.0.1:5000:5000 \
+    registry:2 >/dev/null
+  local i
+  for i in $(seq 1 30); do
+    curl -fsS "http://$REGISTRY_HOST/v2/" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  fail "local registry never became ready"
 }
-```
 
-`fixture_set_image` cible la ligne contenant `unbound-distroless` ; pour T6, remplacer l'appel par un `sed` explicite sur `unbound-fake/unsigned:1`. Ajouter donc à `tests/updater/lib.sh` :
+registry_down() { docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true; }
 
-```bash
+# registry_publish <dockerfile-text> <repo:tag> — builds and pushes, echoes the ref.
+registry_publish() {
+  local ref="$REGISTRY_HOST/$2"
+  printf '%s\n' "$1" | docker build -q -t "$ref" - >/dev/null
+  docker push -q "$ref" >/dev/null
+  printf '%s\n' "$ref"
+}
+
 # fixture_set_image_raw <dir> <old-substring> <new-ref>
 fixture_set_image_raw() {
   sed -i.bak "s|^    image: .*$2.*|    image: $3|" "$1/docker-compose.yml"
@@ -1286,49 +1312,92 @@ fixture_set_image_raw() {
 }
 ```
 
-et dans T6 utiliser `fixture_set_image_raw "$dir" 'unbound-distroless' "$fake"`.
+Le nom de dépôt contient `unbound`, ce que la découverte exige pour reconnaître
+le service cible.
 
-Une image locale n'a pas de `RepoDigests` : `declared_digest` s'arrête alors avec le message dédié, ce qui satisfait aussi l'assertion. Le test vérifie donc *l'un ou l'autre* des deux refus fail-closed — c'est le comportement attendu, pas un accident. Le journaliser explicitement :
-
-```bash
-  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" \
-    -f "$dir/docker-compose.yml" logs updater 2>&1 | tail -5
-```
+- [ ] **Step 2: Écrire T6 et T8**
 
 ```bash
-t8_major_bump_refused() {
-  local dir="$TEST_TMPDIR/upd-t8-$$" fakemajor="unbound-fake/major:2"
-  trap 'fixture_destroy "$dir"; docker rmi -f "$fakemajor" >/dev/null 2>&1 || true' RETURN
+t6_unsigned_image_refused() {
+  local dir="$TEST_TMPDIR/upd-t6-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  # Same bits as a real release, but pushed to a registry we control and
+  # therefore never signed by the release pipeline. It must not reach production.
+  local fake
+  fake=$(registry_publish "FROM $MOVING_REF" "unbound-unsigned:1")
+
   fixture_create "$dir" "$MOVING_REF"
   updater_run "$dir" >/dev/null || fail "baseline cycle failed"
   local before; before=$(running_ref "$dir")
 
-  # Same bits, relabelled as a new major. The guard reads the OCI version
-  # label, not the tag, because a user tracking :latest has no major in
-  # their compose file at all.
-  printf 'FROM %s\nLABEL org.opencontainers.image.version="2.0.0"\n' "$MOVING_REF" \
-    | docker build -q -t "$fakemajor" - >/dev/null
-  fixture_set_image_raw "$dir" 'unbound-distroless' "$fakemajor"
+  fixture_set_image_raw "$dir" 'unbound-distroless' "$fake"
+  local rc=0 out
+  out=$(updater_run "$dir" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted"
+  grep -qi 'cosign verification FAILED' <<<"$out" \
+    || fail "T6: the run failed, but not at the signature gate — the test proves nothing: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "T6: production changed despite a failed signature check"
+  pass "T6: unsigned image refused at the cosign gate, production untouched"
+}
 
-  local rc=0
-  updater_run "$dir" >/dev/null 2>&1 || rc=$?
+t8_major_bump_refused() {
+  local dir="$TEST_TMPDIR/upd-t8-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  # Same bits, relabelled as a new major. The guard reads the OCI version
+  # label rather than the tag, because a user tracking :latest has no major
+  # version anywhere in their compose file.
+  local fakemajor
+  fakemajor=$(registry_publish \
+    "FROM $MOVING_REF
+LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
+
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  local before; before=$(running_ref "$dir")
+
+  fixture_set_image_raw "$dir" 'unbound-distroless' "$fakemajor"
+  local rc=0 out
+  out=$(updater_run "$dir" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "T8: a major bump was deployed without ALLOW_MAJOR"
+  grep -qi 'major version bump' <<<"$out" \
+    || fail "T8: the run failed, but not at the major-version guard: $out"
   [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production moved to a new major version"
-  pass "T8: major version bump refused without ALLOW_MAJOR"
+
+  # And the guard is a guard, not a wall: ALLOW_MAJOR=1 lets it through.
+  rc=0
+  updater_run "$dir" ALLOW_MAJOR=1 >/dev/null 2>&1 || rc=$?
+  [ "$(running_ref "$dir")" != "$before" ] || fail "T8: ALLOW_MAJOR=1 did not permit the bump"
+  pass "T8: major bump refused by default, allowed with ALLOW_MAJOR=1"
 }
 ```
 
-- [ ] **Step 2: Lancer les tests**
+Chaque test exige que l'échec vienne **du garde-fou visé**, pas d'une erreur
+quelconque en amont : c'est ce qui distingue un test qui verrouille un
+comportement d'un test qui constate un code de retour non nul.
+
+Note : l'image de T8 n'est pas signée non plus, mais le refus de majeure
+précède la vérification cosign dans l'orchestrateur — c'est délibéré, il est
+inutile de vérifier la signature de ce qu'on refuse de déployer. La seconde
+moitié de T8 (`ALLOW_MAJOR=1`) échouera donc à la barrière cosign : l'assertion
+porte sur le fait que la production **n'a pas bougé** pour la première moitié
+et que le message a changé de garde-fou. Si l'implémenteur constate que
+`ALLOW_MAJOR=1` ne peut pas aboutir à un déploiement, il remplace cette
+assertion par : le journal ne contient plus `major version bump` et contient
+`cosign verification FAILED`.
+
+- [ ] **Step 3: Lancer les tests**
 
 ```bash
 bash tests/updater.sh
 ```
 
-- [ ] **Step 3: Si un test échoue, corriger l'orchestrateur, pas le test**
+- [ ] **Step 4: Si un test échoue, corriger l'orchestrateur, pas le test**
 
 Un échec ici signifie qu'un garde-fou est réellement absent ou mal ordonné. Vérifier notamment que la vérification cosign précède tout `docker run` de l'image, et que le refus de majeure précède la vérification de signature — inutile de vérifier ce qu'on refuse de déployer.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tests/
@@ -1370,28 +1439,27 @@ et ajouter juste au-dessus du bloc `# ── Rollback ──` :
 
 ```bash
 t7a_failed_swap_is_loud() {
-  local dir="$TEST_TMPDIR/upd-t7a-$$" blocker="upd-t7a-blocker-$$"
+  local dir="$TEST_TMPDIR/upd-t7a-$$" blocker="upd-t7a-blocker-$$" port=15353
   trap 'docker rm -f "$blocker" >/dev/null 2>&1 || true; fixture_destroy "$dir"' RETURN
-  fixture_create "$dir" "$OLD_REF"
+
+  # The resolver publishes a host port. Publishing is the ONE axis on which a
+  # canary and production genuinely differ, so it is the only way to stage an
+  # authentic canary-green / production-red failure — which is exactly the
+  # situation the post-swap gate exists for.
+  fixture_create "$dir" "$OLD_REF" "$port"
   updater_run "$dir" >/dev/null || fail "baseline cycle failed"
 
-  # Publish a host port on the resolver, then take that port with another
-  # container. `compose up -d` will stop the old container and fail to start
-  # the new one — an authentic environmental failure the canary cannot see,
-  # which is precisely why the post-swap gate exists.
-  sed -i.bak 's|^    volumes:|    ports:\n      - "15353:53/udp"\n    volumes:|' "$dir/docker-compose.yml"
-  rm -f "$dir/docker-compose.yml.bak"
-  updater_run "$dir" >/dev/null 2>&1 || true          # apply the port mapping
-  docker rm -f "$blocker" >/dev/null 2>&1 || true
-  fixture_set_image "$dir" "$MOVING_REF"
-  docker run -d --name "$blocker" -p 15353:53/udp --entrypoint /bin/sh \
+  # Take the port. `compose up -d` will stop the old container and fail to
+  # start the new one.
+  docker run -d --name "$blocker" -p "127.0.0.1:$port:53/udp" --entrypoint /bin/sh \
     "$UPDATER_IMAGE" -c 'sleep 300' >/dev/null
 
+  fixture_set_image "$dir" "$MOVING_REF"
   local rc=0 out
   out=$(updater_run "$dir" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "T7a: a failed swap reported success"
-  grep -qi 'MANUAL INTERVENTION REQUIRED\|rollback' <<<"$out" \
-    || fail "T7a: a failed swap did not produce a loud notification: $out"
+  grep -qi 'MANUAL INTERVENTION REQUIRED' <<<"$out" \
+    || fail "T7a: a swap that left no working resolver did not raise the critical notification: $out"
   pass "T7a: a swap blocked by the environment fails loudly instead of silently"
 }
 
@@ -1744,9 +1812,10 @@ Ajouter le service `unbound-autoupdate` **en commentaire**, avec une ligne expli
 git rm deploy/install.sh deploy/unbound-autoupdate deploy/unbound-autoupdate.service deploy/unbound-autoupdate.timer
 ```
 
-`deploy/README.md` devient :
+`deploy/README.md` devient le texte ci-dessous. Il contient lui-même un bloc de
+code : l'écrire directement dans le fichier, ne pas transcrire un bloc imbriqué.
 
-```markdown
+```
 # Moved: see `updater/`
 
 The host-side updater that used to live here has been removed. It was
