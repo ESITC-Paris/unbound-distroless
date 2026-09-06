@@ -4,7 +4,8 @@
 #
 # Exit 0 = up to date, or updated and verified.
 # Exit 1 = a human is needed (no Healthchecks success ping).
-# Exit 2 = deliberately skipped (quarantine, or a refused major bump).
+# Exit 2 = deliberately skipped (quarantine, a refused major bump, or a
+# concurrent cycle already holding the lock).
 set -euo pipefail
 
 LIB=/usr/local/lib/unbound-autoupdate
@@ -27,14 +28,23 @@ COSIGN_ISSUER="${COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 
 state_init
 exec 9>"$LOCK_FILE"
-flock -n 9 || { log_info "another cycle is already running"; exit 0; }
+# A concurrent cycle already holding the lock is a deliberate skip, not
+# "nothing to do" — it gets the same exit code as quarantine/major-bump.
+flock -n 9 || { log_info "another cycle is already running"; exit 2; }
 
 hc_start
 discover_target
 
 RUNNING=$(running_digest)
-compose pull --quiet "$TARGET_SERVICE" >/dev/null 2>&1 \
-  || { log_error "docker compose pull failed"; hc_fail "pull failed"; exit 1; }
+# Output captured rather than discarded: when this fails, the operator needs
+# docker compose's own error, not just "pull failed".
+pull_out=""
+if ! pull_out=$(compose pull --quiet "$TARGET_SERVICE" 2>&1); then
+  log_error "docker compose pull failed"
+  printf '%s\n' "$pull_out" >&2
+  hc_fail "pull failed"
+  exit 1
+fi
 DECLARED=$(declared_digest)
 CONF_HASH=$(config_fingerprint)
 LAST_CONF=$(state_get LAST_CONFIG_HASH)
@@ -47,8 +57,14 @@ fi
 
 # First ever run: record the baseline instead of canarying a system that is
 # already running fine. `check` mode is there for validating on demand.
+# conf_changed above was already computed against the PRIOR (empty) LAST_CONF,
+# so this baseline write cannot itself manufacture a spurious conf_changed=1.
 if [ -z "$LAST_CONF" ]; then
   state_set LAST_CONFIG_HASH "$CONF_HASH"
+  # LAST_IMAGE_DIGEST is an operator-facing breadcrumb in state.env (handy
+  # for a human inspecting it by hand) — no code path reads it back as a
+  # control input. LAST_CONFIG_HASH and the quarantine keys are what gate
+  # cycles; this key never is.
   state_set LAST_IMAGE_DIGEST "$RUNNING"
   log_info "baseline recorded (image $RUNNING)"
   notify baseline "baseline recorded" "The updater is now watching $TARGET_SERVICE in project $COMPOSE_PROJECT."
@@ -64,6 +80,19 @@ if [ "$image_changed" = 1 ] && quarantine_active "$DECLARED"; then
   log_warn "image $DECLARED is quarantined after a failed deployment — not retrying yet"
   notify skipped "update skipped (quarantine)" "Image $DECLARED previously failed its post-swap validation and was rolled back. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until a different image is published."
   hc_fail "quarantined image"
+  exit 2
+fi
+
+# Same mechanism, keyed on the configuration fingerprint instead of the image
+# digest: a config-only failure has no image worth quarantining (the image
+# never changed and is still good), so without this axis the cycle would
+# either quarantine the wrong thing or retry — and break DNS — every hour.
+# Only relevant when the image itself is unchanged: a mixed image+config
+# failure is already gated above via the image's own quarantine.
+if [ "$image_changed" = 0 ] && [ "$conf_changed" = 1 ] && config_quarantine_active "$CONF_HASH"; then
+  log_warn "configuration $CONF_HASH is quarantined after a failed deployment — not retrying yet"
+  notify skipped "update skipped (quarantine)" "The current configuration (fingerprint $CONF_HASH) previously failed its post-swap validation and was rolled back; the image is unaffected and unchanged. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until the configuration is edited again."
+  hc_fail "quarantined configuration"
   exit 2
 fi
 
@@ -127,27 +156,52 @@ recreate=()
 
 log_info "swapping $TARGET_SERVICE (brief restart)"
 swap_ok=1
-compose up -d --no-deps "${recreate[@]}" "$TARGET_SERVICE" >/dev/null 2>&1 || swap_ok=0
+swap_out=$(compose up -d --no-deps "${recreate[@]}" "$TARGET_SERVICE" 2>&1) || swap_ok=0
+if [ "$swap_ok" = 0 ]; then
+  log_error "docker compose up failed while swapping to $DECLARED"
+  printf '%s\n' "$swap_out" >&2
+fi
 
+post_swap_ok=0
 if [ "$swap_ok" = 1 ]; then
-  TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE")
-  if [ -n "$TARGET_CONTAINER" ]; then
-    probe=$(target_probe_ip)
+  # Every check below can fail (a service that never reappears, a probe
+  # address that cannot be determined) and must fall through to rollback
+  # rather than abort the whole script. Folding them into ONE `if` condition
+  # is what makes that safe: bash's `set -e` never fires for a command that
+  # is part of an if/while/until condition, so a bare assignment whose
+  # command substitution dies internally (target_probe_ip calls log_die) just
+  # makes this test false instead of exiting the script mid-way with no
+  # rollback and no notification.
+  #
+  # The running_digest comparison is the load-bearing check: Compose
+  # returning 0 is not proof the swap happened. If Compose ever declines to
+  # recreate the container (a stale config hash, an unexpected interaction
+  # between --no-deps and its diff logic, anything), the OLD container is
+  # still there, answers DNS perfectly, and the old bug this project exists
+  # to remove — "success" reported on an untouched image — comes right back.
+  if TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE") && [ -n "$TARGET_CONTAINER" ] \
+     && [ "$(running_digest)" = "$DECLARED" ] \
+     && probe=$(target_probe_ip) \
+     && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
     # 45s here, not the canary's 90s: the canary starts cold from a freshly
     # cloned volume, production restarts warm on an existing one. A resolver
-    # silent for 45s after a swap is broken, and every extra second is broken
-    # DNS. A spurious rollback is itself safe — it restores the working image.
-    if wait_resolver "$probe" 45 && validate_resolver "$probe"; then
-      state_set LAST_IMAGE_DIGEST "$DECLARED"
-      state_set LAST_CONFIG_HASH "$CONF_HASH"
-      quarantine_clear
-      version=$(image_version_label "$DECLARED")
-      log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
-      notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
-      hc_success
-      exit 0
-    fi
+    # silent for 45s after a swap is broken, and every extra second is
+    # broken DNS. A spurious rollback is itself safe — it restores the
+    # working image.
+    post_swap_ok=1
   fi
+fi
+
+if [ "$post_swap_ok" = 1 ]; then
+  state_set LAST_IMAGE_DIGEST "$DECLARED"
+  state_set LAST_CONFIG_HASH "$CONF_HASH"
+  quarantine_clear
+  config_quarantine_clear
+  version=$(image_version_label "$DECLARED")
+  log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
+  notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
+  hc_success
+  exit 0
 fi
 
 # ── Rollback ────────────────────────────────────────────────────────────────
@@ -155,20 +209,46 @@ log_error "post-swap validation failed — rolling back to $RUNNING"
 COMPOSE_EXTRA_FILE="$STATE_DIR/rollback.yml"
 printf 'services:\n  %s:\n    image: %s\n' "$TARGET_SERVICE" "$RUNNING" > "$COMPOSE_EXTRA_FILE"
 rollback_ok=1
-compose up -d --no-deps "$TARGET_SERVICE" >/dev/null 2>&1 || rollback_ok=0
+rollback_out=$(compose up -d --no-deps "$TARGET_SERVICE" 2>&1) || rollback_ok=0
+if [ "$rollback_ok" = 0 ]; then
+  log_error "docker compose up failed while rolling back to $RUNNING"
+  printf '%s\n' "$rollback_out" >&2
+fi
 TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE" || true)
 unset COMPOSE_EXTRA_FILE
-quarantine_set "$DECLARED"
+
+# Quarantine the axis that actually failed: an unchanged image is never the
+# culprit in a config-only cycle, and quarantining it would both be wrong
+# and be silently ignored (the image quarantine check only ever runs when
+# image_changed=1).
+if [ "$image_changed" = 1 ]; then
+  quarantine_set "$DECLARED"
+else
+  config_quarantine_set "$CONF_HASH"
+fi
+
+# The rollback override pins only the image reference — it cannot revert a
+# bind-mounted configuration file's CONTENTS. Whenever the configuration
+# changed, "restored" would be a lie: production comes back on the previous
+# image but keeps reading the current (possibly still broken) file from disk.
+config_note=""
+if [ "$conf_changed" = 1 ]; then
+  config_note=" NOTE: the bind-mounted configuration file was NOT reverted — only the image was pinned back. Production is recreated on the previous image but is still reading the CURRENT configuration on disk. A human must fix or revert that file."
+fi
 
 if [ "$rollback_ok" = 1 ] && [ -n "$TARGET_CONTAINER" ] \
    && probe=$(target_probe_ip) && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
-  log_info "rollback successful — production restored on $RUNNING"
-  notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.
+  if [ "$conf_changed" = 1 ]; then
+    log_info "rollback successful — production restored on $RUNNING (configuration NOT reverted)"
+  else
+    log_info "rollback successful — production restored on $RUNNING"
+  fi
+  notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.${config_note}
 
 WARNING: the compose file still declares the failing image. Running 'docker compose up -d' by hand would redeploy it. The updater will not retry before RETRY_AFTER=${RETRY_AFTER:-24h}."
 else
   log_error "rollback did NOT restore a healthy resolver — MANUAL INTERVENTION REQUIRED"
-  notify critical "CRITICAL: rollback failed" "The swap to $DECLARED failed AND the rollback to $RUNNING did not restore a working resolver. DNS is likely down on this host. MANUAL INTERVENTION REQUIRED."
+  notify critical "CRITICAL: rollback failed" "The swap to $DECLARED failed AND the rollback to $RUNNING did not restore a working resolver. DNS is likely down on this host.${config_note} MANUAL INTERVENTION REQUIRED."
 fi
 hc_fail "post-swap validation failed"
 exit 1

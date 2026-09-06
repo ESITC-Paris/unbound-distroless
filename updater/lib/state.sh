@@ -52,6 +52,34 @@ quarantine_active() {
   [ $(( now - ts )) -lt "$(to_seconds "${RETRY_AFTER:-24h}")" ]
 }
 
+# config_quarantine_{set,clear,active} — the same digest-quarantine mechanism
+# above, but keyed on the configuration fingerprint rather than the image
+# digest. A config-only redeploy that fails post-swap validation has NO image
+# digest worth quarantining (the image never changed), so without a separate
+# axis the orchestrator would either quarantine the still-good running image
+# (wrong, and never consulted anyway) or retry the same broken configuration
+# every cycle, breaking DNS on each attempt. Editing the file again (which
+# changes the fingerprint) always gets a fresh attempt, exactly like a newly
+# published image does on the digest axis.
+config_quarantine_set() {
+  state_set CONFIG_QUARANTINE_HASH "$1"
+  state_set CONFIG_QUARANTINE_TS "$(date -u +%s)"
+}
+
+config_quarantine_clear() {
+  state_set CONFIG_QUARANTINE_HASH ""
+  state_set CONFIG_QUARANTINE_TS ""
+}
+
+config_quarantine_active() {
+  local h ts now
+  h=$(state_get CONFIG_QUARANTINE_HASH)
+  [ -n "$h" ] && [ "$h" = "$1" ] || return 1
+  ts=$(state_get CONFIG_QUARANTINE_TS); [ -n "$ts" ] || return 1
+  now=$(date -u +%s)
+  [ $(( now - ts )) -lt "$(to_seconds "${RETRY_AFTER:-24h}")" ]
+}
+
 # to_seconds <duration> — 45s | 30m | 1h | 2d | bare integer (seconds).
 to_seconds() {
   local v="$1" n u

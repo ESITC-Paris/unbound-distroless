@@ -40,12 +40,20 @@ t0_state_unit() {
     quarantine_active "repo@sha256:ddd" && { echo "other digest must not be quarantined"; exit 1; }
     quarantine_clear
     quarantine_active "repo@sha256:ccc" && { echo "clear failed"; exit 1; }
+    # config_quarantine_* mirrors quarantine_* exactly, keyed on a
+    # configuration fingerprint instead of an image digest (I4).
+    config_quarantine_active "confhash1" && { echo "should not be config-quarantined"; exit 1; }
+    config_quarantine_set "confhash1"
+    config_quarantine_active "confhash1" || { echo "should be config-quarantined"; exit 1; }
+    config_quarantine_active "confhash2" && { echo "other fingerprint must not be config-quarantined"; exit 1; }
+    config_quarantine_clear
+    config_quarantine_active "confhash1" && { echo "config clear failed"; exit 1; }
     [ "$(to_seconds 45s)" = 45 ] && [ "$(to_seconds 30m)" = 1800 ] \
       && [ "$(to_seconds 1h)" = 3600 ] && [ "$(to_seconds 2d)" = 172800 ] \
       && [ "$(to_seconds 90)" = 90 ] || { echo "to_seconds failed"; exit 1; }
     echo OK') || fail "state unit failed: $out"
   [ "${out##*$'\n'}" = OK ] || fail "state unit did not print OK: $out"
-  pass "state, quarantine and to_seconds behave"
+  pass "state, quarantine, config-quarantine and to_seconds behave"
 }
 
 t_discover() {
@@ -238,6 +246,40 @@ t1_image_update_actually_lands() {
   pass "T1: after a cycle the container really runs the declared image"
 }
 
+t1b_moved_tag_update_actually_lands() {
+  # T1 rewrites the compose file's image STRING, which alone changes
+  # Compose's service config hash and guarantees recreation regardless of
+  # how Compose treats a moved tag. Nobody edits the compose file in
+  # production: the string stays "$MOVING_REF" and the TAG MOVES underneath
+  # it. This is the scenario T1 cannot see, and the one that actually matters.
+  local dir="$TEST_TMPDIR/upd-t1b-$$"
+  trap 'fixture_destroy "$dir"; docker pull -q "$MOVING_REF" >/dev/null 2>&1 || true' RETURN
+
+  # Point $MOVING_REF's LOCAL tag at the older digest so the fixture starts
+  # on it — without the compose file ever mentioning anything but
+  # "$MOVING_REF".
+  docker pull -q "$OLD_REF" >/dev/null
+  local old_id; old_id=$(docker image inspect "$OLD_REF" --format '{{.Id}}')
+  docker tag "$old_id" "$MOVING_REF"
+
+  fixture_create "$dir" "$MOVING_REF"
+  local before; before=$(running_ref "$dir")
+  [ "$before" = "$old_id" ] || fail "T1b setup: fixture did not start on the retagged old digest ($before != $old_id)"
+
+  # The registry now serves a newer digest under the SAME tag. The compose
+  # file is never touched.
+  updater_run "$dir" || fail "T1b: cycle failed"
+
+  local after declared
+  after=$(running_ref "$dir")
+  docker pull -q "$MOVING_REF" >/dev/null
+  declared=$(docker image inspect "$MOVING_REF" --format '{{.Id}}')
+
+  [ "$after" != "$before" ] || fail "T1b: the container is still on the old image — a moved tag with an untouched compose file was a no-op"
+  [ "$after" = "$declared" ] || fail "T1b: running image ($after) is not the declared image ($declared)"
+  pass "T1b: a moved tag lands even when the compose file itself is never edited"
+}
+
 t2_noop_second_cycle() {
   local dir="$TEST_TMPDIR/upd-t2-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -276,6 +318,7 @@ t4_invalid_conf_rejected
 t5_healthcheck_breaking_conf
 t_canary_lifecycle
 t1_image_update_actually_lands
+t1b_moved_tag_update_actually_lands
 t2_noop_second_cycle
 t3_config_change_triggers
 echo "ALL UPDATER TESTS PASSED"
