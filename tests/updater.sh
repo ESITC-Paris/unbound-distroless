@@ -243,10 +243,7 @@ t6_unsigned_image_refused() {
   local rc=0 out
   out=$(updater_run "$dir" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted"
-  # _log_unescape undoes log.sh's printf '%q' encoding of the msg field
-  # (which backslash-escapes every space) so this plain-English grep can
-  # match it.
-  grep -qi 'cosign verification FAILED' < <(_log_unescape <<<"$out") \
+  grep -qi 'cosign verification FAILED' <<<"$out" \
     || fail "T6: the run failed, but not at the signature gate — the test proves nothing: $out"
   [ "$(running_ref "$dir")" = "$before" ] || fail "T6: production changed despite a failed signature check"
   pass "T6: unsigned image refused at the cosign gate, production untouched"
@@ -272,8 +269,7 @@ LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
   local rc=0 out
   out=$(updater_run "$dir" 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "T8: a major bump was deployed without ALLOW_MAJOR"
-  # See T6's comment: _log_unescape undoes log.sh's printf '%q' encoding.
-  grep -qi 'major version bump' < <(_log_unescape <<<"$out") \
+  grep -qi 'major version bump' <<<"$out" \
     || fail "T8: the run failed, but not at the major-version guard: $out"
   [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production moved to a new major version"
 
@@ -288,10 +284,9 @@ LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
   rc=0
   out=$(updater_run "$dir" ALLOW_MAJOR=1 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "T8: ALLOW_MAJOR=1 unexpectedly succeeded against an unsigned image"
-  local out_plain; out_plain=$(_log_unescape <<<"$out")
-  grep -qi 'major version bump' <<<"$out_plain" \
+  grep -qi 'major version bump' <<<"$out" \
     && fail "T8: ALLOW_MAJOR=1 was still refused at the major-version guard: $out"
-  grep -qi 'cosign verification FAILED' <<<"$out_plain" \
+  grep -qi 'cosign verification FAILED' <<<"$out" \
     || fail "T8: ALLOW_MAJOR=1 failed, but not at the cosign gate: $out"
   [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production changed even though the bump was never actually deployed"
   pass "T8: major bump refused by default; ALLOW_MAJOR=1 passes the version guard and is stopped only by the cosign gate"
@@ -384,6 +379,156 @@ t3_config_change_triggers() {
   pass "T3: a configuration change is canaried and deployed"
 }
 
+t7a_failed_swap_is_loud() {
+  local dir="$TEST_TMPDIR/upd-t7a-$$" blocker="upd-t7a-blocker-$$" port=15353
+  # blocker_track (not just this trap) guarantees the port-holder dies even
+  # if a setup assertion below calls fail(): fail()'s `exit` skips this
+  # RETURN trap, and this test occupies a real DNS port on the host for its
+  # duration — a container left holding it breaks every later run, on this
+  # suite or any other, that needs that port.
+  trap 'docker rm -f "$blocker" >/dev/null 2>&1 || true; fixture_destroy "$dir"' RETURN
+
+  # An authentic canary-green / production-red failure. Publishing a host
+  # port is the ONE axis on which a canary and production genuinely differ
+  # — the canary never publishes one — so it is the only way to stage a swap
+  # failure a green canary cannot predict. Nothing here is simulated: the
+  # canary really passes, `compose up -d` really fails, and it fails for a
+  # reason the updater had no way to see coming.
+  #
+  # The port is published only by the UPDATE (added below, alongside the
+  # image bump, exactly as an operator would publish a port in the same edit
+  # that ships a new release), and the blocker takes it BEFORE the cycle
+  # starts, while it is still genuinely free. That ordering is what makes the
+  # conflict deterministic, and it cannot be done the other way round: a
+  # resolver publishing the port from the start holds it until the swap stops
+  # it, and Docker refuses any overlapping publish in the meantime (a
+  # wildcard bind conflicts with an existing loopback one), so the port could
+  # only be stolen inside `compose up -d`'s own stop-old/start-new window.
+  # That is a race, and an earlier revision of this test lost it reliably.
+  fixture_create "$dir" "$OLD_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+
+  docker run -d --name "$blocker" -p "127.0.0.1:${port}:53/udp" --entrypoint /bin/sh \
+    "$UPDATER_IMAGE" -c 'sleep 3600' >/dev/null || fail "T7a setup: could not take the port"
+  blocker_track "$blocker"
+
+  fixture_set_image "$dir" "$MOVING_REF"
+  # Anchored on the (now updated) image line, which — unlike the volumes: key
+  # — is unique to the unbound service, so the updater's own block is left
+  # alone.
+  sed -i.bak "s|^    image: .*unbound-distroless.*|&\\
+    ports:\\
+      - \"127.0.0.1:${port}:53/udp\"|" "$dir/docker-compose.yml"
+  rm -f "$dir/docker-compose.yml.bak"
+
+  local rc=0 out
+  out=$(updater_run "$dir" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "T7a: a failed swap reported success"
+  # The cycle must have died AT THE SWAP, on the conflict this test staged —
+  # not at some earlier gate, which would leave everything below proving
+  # nothing whatsoever about the swap path.
+  grep -q 'docker compose up failed while swapping' <<<"$out" \
+    || fail "T7a: the cycle failed, but not at the swap — the test proves nothing: $out"
+  grep -q 'port is already allocated' <<<"$out" \
+    || fail "T7a: the swap failed for some reason other than the staged port conflict: $out"
+
+  # Whatever the recovery manages to achieve, production must never be left
+  # running the image whose swap just failed.
+  local declared after
+  docker pull -q "$MOVING_REF" >/dev/null
+  declared=$(docker image inspect "$MOVING_REF" --format '{{.Id}}')
+  after=$(running_ref "$dir" 2>/dev/null || true)
+  [ "$after" != "$declared" ] || fail "T7a: production is running the image whose swap failed"
+
+  # The rollback cannot bind the port either — the compose file still
+  # declares it and the blocker still holds it — so this cycle ends with
+  # nothing serving DNS at all. That is exactly what the critical branch is
+  # for, and reaching it is the point of this test: a swap that leaves no
+  # working resolver has to say so, in the loudest terms available.
+  #
+  # This assertion is also the regression guard for the compose-file-list bug
+  # this test found. While COMPOSE_FILE_ARGS was silently empty, the rollback
+  # ran with the override as its ONLY -f, so it recreated production from a
+  # bare `image:` definition — no published port, and therefore nothing to
+  # conflict with. It started happily and the cycle reported "rollback
+  # successful", with production quietly stripped of its state volume, its
+  # configuration and its capability limits. If that ever comes back, this
+  # grep fails.
+  grep -q 'MANUAL INTERVENTION REQUIRED' <<<"$out" \
+    || fail "T7a: a swap that left no working resolver did not raise the critical notification: $out"
+  pass "T7a: a swap blocked by the environment fails loudly instead of silently"
+}
+
+t7b_rollback_restores_previous_digest() {
+  local dir="$TEST_TMPDIR/upd-t7b-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$OLD_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  local before; before=$(running_ref "$dir")
+
+  fixture_set_image "$dir" "$MOVING_REF"
+  local rc=0 out1
+  out1=$(updater_run "$dir" _TEST_FORCE_POSTSWAP_FAIL=1 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "T7b: a forced post-swap failure reported success"
+  # Without this, every assertion below passes vacuously whenever the cycle
+  # dies BEFORE the swap: production is then untouched, so it trivially still
+  # runs the previous digest with its mounts intact and a working resolver,
+  # and nothing has been proved about the rollback at all.
+  grep -q 'post-swap validation failed — rolling back' <<<"$out1" \
+    || fail "T7b: the forced cycle never reached the rollback — nothing below would prove anything: $out1"
+
+  local after; after=$(running_ref "$dir")
+  [ "$after" = "$before" ] || fail "T7b: rollback did not restore the previous image ($after != $before)"
+
+  # Restoring the previous image is only half of it: the rest of the service
+  # definition has to survive too. This is the direct regression guard for the
+  # compose-file-list bug — the rollback override must be merged ON TOP of the
+  # project's own compose file, never used as a replacement for it. When it
+  # was used as a replacement, production came back from a bare `image:`
+  # definition: no state volume (so the DNSSEC trust anchor was gone) and no
+  # bind-mounted unbound.conf (so it silently served the image's built-in
+  # defaults instead of the operator's configuration) — and the cycle still
+  # called that "rollback successful".
+  local mounts
+  mounts=$(docker inspect "$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" \
+           -f "$dir/docker-compose.yml" ps -q unbound)" --format '{{range .Mounts}}{{.Destination}} {{end}}')
+  grep -q '/var/lib/unbound' <<<"$mounts" \
+    || fail "T7b: the rolled-back container lost its named state volume: [$mounts]"
+  grep -q '/etc/unbound/unbound.conf' <<<"$mounts" \
+    || fail "T7b: the rolled-back container lost its bind-mounted configuration: [$mounts]"
+
+  # And the resolver still works after the rollback.
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c '
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/validate.sh
+    discover_target
+    ip=$(target_probe_ip)
+    wait_resolver "$ip" 90 && validate_resolver "$ip" && echo OK') || fail "resolver broken after rollback: $out"
+  grep -q '^OK$' <<<"$out" || fail "T7b: resolver does not validate after rollback: $out"
+
+  # The failing digest must now be quarantined: the next cycle must refuse it
+  # DELIBERATELY. Asserting only that the container was not recreated is not
+  # enough — anything that stops a cycle short satisfies that, including a
+  # crash, so the assertion has to name the reason. It caught two real bugs
+  # this way: an unchanged container id alone passed happily both while the
+  # rollback pin was leaking into the next cycle's compose file list (making
+  # every later cycle report "up to date" and never reach this check at all)
+  # and with quarantine_set deleted outright.
+  local cid_before cid_after rc2=0 out2
+  cid_before=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q unbound)
+  out2=$(updater_run "$dir" 2>&1) || rc2=$?
+  [ "$rc2" -eq 2 ] \
+    || fail "T7b: the cycle after a rollback did not deliberately skip (expected exit 2, got $rc2): $out2"
+  grep -q 'is quarantined after a failed deployment' <<<"$out2" \
+    || fail "T7b: the cycle was skipped, but not by the quarantine: $out2"
+  cid_after=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q unbound)
+  [ "$cid_before" = "$cid_after" ] || fail "T7b: the quarantined image was retried immediately"
+  pass "T7b: rollback restores the previous digest, resolver validates, digest quarantined"
+}
+
 t0_image_sane
 t0_state_unit
 t_discover
@@ -398,4 +543,6 @@ t2_noop_second_cycle
 t3_config_change_triggers
 t6_unsigned_image_refused
 t8_major_bump_refused
+t7a_failed_swap_is_loud
+t7b_rollback_restores_previous_digest
 echo "ALL UPDATER TESTS PASSED"

@@ -198,7 +198,8 @@ if [ "$swap_ok" = 1 ]; then
   # symmetrically: a genuine Compose recreation ALWAYS yields a new
   # container id, on both the image path and the config-only path, so
   # requiring it here covers the config door the digest check cannot see.
-  if TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE") && [ -n "$TARGET_CONTAINER" ] \
+  if [ "${_TEST_FORCE_POSTSWAP_FAIL:-0}" != 1 ] \
+     && TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE") && [ -n "$TARGET_CONTAINER" ] \
      && [ "$TARGET_CONTAINER" != "$PRE_SWAP_CONTAINER" ] \
      && [ "$(running_digest)" = "$DECLARED" ] \
      && probe=$(target_probe_ip) \
@@ -224,9 +225,14 @@ if [ "$post_swap_ok" = 1 ]; then
   exit 0
 fi
 
+# _TEST_FORCE_POSTSWAP_FAIL exists so the integration suite can exercise the
+# rollback machinery deterministically. It short-circuits ONLY the post-swap
+# verdict: the override file, the digest pin, the re-validation and the
+# quarantine below are the real code paths.
+
 # ── Rollback ────────────────────────────────────────────────────────────────
 log_error "post-swap validation failed — rolling back to $RUNNING"
-COMPOSE_EXTRA_FILE="$STATE_DIR/rollback.yml"
+COMPOSE_EXTRA_FILE="$ROLLBACK_FILE"
 printf 'services:\n  %s:\n    image: %s\n' "$TARGET_SERVICE" "$RUNNING" > "$COMPOSE_EXTRA_FILE"
 rollback_ok=1
 rollback_out=$(compose up -d --no-deps "$TARGET_SERVICE" 2>&1) || rollback_ok=0

@@ -8,6 +8,11 @@ STATE_FILE="$STATE_DIR/state.env"
 # added in a later task); shellcheck cannot see that from this file alone.
 # shellcheck disable=SC2034
 LOCK_FILE="$STATE_DIR/lock"
+# The transient Compose override the rollback path writes. Named here rather
+# than inline at its one use site because discover.sh must also recognise it,
+# to keep it OUT of the discovered compose file list (see there).
+# shellcheck disable=SC2034
+ROLLBACK_FILE="$STATE_DIR/rollback.yml"
 
 state_init() {
   mkdir -p "$STATE_DIR"

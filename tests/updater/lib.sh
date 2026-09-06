@@ -29,32 +29,33 @@ declare -a _FIXTURE_DIRS=()
 declare -a _MOVED_TAGS=()
 retag_track() { _MOVED_TAGS+=("$1"); }
 
+# Every container name a test started purely to occupy a host port (T7a's
+# environmental "blocker"). Same reasoning as _FIXTURE_DIRS and _MOVED_TAGS:
+# fail()'s `exit` skips a test's own `trap ... RETURN`, and this specific
+# container holds a real DNS port on the host — a leftover one breaks every
+# later run that needs that port, not just the fixture that created it.
+declare -a _BLOCKER_CONTAINERS=()
+blocker_track() { _BLOCKER_CONTAINERS+=("$1"); }
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 info() { echo "---- $*"; }
 
-# _log_unescape — log.sh's _log renders its msg field through `printf '%q'`
-# (so an embedded newline can never split a structured log line), which
-# backslash-escapes every space. A test that greps captured output for a
-# guard's own multi-word message must undo that first, or a perfectly
-# correct, present message never matches a plain-English grep pattern.
-_log_unescape() { sed -E 's/\\(.)/\1/g'; }
-
-# fixture_create <dir> <image-ref> [host-udp-port] — writes a compose project
-# and starts it. When a port is given the resolver publishes it on loopback,
-# which is the one axis on which a canary and production genuinely differ.
+# fixture_create <dir> <image-ref> — writes a compose project and starts it.
 # The project dir is bind-mounted into the sidecar at the SAME absolute path,
 # which is what makes Compose's relative bind-mount resolution line up.
+# No port-publishing knob on purpose: T7a, the one test that needs a published
+# port, must add it at UPDATE time rather than at creation time (see there),
+# so a knob here would only ever be dead code.
 fixture_create() {
-  local dir="$1" ref="$2" port="${3:-}" ports=""
-  [ -n "$port" ] && ports=$'\n    ports:\n      - "127.0.0.1:'"$port"$':53/udp"'
+  local dir="$1" ref="$2"
   mkdir -p "$dir"
   _FIXTURE_DIRS+=("$dir")
   cp "$REPO_ROOT/unbound.conf" "$dir/unbound.conf"
   cat > "$dir/docker-compose.yml" <<YML
 services:
   unbound:
-    image: $ref$ports
+    image: $ref
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
     security_opt: ["no-new-privileges:true"]
@@ -171,6 +172,9 @@ updater_run() {
 # a test that fails between registry_up and its own (skipped) RETURN trap
 # would otherwise leave it holding port 5000, breaking every subsequent run
 # on this machine. registry_down is a no-op if nothing was ever started.
+# Also removes every container a test started purely to hold a host port
+# (T7a's blocker), for the same reason: a leftover one breaks every later
+# run that needs that port, not just the fixture that started it.
 _fixture_reap_leftovers() {
   local status=$? d ref
   for d in "${_FIXTURE_DIRS[@]:-}"; do
@@ -178,6 +182,9 @@ _fixture_reap_leftovers() {
   done
   for ref in "${_MOVED_TAGS[@]:-}"; do
     [ -n "$ref" ] && docker pull -q "$ref" >/dev/null 2>&1 || true
+  done
+  for ref in "${_BLOCKER_CONTAINERS[@]:-}"; do
+    [ -n "$ref" ] && docker rm -f "$ref" >/dev/null 2>&1 || true
   done
   registry_down
   exit "$status"

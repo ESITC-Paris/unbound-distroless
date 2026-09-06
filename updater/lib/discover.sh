@@ -57,13 +57,34 @@ discover_target() {
 
   COMPOSE_FILE_ARGS=()
   local f
+  # The trailing newline fed to this loop is load-bearing: `read` returns
+  # false on a final field that is not newline-terminated, so with a bare
+  # `printf '%s'` the body never ran at all and COMPOSE_FILE_ARGS stayed
+  # EMPTY for the usual single-file project. Every other call papered over
+  # that, because Compose then discovers docker-compose.yml from
+  # --project-directory on its own — but the rollback adds a second -f, and
+  # with no base file in the list the override became the ONLY compose file.
+  # Production was then recreated from a service definition consisting of
+  # nothing but `image:`: no state volume (losing the DNSSEC trust anchor),
+  # no bind-mounted unbound.conf (silently falling back to the image's
+  # built-in defaults), no cap_drop and no no-new-privileges — while the
+  # cycle still reported "rollback successful".
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     # Compose records relative paths when invoked with one; resolve against workdir.
     case "$f" in /*) : ;; *) f="$COMPOSE_WORKDIR/$f" ;; esac
+    # The updater's own rollback override is a transient artefact of ONE
+    # cycle, never part of the operator's project. Compose stamps the file
+    # list it was invoked with onto the container it creates, so the override
+    # used for a rollback comes back on the NEXT cycle's label — and re-pins
+    # the declared image to the digest that was rolled back to. The updater
+    # would then compare that pin against itself, report "up to date" on
+    # every subsequent cycle, and never update again or even reach the
+    # quarantine check: a silently frozen updater, green forever.
+    if [ "$f" = "${ROLLBACK_FILE:-}" ]; then continue; fi
     [ -r "$f" ] || log_die "compose file '$f' is not readable from inside the sidecar — mount the project directory read-only at the SAME absolute path"
     COMPOSE_FILE_ARGS+=(-f "$f")
-  done < <(printf '%s' "$files" | tr ',' '\n')
+  done < <(printf '%s\n' "$files" | tr ',' '\n')
 
   _read_declared
   _read_running_mounts
