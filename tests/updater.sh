@@ -48,6 +48,36 @@ t0_state_unit() {
   pass "state, quarantine and to_seconds behave"
 }
 
+t_discover() {
+  local dir="$TEST_TMPDIR/upd-discover-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    discover_target
+    echo "service=$TARGET_SERVICE"
+    echo "workdir=$COMPOSE_WORKDIR"
+    echo "declared=$DECLARED_IMAGE_REF"
+    echo "volume=$TARGET_STATE_VOLUME"
+    echo "confmounts=${DECLARED_CONF_MOUNTS[*]}"
+    echo "fp=$(config_fingerprint)"
+    echo "running=$(running_digest)"') || fail "discover_target failed: $out"
+
+  grep -q '^service=unbound$'                       <<<"$out" || fail "bad service: $out"
+  grep -q "^workdir=$dir\$"                         <<<"$out" || fail "bad workdir: $out"
+  grep -q '^declared=esitcparis/unbound-distroless:1$' <<<"$out" || fail "bad declared ref: $out"
+  grep -q '^volume=.*state$'                        <<<"$out" || fail "bad state volume: $out"
+  grep -q "confmounts=.*$dir/unbound.conf:/etc/unbound/unbound.conf" <<<"$out" || fail "conf mount not discovered: $out"
+  grep -qE '^fp=[0-9a-f]{64}$'                      <<<"$out" || fail "bad fingerprint: $out"
+  grep -qE '^running=esitcparis/unbound-distroless@sha256:[0-9a-f]{64}$' <<<"$out" || fail "bad running digest: $out"
+  pass "discovery derives service, workdir, declared ref, volume, conf mounts"
+}
+
 t0_image_sane
 t0_state_unit
+t_discover
 echo "ALL UPDATER TESTS PASSED"
