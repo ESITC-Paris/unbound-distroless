@@ -17,6 +17,54 @@ discover_self_id() {
 
 _label() { docker inspect "$1" --format "{{index .Config.Labels \"$2\"}}" 2>/dev/null; }
 
+# _compose_file_args <config-files-label> — turn Compose's
+# project.config_files label into this project's -f arguments, in order.
+# Split out of discover_target purely so it can be unit-tested directly
+# against synthetic label strings: the shapes that matter here (one file, two
+# files, a trailing separator, relative paths, the rollback override) are
+# cheap to assert in a bare container and would otherwise only ever be
+# covered indirectly, by slow integration tests that need a live registry.
+# Bug A lived here precisely because nothing asserted the result.
+_compose_file_args() {
+  local files="$1" f
+  # A hard failure, not a "${ROLLBACK_FILE:-}" fallback. If this is ever empty
+  # — state.sh sourced after this file, or STATE_DIR differing between cycles
+  # — the comparison below silently matches nothing and the rollback override
+  # walks straight back into the project definition, which is Bug B returning
+  # with no error at all. That class of regression has to be loud.
+  [ -n "${ROLLBACK_FILE:-}" ] || log_die "internal error: ROLLBACK_FILE is unset — state.sh must be sourced before discover.sh"
+
+  COMPOSE_FILE_ARGS=()
+  # The trailing newline fed to this loop is load-bearing: `read` returns
+  # false on a final field that is not newline-terminated, so with a bare
+  # `printf '%s'` the body never ran at all and COMPOSE_FILE_ARGS stayed
+  # EMPTY for the usual single-file project. Every other call papered over
+  # that, because Compose then discovers docker-compose.yml from
+  # --project-directory on its own — but the rollback adds a second -f, and
+  # with no base file in the list the override became the ONLY compose file.
+  # Production was then recreated from a service definition consisting of
+  # nothing but `image:`: no state volume (losing the DNSSEC trust anchor),
+  # no bind-mounted unbound.conf (silently falling back to the image's
+  # built-in defaults), no cap_drop and no no-new-privileges — while the
+  # cycle still reported "rollback successful".
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # Compose records relative paths when invoked with one; resolve against workdir.
+    case "$f" in /*) : ;; *) f="$COMPOSE_WORKDIR/$f" ;; esac
+    # The updater's own rollback override is a transient artefact of ONE
+    # cycle, never part of the operator's project. Compose stamps the file
+    # list it was invoked with onto the container it creates, so the override
+    # used for a rollback comes back on the NEXT cycle's label — and re-pins
+    # the declared image to the digest that was rolled back to. The updater
+    # would then compare that pin against itself, report "up to date" on
+    # every subsequent cycle, and never update again or even reach the
+    # quarantine check: a silently frozen updater, green forever.
+    if [ "$f" = "$ROLLBACK_FILE" ]; then continue; fi
+    [ -r "$f" ] || log_die "compose file '$f' is not readable from inside the sidecar — mount the project directory read-only at the SAME absolute path"
+    COMPOSE_FILE_ARGS+=(-f "$f")
+  done < <(printf '%s\n' "$files" | tr ',' '\n')
+}
+
 discover_target() {
   SELF_ID=$(discover_self_id) || log_die "cannot determine my own container id — is /var/run/docker.sock mounted?"
   # Produced for callers (target_probe_ip's network_mode: host check, and
@@ -55,36 +103,7 @@ discover_target() {
   local files; files=$(_label "$TARGET_CONTAINER" com.docker.compose.project.config_files)
   [ -n "$files" ] && [ -n "$COMPOSE_WORKDIR" ] || log_die "target container carries no compose file labels"
 
-  COMPOSE_FILE_ARGS=()
-  local f
-  # The trailing newline fed to this loop is load-bearing: `read` returns
-  # false on a final field that is not newline-terminated, so with a bare
-  # `printf '%s'` the body never ran at all and COMPOSE_FILE_ARGS stayed
-  # EMPTY for the usual single-file project. Every other call papered over
-  # that, because Compose then discovers docker-compose.yml from
-  # --project-directory on its own — but the rollback adds a second -f, and
-  # with no base file in the list the override became the ONLY compose file.
-  # Production was then recreated from a service definition consisting of
-  # nothing but `image:`: no state volume (losing the DNSSEC trust anchor),
-  # no bind-mounted unbound.conf (silently falling back to the image's
-  # built-in defaults), no cap_drop and no no-new-privileges — while the
-  # cycle still reported "rollback successful".
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    # Compose records relative paths when invoked with one; resolve against workdir.
-    case "$f" in /*) : ;; *) f="$COMPOSE_WORKDIR/$f" ;; esac
-    # The updater's own rollback override is a transient artefact of ONE
-    # cycle, never part of the operator's project. Compose stamps the file
-    # list it was invoked with onto the container it creates, so the override
-    # used for a rollback comes back on the NEXT cycle's label — and re-pins
-    # the declared image to the digest that was rolled back to. The updater
-    # would then compare that pin against itself, report "up to date" on
-    # every subsequent cycle, and never update again or even reach the
-    # quarantine check: a silently frozen updater, green forever.
-    if [ "$f" = "${ROLLBACK_FILE:-}" ]; then continue; fi
-    [ -r "$f" ] || log_die "compose file '$f' is not readable from inside the sidecar — mount the project directory read-only at the SAME absolute path"
-    COMPOSE_FILE_ARGS+=(-f "$f")
-  done < <(printf '%s\n' "$files" | tr ',' '\n')
+  _compose_file_args "$files"
 
   _read_declared
   _read_running_mounts

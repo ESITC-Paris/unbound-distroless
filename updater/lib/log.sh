@@ -7,6 +7,12 @@ _ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # backslash and double-quote (so the quoted value parses back unambiguously),
 # and a literal newline (so an embedded newline can never split one log line
 # into two). Anything else — including spaces — passes through unescaped.
+#
+# Carriage return and tab are deliberately left alone: this was considered,
+# and neither can split a logfmt line the way a newline does, so escaping
+# them would only make ordinary operator messages harder to read for no gain.
+# A lone \r could still confuse a terminal that honours it, but these lines
+# are written for log collectors and greps, not for cursor positioning.
 _logfmt_escape() {
   local v="$1"
   v="${v//\\/\\\\}"

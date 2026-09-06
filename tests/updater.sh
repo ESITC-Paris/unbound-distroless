@@ -56,6 +56,87 @@ t0_state_unit() {
   pass "state, quarantine, config-quarantine and to_seconds behave"
 }
 
+t0_logfmt_unit() {
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    # The point of the change: an ordinary operator message must arrive
+    # completely untouched. It used to come out %q-escaped, so every space in
+    # it became a backslash and plain-English greps could not match it.
+    plain="cosign verification FAILED for repo@sha256:abc — refusing to deploy"
+    [ "$(_logfmt_escape "$plain")" = "$plain" ] || { echo "a plain message was altered"; exit 1; }
+    [ "$(_logfmt_escape "a\\b")"  = "a\\\\b" ] || { echo "backslash not doubled"; exit 1; }
+    [ "$(_logfmt_escape "a\"b")"  = "a\\\"b"  ] || { echo "double quote not escaped"; exit 1; }
+    [ "$(_logfmt_escape "$(printf "a\nb")")" = "a\\nb" ] || { echo "embedded newline not collapsed"; exit 1; }
+    # Carriage return and tab pass through by design (see log.sh): neither can
+    # split a line, so escaping them would only hurt readability.
+    [ "$(_logfmt_escape "$(printf "a\tb")")" = "$(printf "a\tb")" ] || { echo "tab should pass through"; exit 1; }
+    # The property all of that exists to protect: one call, one line.
+    line=$(log_info "$(printf "rolling back\nto the old image")")
+    [ "$(printf %s "$line" | wc -l)" = 0 ] || { echo "a log line was split in two"; exit 1; }
+    echo OK') || fail "logfmt unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "logfmt unit did not print OK: $out"
+  pass "_logfmt_escape escapes backslash, quote and newline, and leaves plain text alone"
+}
+
+t0_compose_file_args_unit() {
+  # A unit test rather than a two-compose-file fixture: these are pure string
+  # shapes, so asserting them in a bare container is fast, deterministic and
+  # needs neither Docker Hub nor Sigstore — where the equivalent integration
+  # coverage would need both, and would still only reach one shape per run.
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    export STATE_DIR=/tmp/st
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    mkdir -p /proj /tmp/st
+    : > /proj/docker-compose.yml
+    : > /proj/override.yml
+    : > "$ROLLBACK_FILE"
+    COMPOSE_WORKDIR=/proj
+
+    # One absolute path: the everyday shape, and the one that silently
+    # produced an EMPTY list for as long as the label was fed to read without
+    # a trailing newline.
+    _compose_file_args "/proj/docker-compose.yml"
+    [ "${COMPOSE_FILE_ARGS[*]}" = "-f /proj/docker-compose.yml" ] \
+      || { echo "single file: [${COMPOSE_FILE_ARGS[*]}]"; exit 1; }
+
+    # Two files, order preserved — Compose applies each -f on top of the last,
+    # so reordering them would silently change what gets deployed.
+    _compose_file_args "/proj/docker-compose.yml,/proj/override.yml"
+    [ "${COMPOSE_FILE_ARGS[*]}" = "-f /proj/docker-compose.yml -f /proj/override.yml" ] \
+      || { echo "two files: [${COMPOSE_FILE_ARGS[*]}]"; exit 1; }
+
+    # A trailing separator must not turn into an empty -f argument.
+    _compose_file_args "/proj/docker-compose.yml,"
+    [ "${COMPOSE_FILE_ARGS[*]}" = "-f /proj/docker-compose.yml" ] \
+      || { echo "trailing separator: [${COMPOSE_FILE_ARGS[*]}]"; exit 1; }
+
+    # Compose records relative paths when it was invoked with one.
+    _compose_file_args "docker-compose.yml,override.yml"
+    [ "${COMPOSE_FILE_ARGS[*]}" = "-f /proj/docker-compose.yml -f /proj/override.yml" ] \
+      || { echo "relative paths: [${COMPOSE_FILE_ARGS[*]}]"; exit 1; }
+
+    # The rollback override is a transient artefact of one cycle and must
+    # never re-enter the project definition, however it reaches this label.
+    _compose_file_args "/proj/docker-compose.yml,$ROLLBACK_FILE"
+    [ "${COMPOSE_FILE_ARGS[*]}" = "-f /proj/docker-compose.yml" ] \
+      || { echo "rollback override not filtered: [${COMPOSE_FILE_ARGS[*]}]"; exit 1; }
+
+    # And that filter must fail loudly rather than degrade to matching
+    # nothing, which would let the override back in with no error at all.
+    if ( unset ROLLBACK_FILE; _compose_file_args "/proj/docker-compose.yml" ) 2>/dev/null; then
+      echo "an unset ROLLBACK_FILE was tolerated"; exit 1
+    fi
+    echo OK') || fail "compose file args unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "compose file args unit did not print OK: $out"
+  pass "compose file list: single, multiple, trailing separator, relative paths, rollback override filtered"
+}
+
 t_discover() {
   local dir="$TEST_TMPDIR/upd-discover-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -73,7 +154,8 @@ t_discover() {
     echo "volume=$TARGET_STATE_VOLUME"
     echo "bindmounts=${DECLARED_BIND_MOUNTS[*]}"
     echo "fp=$(config_fingerprint)"
-    echo "running=$(running_digest)"') || fail "discover_target failed: $out"
+    echo "running=$(running_digest)"
+    echo "composefiles=${COMPOSE_FILE_ARGS[*]}"') || fail "discover_target failed: $out"
 
   grep -q '^service=unbound$'                       <<<"$out" || fail "bad service: $out"
   grep -q "^workdir=$dir\$"                         <<<"$out" || fail "bad workdir: $out"
@@ -82,7 +164,14 @@ t_discover() {
   grep -q "bindmounts=.*$dir/unbound.conf:/etc/unbound/unbound.conf" <<<"$out" || fail "bind mount not discovered: $out"
   grep -qE '^fp=[0-9a-f]{64}$'                      <<<"$out" || fail "bad fingerprint: $out"
   grep -qE '^running=esitcparis/unbound-distroless@sha256:[0-9a-f]{64}$' <<<"$out" || fail "bad running digest: $out"
-  pass "discovery derives service, workdir, declared ref, volume, bind mounts"
+  # The one variable nothing used to assert — which is exactly why it could
+  # sit permanently empty (Bug A) while every other check here still passed.
+  # Everything downstream papers over an empty list, because Compose then
+  # discovers the file from --project-directory by itself; only the rollback,
+  # which adds a second -f, ever noticed.
+  grep -q "^composefiles=-f $dir/docker-compose.yml\$" <<<"$out" \
+    || fail "COMPOSE_FILE_ARGS was not derived from the compose label: $out"
+  pass "discovery derives service, workdir, declared ref, volume, bind mounts, compose file args"
 }
 
 t_config_fingerprint_handles_spaces() {
@@ -531,6 +620,8 @@ t7b_rollback_restores_previous_digest() {
 
 t0_image_sane
 t0_state_unit
+t0_logfmt_unit
+t0_compose_file_args_unit
 t_discover
 t_config_fingerprint_handles_spaces
 t_validate
