@@ -63,7 +63,7 @@ t_discover() {
     echo "workdir=$COMPOSE_WORKDIR"
     echo "declared=$DECLARED_IMAGE_REF"
     echo "volume=$TARGET_STATE_VOLUME"
-    echo "confmounts=${DECLARED_CONF_MOUNTS[*]}"
+    echo "bindmounts=${DECLARED_BIND_MOUNTS[*]}"
     echo "fp=$(config_fingerprint)"
     echo "running=$(running_digest)"') || fail "discover_target failed: $out"
 
@@ -71,10 +71,10 @@ t_discover() {
   grep -q "^workdir=$dir\$"                         <<<"$out" || fail "bad workdir: $out"
   grep -q '^declared=esitcparis/unbound-distroless:1$' <<<"$out" || fail "bad declared ref: $out"
   grep -q '^volume=.*state$'                        <<<"$out" || fail "bad state volume: $out"
-  grep -q "confmounts=.*$dir/unbound.conf:/etc/unbound/unbound.conf" <<<"$out" || fail "conf mount not discovered: $out"
+  grep -q "bindmounts=.*$dir/unbound.conf:/etc/unbound/unbound.conf" <<<"$out" || fail "bind mount not discovered: $out"
   grep -qE '^fp=[0-9a-f]{64}$'                      <<<"$out" || fail "bad fingerprint: $out"
   grep -qE '^running=esitcparis/unbound-distroless@sha256:[0-9a-f]{64}$' <<<"$out" || fail "bad running digest: $out"
-  pass "discovery derives service, workdir, declared ref, volume, conf mounts"
+  pass "discovery derives service, workdir, declared ref, volume, bind mounts"
 }
 
 t_config_fingerprint_handles_spaces() {
@@ -156,7 +156,16 @@ t5_healthcheck_breaking_conf() {
   fixture_create "$dir" "esitcparis/unbound-distroless:1"
   # The exact trap in this project's own unbound.conf.local: remote-control
   # over TCP/TLS, whose key and certificate files are deliberately absent
-  # from the image.
+  # from the image. REPLACE the shipped unbound.conf's own remote-control
+  # clause (a unix socket, for the healthcheck) rather than appending next to
+  # it: unbound only enforces TLS key/cert files when the FIRST
+  # control-interface in the merged config is an address, so appending here
+  # would leave the unix socket first and the check would never fire —
+  # that's a real, separate quirk (see preflight_checkconf's warning), not
+  # this test's concern. A single, address-only remote-control clause is
+  # what genuinely fails unbound-checkconf today.
+  sed -i.bak '/^remote-control:$/,/^$/d' "$dir/unbound.conf"
+  rm -f "$dir/unbound.conf.bak"
   cat >> "$dir/unbound.conf" <<'CONF'
 remote-control:
   control-enable: yes

@@ -21,63 +21,44 @@ _canary_names() {
 preflight_checkconf() {
   local ref="$1" out rc=0
   out=$(docker run --rm --entrypoint /usr/local/sbin/unbound-checkconf \
-        "${DECLARED_CONF_MOUNTS[@]}" "$ref" /etc/unbound/unbound.conf 2>&1) || rc=$?
+        "${DECLARED_BIND_MOUNTS[@]}" "$ref" /etc/unbound/unbound.conf 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
     log_error "preflight: the declared configuration is not valid for $ref"
     printf '%s\n' "$out" >&2
     return 1
   fi
 
-  _preflight_remote_control_files "$ref" || return 1
+  _warn_plaintext_control_channel "$ref"
 
   log_info "preflight: configuration accepted by $ref"
   return 0
 }
 
-# _checkconf_opt <option> <image_ref> — resolved value of a single-valued
-# unbound.conf option (docker compose's `-o`), empty on failure. May print
-# more than one line for a list option such as control-interface.
-_checkconf_opt() {
-  docker run --rm --entrypoint /usr/local/sbin/unbound-checkconf \
-    "${DECLARED_CONF_MOUNTS[@]}" "$2" -o "$1" /etc/unbound/unbound.conf 2>/dev/null || true
-}
+# _warn_plaintext_control_channel <image_ref>
+# unbound only enforces remote-control TLS (and the existence of its key/cert
+# files) when the FIRST control-interface in the merged config is an address
+# rather than a unix socket (unbound's options_remote_is_address(),
+# config_file.c). When a unix socket is declared first — ours always is, for
+# the container healthcheck — a later address-based control-interface is not
+# an error: unbound runs it as plain, unauthenticated TCP and simply ignores
+# its key/cert settings. That is a legitimate, working configuration, so this
+# never fails the preflight — only warns, since a "TLS" remote-control the
+# user configured quietly becoming unauthenticated is easy to miss.
+_warn_plaintext_control_channel() {
+  local ref="$1" enabled line has_socket=0 has_addr=0
+  enabled=$(docker run --rm --entrypoint /usr/local/sbin/unbound-checkconf \
+    "${DECLARED_BIND_MOUNTS[@]}" "$ref" -o control-enable /etc/unbound/unbound.conf 2>/dev/null) || return 0
+  [ "$enabled" = yes ] || return 0
 
-# _preflight_remote_control_files <image_ref>
-# unbound-checkconf only validates the remote-control key/cert files when the
-# FIRST control-interface in the merged config is an address rather than a
-# unix socket (unbound's options_remote_is_address(), config_file.c). Our own
-# healthcheck's control-interface is a unix socket declared ahead of anything
-# a user's config adds, so a TCP/TLS remote-control appended afterwards is
-# silently accepted by checkconf even when the certificate files it names do
-# not exist — checkconf never looks at them in that ordering. If the declared
-# config implies a TLS control channel (any control-interface is an address),
-# verify the four files ourselves, reusing unbound-checkconf's own "could not
-# open" error to name the missing one precisely.
-_preflight_remote_control_files() {
-  local ref="$1"
-  [ "$(_checkconf_opt control-enable "$ref")" = yes ] || return 0
-
-  local line wants_tls=0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    case "$line" in /*) ;; *) wants_tls=1 ;; esac
-  done < <(_checkconf_opt control-interface "$ref")
-  [ "$wants_tls" -eq 1 ] || return 0
+    case "$line" in /*) has_socket=1 ;; *) has_addr=1 ;; esac
+  done < <(docker run --rm --entrypoint /usr/local/sbin/unbound-checkconf \
+    "${DECLARED_BIND_MOUNTS[@]}" "$ref" -o control-interface /etc/unbound/unbound.conf 2>/dev/null)
 
-  local key path out rc
-  for key in server-key-file server-cert-file control-key-file control-cert-file; do
-    path=$(_checkconf_opt "$key" "$ref")
-    [ -n "$path" ] || continue
-    rc=0
-    out=$(docker run --rm --entrypoint /usr/local/sbin/unbound-checkconf \
-          "${DECLARED_CONF_MOUNTS[@]}" "$ref" "$path" 2>&1) || rc=$?
-    if [ "$rc" -ne 0 ] && grep -q 'No such file or directory' <<<"$out"; then
-      log_error "preflight: remote-control $key is not usable for $ref"
-      printf '%s\n' "$out" >&2
-      return 1
-    fi
-  done
-  return 0
+  if [ "$has_socket" -eq 1 ] && [ "$has_addr" -eq 1 ]; then
+    log_warn "preflight: control-interface declares both a unix socket and an address for $ref — unbound will use the unix socket and serve the address as PLAINTEXT, silently ignoring its TLS key/cert settings"
+  fi
 }
 
 canary_down() {
@@ -106,7 +87,7 @@ canary_up() {
 
   docker run -d --name "$CANARY_NAME" --network "$CANARY_NET" \
     --cap-drop=ALL --cap-add=NET_BIND_SERVICE --security-opt no-new-privileges \
-    -v "$CANARY_VOL":/var/lib/unbound "${DECLARED_CONF_MOUNTS[@]}" \
+    -v "$CANARY_VOL":/var/lib/unbound "${DECLARED_BIND_MOUNTS[@]}" \
     "$ref" >/dev/null \
     || { log_error "canary: container failed to start"; return 1; }
 

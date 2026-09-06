@@ -76,7 +76,7 @@ compose() {
   docker compose "${args[@]}" "$@"
 }
 
-# _read_declared — DECLARED_IMAGE_REF and DECLARED_CONF_MOUNTS, from the
+# _read_declared — DECLARED_IMAGE_REF and DECLARED_BIND_MOUNTS, from the
 # compose project itself rather than from the running container.
 _read_declared() {
   local cfg
@@ -85,16 +85,21 @@ _read_declared() {
   DECLARED_IMAGE_REF=$(jq -r --arg s "$TARGET_SERVICE" '.services[$s].image // empty' <<<"$cfg")
   [ -n "$DECLARED_IMAGE_REF" ] || log_die "service '$TARGET_SERVICE' declares no image"
 
-  DECLARED_CONF_MOUNTS=()
+  # Every declared bind mount, not just ones under /etc/unbound: production
+  # may mount a cert, a zonefile, or anything else elsewhere, and the canary
+  # must run with the SAME filesystem view or it validates a configuration
+  # production doesn't actually have. /var/lib/unbound is excluded because
+  # that's the state volume, which is cloned separately, not bind-mounted.
+  DECLARED_BIND_MOUNTS=()
   local src dst
   while IFS=$'\t' read -r src dst; do
     [ -n "$src" ] || continue
-    [ -r "$src" ] || log_die "declared config file '$src' is not readable from inside the sidecar — it must be mounted read-only at the same absolute path"
-    DECLARED_CONF_MOUNTS+=(-v "$src:$dst:ro")
+    [ -r "$src" ] || log_die "declared bind mount '$src' is not readable from inside the sidecar — it must be mounted read-only at the same absolute path"
+    DECLARED_BIND_MOUNTS+=(-v "$src:$dst:ro")
   done < <(jq -r --arg s "$TARGET_SERVICE" '
       .services[$s].volumes // []
       | .[] | select(.type == "bind")
-      | select(.target | startswith("/etc/unbound"))
+      | select(.target | startswith("/var/lib/unbound") | not)
       | [.source, .target] | @tsv' <<<"$cfg")
 }
 
@@ -122,13 +127,16 @@ declared_digest() {
   printf '%s\n' "$rd"
 }
 
-# config_fingerprint — one sha256 over every declared config file, ordered.
+# config_fingerprint — one sha256 over every declared bind-mounted file,
+# ordered. Covering all of them (not just unbound.conf) is intended: a
+# rotated certificate or any other bind-mounted file changing must trigger a
+# canary and a redeploy just as surely as an edited unbound.conf does.
 config_fingerprint() {
   local src paths=()
   local i
-  for (( i = 0; i < ${#DECLARED_CONF_MOUNTS[@]}; i++ )); do
-    [ "${DECLARED_CONF_MOUNTS[$i]}" = "-v" ] || continue
-    src="${DECLARED_CONF_MOUNTS[$((i+1))]%%:*}"
+  for (( i = 0; i < ${#DECLARED_BIND_MOUNTS[@]}; i++ )); do
+    [ "${DECLARED_BIND_MOUNTS[$i]}" = "-v" ] || continue
+    src="${DECLARED_BIND_MOUNTS[$((i+1))]%%:*}"
     paths+=("$src")
   done
   if [ "${#paths[@]}" -eq 0 ]; then
