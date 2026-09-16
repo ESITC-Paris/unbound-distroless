@@ -85,9 +85,13 @@ canary_up() {
     "$SELF_IMAGE" -c 'cp -a /src/. /dst/' \
     || { log_error "canary: cloning production state failed"; return 1; }
 
+  # Same runtime settings as the declared service (read_only, tmpfs,
+  # environment, ulimits, sysctls — see _read_declared_runtime), so the
+  # canary fails where production would fail and passes where it would pass.
   docker run -d --name "$CANARY_NAME" --network "$CANARY_NET" \
     --cap-drop=ALL --cap-add=NET_BIND_SERVICE --security-opt no-new-privileges \
     -v "$CANARY_VOL":/var/lib/unbound "${DECLARED_BIND_MOUNTS[@]}" \
+    "${DECLARED_RUNTIME_ARGS[@]}" \
     "$ref" >/dev/null \
     || { log_error "canary: container failed to start"; return 1; }
 

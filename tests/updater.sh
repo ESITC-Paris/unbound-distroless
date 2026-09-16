@@ -411,6 +411,48 @@ t_canary_lifecycle() {
   pass "canary starts on cloned state, validates, and leaves nothing behind"
 }
 
+t_canary_replicates_declared_runtime() {
+  # The canary must run under the same runtime settings Compose will give
+  # production, not just the same image, state and bind mounts. A canary
+  # with a writable rootfs, no tmpfs, no ulimits and no environment can pass
+  # while production, declared read-only with a tmpfs, fails — or the other
+  # way round. Every setting below is read back from the canary container
+  # itself, and the canary must still validate under them.
+  local dir="$TEST_TMPDIR/upd-fidelity-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  FIXTURE_UNBOUND_EXTRA='    read_only: true
+    tmpfs: ["/run/unbound:uid=65532,gid=65532"]
+    environment:
+      CANARY_FIDELITY_PROBE: "42"
+    ulimits:
+      nofile: {soft: 4096, hard: 8192}
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 1024' \
+    fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/validate.sh
+    . /usr/local/lib/unbound-autoupdate/canary.sh
+    discover_target
+    trap canary_down EXIT
+    canary_up "$DECLARED_IMAGE_REF"
+    j=$(docker inspect "$CANARY_NAME")
+    jq -e ".[0].HostConfig.ReadonlyRootfs == true" <<<"$j" >/dev/null || { echo "canary rootfs is not read-only"; exit 1; }
+    jq -e ".[0].HostConfig.Tmpfs[\"/run/unbound\"] | test(\"uid=65532\")" <<<"$j" >/dev/null || { echo "canary lacks the declared tmpfs"; exit 1; }
+    jq -e ".[0].Config.Env | index(\"CANARY_FIDELITY_PROBE=42\")" <<<"$j" >/dev/null || { echo "canary lacks the declared environment"; exit 1; }
+    jq -e ".[0].HostConfig.Ulimits[] | select(.Name==\"nofile\" and .Soft==4096 and .Hard==8192)" <<<"$j" >/dev/null || { echo "canary lacks the declared ulimit"; exit 1; }
+    jq -e ".[0].HostConfig.Sysctls[\"net.ipv4.ip_unprivileged_port_start\"] == \"1024\"" <<<"$j" >/dev/null || { echo "canary lacks the declared sysctl"; exit 1; }
+    wait_resolver "$CANARY_IP" 90
+    validate_resolver "$CANARY_IP"
+    echo OK') || fail "canary fidelity failed: $out"
+  grep -q '^OK$' <<<"$out" || fail "canary fidelity did not reach OK: $out"
+  pass "canary replicates read_only, tmpfs, environment, ulimits and sysctls from the declared service"
+}
+
 t6_unsigned_image_refused() {
   local dir="$TEST_TMPDIR/upd-t6-$$"
   trap 'fixture_destroy "$dir"; registry_down' RETURN
@@ -728,6 +770,7 @@ ALL_TESTS="
   t4_invalid_conf_rejected
   t5_healthcheck_breaking_conf
   t_canary_lifecycle
+  t_canary_replicates_declared_runtime
   t1_image_update_actually_lands
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle

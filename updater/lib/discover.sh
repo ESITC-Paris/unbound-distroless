@@ -141,6 +141,60 @@ _read_declared() {
       | .[] | select(.type == "bind")
       | select(.target | startswith("/var/lib/unbound") | not)
       | [.source, .target] | @tsv' <<<"$cfg")
+
+  _read_declared_runtime "$cfg"
+}
+
+# _read_declared_runtime <compose-config-json> — DECLARED_RUNTIME_ARGS, the
+# `docker run` flags that make the canary run under the same runtime settings
+# Compose will give production: read_only, tmpfs, environment, ulimits and
+# sysctls. Image, state and bind mounts alone are not enough: a canary with
+# a writable rootfs and no tmpfs can pass while a production declared
+# read-only fails at the first write, or the reverse. Capabilities and
+# security_opt are NOT taken from the declaration — the canary always runs
+# with the hardened set the image is tested with.
+_read_declared_runtime() {
+  local cfg="$1" item
+  DECLARED_RUNTIME_ARGS=()
+
+  if [ "$(jq -r --arg s "$TARGET_SERVICE" '.services[$s].read_only // false' <<<"$cfg")" = true ]; then
+    DECLARED_RUNTIME_ARGS+=(--read-only)
+  fi
+
+  # tmpfs: a list of "path" or "path:options" (a bare string is also legal).
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    DECLARED_RUNTIME_ARGS+=(--tmpfs "$item")
+  done < <(jq -r --arg s "$TARGET_SERVICE" '
+      .services[$s].tmpfs // [] | if type == "string" then [.] else . end | .[]' <<<"$cfg")
+
+  # environment: Compose normalises it to a map; a null value means "take it
+  # from the invoking environment", which `-e KEY` reproduces. Each entry is
+  # base64-encoded on its own line because a value may contain anything,
+  # including newlines — and jq (1.8) silently drops a NUL byte from raw
+  # output, so NUL-delimiting is not an option here.
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    DECLARED_RUNTIME_ARGS+=(-e "$(printf '%s' "$item" | base64 -d)")
+  done < <(jq -r --arg s "$TARGET_SERVICE" '
+      .services[$s].environment // {} | to_entries[]
+      | (if .value == null then .key else "\(.key)=\(.value)" end) | @base64' <<<"$cfg")
+
+  # ulimits: either a single number or {soft, hard}.
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    DECLARED_RUNTIME_ARGS+=(--ulimit "$item")
+  done < <(jq -r --arg s "$TARGET_SERVICE" '
+      .services[$s].ulimits // {} | to_entries[]
+      | if (.value | type) == "object" then "\(.key)=\(.value.soft):\(.value.hard)" else "\(.key)=\(.value)" end' <<<"$cfg")
+
+  # sysctls: a map after normalisation, but accept the list form too.
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    DECLARED_RUNTIME_ARGS+=(--sysctl "$item")
+  done < <(jq -r --arg s "$TARGET_SERVICE" '
+      .services[$s].sysctls // {}
+      | if type == "array" then .[] else to_entries[] | "\(.key)=\(.value)" end' <<<"$cfg")
 }
 
 _read_running_mounts() {

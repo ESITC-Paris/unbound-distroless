@@ -47,6 +47,11 @@ info() { echo "---- $*"; }
 # No port-publishing knob on purpose: T7a, the one test that needs a published
 # port, must add it at UPDATE time rather than at creation time (see there),
 # so a knob here would only ever be dead code.
+#
+# FIXTURE_UNBOUND_EXTRA / FIXTURE_UPDATER_EXTRA: extra YAML lines (indented
+# four spaces, i.e. service-level keys) appended to the respective service,
+# for tests that need a differently shaped project at CREATION time — a
+# read-only rootfs, a host-networked sidecar. Empty by default.
 fixture_create() {
   local dir="$1" ref="$2"
   mkdir -p "$dir"
@@ -62,6 +67,7 @@ services:
     volumes:
       - state:/var/lib/unbound
       - ./unbound.conf:/etc/unbound/unbound.conf:ro
+${FIXTURE_UNBOUND_EXTRA:-}
   updater:
     image: $UPDATER_IMAGE
     entrypoint: ["sleep", "infinity"]
@@ -71,6 +77,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - $dir:$dir:ro
       - ustate:/var/lib/unbound-autoupdate
+${FIXTURE_UPDATER_EXTRA:-}
 volumes:
   state:
   ustate:
