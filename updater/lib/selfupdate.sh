@@ -7,6 +7,11 @@
 # only correct place to run it is outside.
 
 SELF_UPDATE="${SELF_UPDATE:-1}"
+# How long the helper waits for the cycle lock before writing state anyway. A
+# cycle legitimately holds it for minutes — the canary waits up to 90 s then
+# validates, the post-swap and rollback gates 45 s each plus their own probes,
+# and every one of those sits behind a registry pull.
+SELF_LOCK_WAIT="${SELF_LOCK_WAIT:-900}"
 # Read by the orchestrator to tell "nothing to do" from "a helper is now
 # recreating me"; shellcheck cannot see that use from this file alone.
 # shellcheck disable=SC2034
@@ -181,9 +186,18 @@ _self_services_healthy() {
 # The compose work deliberately stays OUTSIDE the lock; only the state
 # mutations need it, and holding it across a 30 s soak would block cycles for
 # no reason.
+#
+# Running out of that wait is NOT a reason to give up on the write. Dying here
+# would skip the quarantine, the metrics and the notification on a path where
+# the rollback has already happened — and a missing quarantine guarantees the
+# broken image is relaunched on every cycle from then on, silently. An
+# unlocked write only risks a state.env the next cycle rewrites anyway. So the
+# timeout is loud and the writes go ahead: this always returns 0.
 _self_take_cycle_lock() {
   exec 9>"$LOCK_FILE"
-  flock -w 120 9 || log_die "self-update helper: could not take the cycle lock within 120 s"
+  flock -w "$SELF_LOCK_WAIT" 9 \
+    || log_error "self-update helper: could not take the cycle lock within ${SELF_LOCK_WAIT}s — writing state without it"
+  return 0
 }
 _self_release_cycle_lock() { exec 9>&-; }
 

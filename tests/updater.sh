@@ -380,9 +380,27 @@ t0_helper_lock_unit() {
       || { echo "metrics.prom was not rewritten"; exit 1; }
     # And the lock is released again, or the next cycle would block forever.
     flock -w 5 "$LOCK_FILE" true || { echo "the helper did not release the cycle lock"; exit 1; }
+
+    # A cycle legitimately holds that lock for MINUTES (canary, post-swap and
+    # rollback validation each wait up to 45-90 s plus their probes). When the
+    # wait runs out the helper must still write: an unlocked write risks a torn
+    # state.env that the next cycle rewrites, while a missing quarantine
+    # GUARANTEES the broken image is relaunched on every cycle, silently. So
+    # the timeout is loud and non-fatal, never an exit.
+    flock "$LOCK_FILE" sleep 6 &
+    holder2=$!
+    sleep 0.5
+    start=$(date -u +%s)
+    err=$( { SELF_LOCK_WAIT=2 _self_update_record_failure "repo@sha256:cafe"; } 2>&1 1>/dev/null )
+    elapsed=$(( $(date -u +%s) - start ))
+    wait "$holder2"
+    [ "$elapsed" -lt 5 ] || { echo "the helper waited ${elapsed}s instead of giving up after SELF_LOCK_WAIT=2"; exit 1; }
+    case "$err" in *"could not take the cycle lock"*) : ;; *) echo "the lock timeout was not reported: $err"; exit 1;; esac
+    [ "$(state_get SELF_QUARANTINE_DIGEST)" = "repo@sha256:cafe" ] \
+      || { echo "the quarantine key was dropped when the lock could not be taken"; exit 1; }
     echo OK') || fail "helper lock unit failed: $out"
   [ "${out##*$'\n'}" = OK ] || fail "helper lock unit did not print OK: $out"
-  pass "the self-update helper waits for the cycle lock before writing state, and releases it"
+  pass "the self-update helper waits for the cycle lock, releases it, and still writes state when the wait runs out"
 }
 
 t_discover() {
