@@ -38,6 +38,12 @@ jobs:
       - name: Monitor decision logic
         run: bash tests/monitor.sh
 
+      - name: promtool (alert rules)
+        run: |
+          docker run --rm -v "$PWD/docs/observability:/obs:ro" --entrypoint promtool \
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            check rules /obs/alerts.yml
+
       - name: actionlint (workflows)
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
 

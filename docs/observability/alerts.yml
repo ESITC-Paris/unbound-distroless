@@ -1,0 +1,79 @@
+# Alert rules for the unbound-distroless resolver and its update sidecar.
+# Metric names are the ones updater/lib/metrics.sh and updater/www/cgi-bin/metrics
+# actually emit. Check them with:
+#   promtool check rules docs/observability/alerts.yml
+groups:
+  - name: unbound
+    rules:
+      - alert: UnboundDown
+        expr: up{job="unbound"} == 0 or unbound_exporter_scrape_success == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Unbound on {{ $labels.instance }} is not answering unbound-control"
+          description: "The metrics sidecar cannot collect statistics from the resolver container for 2 minutes."
+
+      - alert: UnboundServfailRatioHigh
+        expr: |
+          rate(unbound_answer_rcodes_total{rcode="SERVFAIL"}[5m])
+            / rate(unbound_queries_total[5m]) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% SERVFAIL on {{ $labels.instance }}"
+          description: "Upstream reachability or DNSSEC failures; check `log-servfail` lines in the resolver logs."
+
+      - alert: UnboundNoDnssecValidation
+        expr: |
+          increase(unbound_answers_secure_total[1h]) == 0
+            and increase(unbound_queries_total[1h]) > 100
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "No DNSSEC-secure answers in the last hour on {{ $labels.instance }}"
+          description: "Queries are flowing but nothing validates: the validator may be disabled or the trust anchor broken."
+
+  - name: unbound-autoupdate
+    rules:
+      - alert: UnboundAutoupdateStale
+        expr: time() - unbound_autoupdate_last_cycle_timestamp_seconds > 3 * 3600
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "No update cycle for over 3 hours on {{ $labels.instance }}"
+          description: "With INTERVAL=1h the sidecar should have run three cycles. Is the unbound-autoupdate container running?"
+
+      - alert: UnboundAutoupdateFailed
+        expr: unbound_autoupdate_last_cycle_status{status=~"blocked|error"} == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Last update cycle failed ({{ $labels.status }}) on {{ $labels.instance }}"
+          description: "Signature, preflight, canary or an unexpected error stopped the last cycle. Production was not touched. See the sidecar logs."
+
+      - alert: UnboundAutoupdateRolledBack
+        expr: increase(unbound_autoupdate_cycles_total{status="rollback"}[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "An update was rolled back on {{ $labels.instance }}"
+          description: "The new image or configuration failed post-swap validation; production was restored and the change quarantined."
+
+      - alert: UnboundAutoupdateCritical
+        expr: unbound_autoupdate_last_cycle_status{status="critical"} == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "Rollback FAILED on {{ $labels.instance }} — DNS may be down"
+          description: "The swap failed and the rollback did not restore a working resolver. Manual intervention required."
+
+      # The quarantine series returns to 0 by itself the moment RETRY_AFTER
+      # elapses (metrics.sh reads _quarantine_window_open), so this alert must
+      # fire WHILE the window is open — a `for:` longer than RETRY_AFTER would
+      # never fire at all. 30m is long enough to ignore the quarantine written
+      # by a cycle whose very next run clears it.
+      - alert: UnboundAutoupdateQuarantined
+        expr: unbound_autoupdate_quarantine_active == 1
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "A {{ $labels.axis }} change is quarantined on {{ $labels.instance }}"
+          description: "A failed deployment was rolled back and its image, configuration or sidecar image is held back. The sidecar retries it once RETRY_AFTER (default 24h) has elapsed — decide before then whether it should be retried."

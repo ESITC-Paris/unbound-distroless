@@ -36,6 +36,9 @@ infrastructure — see [operations.md](operations.md)) and looks for:
 2. **Updated base images** — the Debian build stage or the distroless runtime
    base → revision rebuild `X.Y.Z-rN`, which picks up OpenSSL, glibc,
    libevent, nghttp2, hiredis, and expat security fixes
+3. **The sidecar's own bases** — the Alpine base and the cosign image that
+   `updater/` builds on, tracked by digest on their own axis → revision
+   rebuild `updater-vX.Y.Z-rN`, independently of the resolver's releases
 
 Detection to publication is fully automatic; the gate table above is the
 safety net. A failed gate publishes nothing and leaves a red run in
@@ -73,6 +76,45 @@ docker buildx imagetools inspect esitcparis/unbound-distroless:latest \
 Every [GitHub Release](https://github.com/ESITC-Paris/unbound-distroless/releases)
 lists the exact digests. Pin production deployments to an immutable
 `X.Y.Z-rN` tag or a digest.
+
+## The updater sidecar
+
+The companion sidecar — `esitcparis/unbound-autoupdate` (Docker Hub) ·
+`ghcr.io/esitc-paris/unbound-autoupdate` — is built and published by
+[its own workflow](https://github.com/ESITC-Paris/unbound-distroless/blob/main/.github/workflows/updater.yml),
+with the same shape and the same guarantees as the resolver's:
+
+- native builds on `linux/amd64` **and** `linux/arm64` runners, no emulation;
+- the **full integration suite** (`tests/updater.sh`) run per architecture, on
+  that architecture's own runner, before anything is pushed;
+- Trivy CVE gate per architecture;
+- platform images pushed **by digest only**, tags created in one final step
+  from the two digests;
+- the multi-arch index signed with **cosign keyless** (GitHub OIDC), and the
+  published index then **verified with the documented identity** — the release
+  fails if what was just signed does not verify;
+- SBOM and SLSA provenance attestations, plus a GitHub provenance attestation
+  on both registries.
+
+Tags follow `X.Y.Z-rN`, where `rN` is the sidecar's own revision: it is
+incremented when its Alpine base or the cosign image it copies moves, which
+the upstream monitor tracks by digest independently of the resolver's bases.
+`latest`, `X`, `X.Y` and `X.Y.Z` are mutable pointers to the newest build.
+
+Verify it exactly as you verify the resolver:
+
+```bash
+cosign verify esitcparis/unbound-autoupdate:latest \
+  --certificate-identity-regexp 'https://github.com/ESITC-Paris/unbound-distroless/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The sidecar applies that same check itself, fail-closed, before it runs
+anything: every resolver image it is about to canary, and every sidecar image
+it is about to replace itself with, must pass `cosign verify` against this
+identity (or against your own key — see
+[updater/README.md](../updater/README.md)). An image that does not verify is
+never started, and the cycle reports it as a supply-chain incident.
 
 ## DNSSEC trust anchor and root data lifecycle
 
