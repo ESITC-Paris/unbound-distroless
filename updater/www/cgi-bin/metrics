@@ -21,11 +21,20 @@ printf 'Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\r\n'
 start=$(date +%s.%N)
 ok=0
 
-# Discovery and the exec run in a subshell: discover_target_container dies
-# (exit) when it cannot find the resolver, and that must not end the scrape.
-if stats=$( { discover_target_container \
-              && timeout 10 docker exec "$TARGET_CONTAINER" \
-                   /usr/local/sbin/unbound-control -c /etc/unbound/unbound.conf stats_noreset; } 2>/dev/null ); then
+# Collection runs in a child of its own, under ONE timeout that covers all of
+# it: discover_target_container dies (exit) when it cannot find the resolver,
+# and that must not end the scrape — and its own calls to the Docker socket
+# have to be bounded just as the exec is, or a wedged daemon hangs the scrape
+# in the step before the one that was bounded. A separate `bash -c` rather
+# than a subshell because a subshell cannot be the child `timeout` signals.
+if stats=$(timeout 10 bash -c '
+    set -uo pipefail
+    LIB=/usr/local/lib/unbound-autoupdate
+    . "$LIB/log.sh"
+    . "$LIB/state.sh"
+    . "$LIB/discover.sh"
+    . "$LIB/metrics.sh"
+    _collect_stats' 2>/dev/null); then
   if [ -n "$stats" ]; then
     stats_to_prometheus <<<"$stats"
     ok=1

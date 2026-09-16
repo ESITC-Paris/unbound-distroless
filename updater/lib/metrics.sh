@@ -141,6 +141,22 @@ stats_to_prometheus() {
   }'
 }
 
+# _prom_escape <value> — a label VALUE is a quoted string, and the three
+# characters the exposition format does not allow raw inside one are a
+# backslash, a double quote and a newline. One of them unescaped does not
+# corrupt a single sample: it makes a Prometheus parser reject the WHOLE
+# document, so every metric in this file is lost at once. stats_to_prometheus
+# escapes its label values in awk for exactly that reason; the values below —
+# an image digest, an image version label — come from image metadata, which is
+# no more a trusted schema than unbound's control socket, and were printed raw.
+_prom_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  printf '%s' "$s"
+}
+
 # write_cycle_metrics — rewrite metrics.prom from persisted state, atomically.
 # Called at the end of every cycle (record_cycle) and by the self-update
 # helper after it changed the sidecar itself.
@@ -156,10 +172,17 @@ write_cycle_metrics() {
   [ -n "$target" ] && target_v=$(docker image inspect "$target" --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null) || true
   ts=$(state_get SELF_UPDATE_TS); : "${ts:=0}"
 
+  # Every label value below that is not drawn from CYCLE_STATUSES (a fixed
+  # literal list record_cycle validates against) is attacker-influenced text.
+  version=$(_prom_escape "$version")
+  self_digest=$(_prom_escape "${self_digest:-unknown}")
+  target=$(_prom_escape "${target:-unknown}")
+  target_v=$(_prom_escape "${target_v:-unknown}")
+
   tmp=$(mktemp "$STATE_DIR/.metrics.XXXXXX")
   {
     printf '# HELP unbound_autoupdate_info Sidecar version and image digest.\n# TYPE unbound_autoupdate_info gauge\n'
-    printf 'unbound_autoupdate_info{version="%s",image_digest="%s"} 1\n' "$version" "${self_digest:-unknown}"
+    printf 'unbound_autoupdate_info{version="%s",image_digest="%s"} 1\n' "$version" "$self_digest"
     printf '# HELP unbound_autoupdate_last_cycle_timestamp_seconds End of the last update cycle, unix time.\n# TYPE unbound_autoupdate_last_cycle_timestamp_seconds gauge\n'
     printf 'unbound_autoupdate_last_cycle_timestamp_seconds %s\n' "$last_ts"
     printf '# HELP unbound_autoupdate_last_cycle_duration_seconds Duration of the last update cycle.\n# TYPE unbound_autoupdate_last_cycle_duration_seconds gauge\n'
@@ -178,7 +201,7 @@ write_cycle_metrics() {
     printf 'unbound_autoupdate_quarantine_active{axis="config"} %d\n' "$(_quarantine_window_open CONFIG_QUARANTINE_TS && echo 1 || echo 0)"
     printf 'unbound_autoupdate_quarantine_active{axis="self"} %d\n'   "$(_quarantine_window_open SELF_QUARANTINE_TS   && echo 1 || echo 0)"
     printf '# HELP unbound_autoupdate_target_image_info Image the resolver was last seen or deployed on.\n# TYPE unbound_autoupdate_target_image_info gauge\n'
-    printf 'unbound_autoupdate_target_image_info{digest="%s",version="%s"} 1\n' "${target:-unknown}" "${target_v:-unknown}"
+    printf 'unbound_autoupdate_target_image_info{digest="%s",version="%s"} 1\n' "$target" "$target_v"
     printf '# HELP unbound_autoupdate_self_update_last_timestamp_seconds Last successful self-update, unix time (0 = never).\n# TYPE unbound_autoupdate_self_update_last_timestamp_seconds gauge\n'
     printf 'unbound_autoupdate_self_update_last_timestamp_seconds %s\n' "$ts"
   } > "$tmp"
@@ -195,6 +218,29 @@ record_cycle() {
   state_set LAST_CYCLE_DURATION "$duration"
   state_inc "CYCLES_${status^^}"
   write_cycle_metrics
+}
+
+# _collect_stats — discover the resolver, then dump one
+# `unbound-control stats_noreset` on stdout. Split out of the metrics CGI so
+# the WHOLE collection, DISCOVERY INCLUDED, runs under one `timeout`:
+# discovery makes several calls to the Docker socket (`docker ps`,
+# `docker inspect`), and a wedged daemon hangs those exactly as surely as it
+# hangs `docker exec` — bounding only the exec left the scrape able to hang
+# forever on the step before it, which is the one failure a scrape must
+# always survive.
+#
+# Dies (log_die) when the resolver cannot be found, which is why the CGI runs
+# this in a child of its own: the scrape must still answer 200.
+#
+# `exec`, deliberately: this runs as the direct child of a `timeout`, and only
+# that direct child is signalled when the budget runs out. Replacing the shell
+# with docker exec puts the process timeout can actually kill at the end of
+# the pipe, instead of leaving a stranded `docker exec` behind on every
+# timed-out scrape. NOTHING may follow this call.
+_collect_stats() {
+  discover_target_container
+  exec docker exec "$TARGET_CONTAINER" \
+    /usr/local/sbin/unbound-control -c /etc/unbound/unbound.conf stats_noreset
 }
 
 # exec_metrics_server — busybox httpd in the foreground, docroot www/, with

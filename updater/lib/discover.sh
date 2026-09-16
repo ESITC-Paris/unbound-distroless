@@ -284,12 +284,31 @@ config_fingerprint() {
   # not depend on the caller's shell options.
   (
     set -o pipefail
+    local out
     for src in "${paths[@]}"; do
       if [ -d "$src" ]; then
         # Relative names, so the same directory hashes the same wherever the
         # project lives on the host; sorted, so order is deterministic.
-        ( cd "$src" && find . -type f -print0 | sort -z \
+        #
+        # -L, and -type l alongside -type f, are both load-bearing. A tls/
+        # directory in the Let's Encrypt `live/` layout contains nothing but
+        # SYMLINKS, and `find . -type f` skips every one of them: the mount
+        # would expand to no files at all and a renewed certificate would
+        # never change the fingerprint — silently, which is the exact case
+        # this expansion promises to catch. With -L a symlink to a file is a
+        # file; what stays `-type l` is a link that resolves to nothing, and
+        # keeping those makes sha256sum fail on them instead of dropping
+        # them. A symlink loop makes find itself fail. Both are loud, as
+        # they must be: a configuration the sidecar cannot read whole is not
+        # a configuration it may hash partially.
+        out=$( cd "$src" && find -L . \( -type f -o -type l \) -print0 | sort -z \
             | xargs -0 -r sha256sum ) || exit 1
+        # An empty expansion is not "nothing changed", it is "this mount
+        # contributes nothing to the fingerprint" — and a mount that can
+        # never move the hash is a configuration change this sidecar would
+        # never canary. Loud, like every other hole in the coverage.
+        [ -n "$out" ] || { log_error "config fingerprint: directory mount '$src' expands to no files"; exit 1; }
+        printf '%s\n' "$out"
       elif [ -f "$src" ]; then
         sha256sum < "$src" || exit 1
       else

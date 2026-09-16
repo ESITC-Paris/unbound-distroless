@@ -191,9 +191,36 @@ t0_config_fingerprint_directory_unit() {
     # An unreadable path must fail loudly, never hash partially.
     DECLARED_BIND_MOUNTS=(-v /u.conf:/etc/unbound/unbound.conf:ro -v /does/not/exist:/etc/unbound/x:ro)
     if config_fingerprint >/dev/null 2>&1; then echo "a missing path was silently hashed"; exit 1; fi
+
+    # A tls/ directory in the Lets Encrypt live/ layout is nothing but
+    # SYMLINKS to files elsewhere. `find . -type f` skips every one of them,
+    # so the mount expands to no files and a renewed certificate never moves
+    # the fingerprint — silently, which is the exact case a directory mount
+    # is expanded for.
+    mkdir -p /real /link
+    echo certA > /real/cert.pem
+    ln -s /real/cert.pem /link/server.pem
+    DECLARED_BIND_MOUNTS=(-v /link:/etc/unbound/tls:ro)
+    s1=$(config_fingerprint 2>/dev/null) || { echo "a directory of symlinks failed to hash"; exit 1; }
+    [ "$s1" != "$empty" ] || { echo "a directory of symlinks hashed as empty input"; exit 1; }
+    echo certB > /real/cert.pem
+    s2=$(config_fingerprint 2>/dev/null) || { echo "a directory of symlinks failed to hash after rotation"; exit 1; }
+    [ "$s1" != "$s2" ] || { echo "a certificate rotated behind a symlink did not change the fingerprint"; exit 1; }
+
+    # A directory mount that expands to nothing can never move the
+    # fingerprint: that is a blind spot, not a valid hash.
+    mkdir -p /emptydir
+    DECLARED_BIND_MOUNTS=(-v /emptydir:/etc/unbound/tls:ro)
+    if config_fingerprint >/dev/null 2>&1; then echo "an empty directory mount was hashed instead of failing"; exit 1; fi
+
+    # A dangling symlink is a BROKEN configuration, not an absent file.
+    mkdir -p /dangling
+    ln -s /nowhere/missing.pem /dangling/server.pem
+    DECLARED_BIND_MOUNTS=(-v /dangling:/etc/unbound/tls:ro)
+    if config_fingerprint >/dev/null 2>&1; then echo "a dangling symlink was silently ignored"; exit 1; fi
     echo OK') || fail "config_fingerprint directory unit failed: $out"
   [ "${out##*$'\n'}" = OK ] || fail "config_fingerprint directory unit did not print OK: $out"
-  pass "config_fingerprint covers files inside directory mounts, sees renames, fails loudly on a missing path"
+  pass "config_fingerprint covers directory mounts including symlinked certificates, sees renames, and fails loudly on a missing path, an empty mount or a dangling symlink"
 }
 
 t0_stats_to_prometheus_unit() {
@@ -323,7 +350,11 @@ t0_cycle_metrics_unit() {
     self_quarantine_active "d1" || { echo "self quarantine should be active"; exit 1; }
     _quarantine_window_open SELF_QUARANTINE_TS || { echo "window should be open"; exit 1; }
     _quarantine_window_open QUARANTINE_TS && { echo "image window should be closed"; exit 1; }
-    state_set LAST_IMAGE_DIGEST "esitcparis/unbound-distroless@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    # A label VALUE is a quoted string. An image digest or version label is
+    # not a trusted schema, and one unescaped double quote does not corrupt a
+    # single sample — it makes a Prometheus parser reject the WHOLE document,
+    # losing every metric in the file at once. promtool below is the judge.
+    state_set LAST_IMAGE_DIGEST "esitcparis/unbound-distroless@sha256:0000000000000000000000000000000000000000000000000000000000000000\"quote"
     record_cycle rollback 42
     record_cycle up_to_date 3
     echo "===="
@@ -346,8 +377,10 @@ t0_cycle_metrics_unit() {
     '^unbound_autoupdate_last_cycle_timestamp_seconds [0-9]{10}$'; do
     grep -qE "$expect" "$out" || fail "cycle metrics: missing '$expect' in: $(cat "$out")"
   done
+  grep -qF 'sha256:0000000000000000000000000000000000000000000000000000000000000000\"quote",version=' "$out" \
+    || fail "cycle metrics: the double quote in the digest was not escaped: $(grep target_image_info "$out")"
   rm -f "$out"
-  pass "record_cycle persists status and counters and writes a valid metrics.prom"
+  pass "record_cycle persists status and counters and writes a valid metrics.prom, label values escaped"
 }
 
 t0_helper_lock_unit() {
@@ -401,6 +434,90 @@ t0_helper_lock_unit() {
     echo OK') || fail "helper lock unit failed: $out"
   [ "${out##*$'\n'}" = OK ] || fail "helper lock unit did not print OK: $out"
   pass "the self-update helper waits for the cycle lock, releases it, and still writes state when the wait runs out"
+}
+
+t0_self_swap_identity_unit() {
+  # `compose up` exiting 0 is not proof it recreated anything. A Compose that
+  # declines to recreate leaves the OLD container in place — running, never
+  # restarted, and therefore perfectly acceptable to _self_services_healthy —
+  # after which the helper clears the quarantine, stamps SELF_UPDATE_TS and
+  # notifies "updated" while nothing whatsoever changed: a false "updated"
+  # every cycle, forever. And a container that genuinely IS new still has to
+  # run the digest verify_image approved, or a project with
+  # `pull_policy: always` quietly deploys a sidecar image nobody verified.
+  # Both are pure decision logic, asserted here against stub docker/compose
+  # commands rather than inside the ten-minute self-update integration test.
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -uo pipefail
+    export STATE_DIR=/tmp/st RETRY_AFTER=1h
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    . /usr/local/lib/unbound-autoupdate/selfupdate.sh
+    for f in _self_service_cids _self_services_recreated _self_services_on_image; do
+      declare -F "$f" >/dev/null || { echo "missing function: $f"; exit 1; }
+    done
+
+    NEW="registry.example/unbound-autoupdate@sha256:new"
+    OTHER="registry.example/unbound-autoupdate@sha256:old"
+    declare -A CID_OF IMG_OF DIGESTS_OF
+
+    # The only two commands these functions ask about the world.
+    compose() { [ "$1" = ps ] && printf "%s\n" "${CID_OF[$3]:-}"; return 0; }
+    docker() {
+      case "$1" in
+        inspect)
+          case "$4" in
+            *ImageManifestDescriptor*) printf "\n" ;;
+            *) printf "%s\n" "${IMG_OF[$2]:-}" ;;
+          esac ;;
+        image) printf "%s\n" "${DIGESTS_OF[$3]:-}" ;;
+      esac
+      return 0
+    }
+
+    CID_OF[updater]=c1; CID_OF[metrics]=m1
+    IMG_OF[c1]=imgold;  IMG_OF[m1]=imgold
+    DIGESTS_OF[imgold]="$OTHER"
+    DIGESTS_OF[imgnew]="$NEW"
+    before=$(_self_service_cids updater metrics)
+
+    # Nothing moved: the exact shape of a Compose that declined to recreate.
+    if _self_services_recreated "$before" updater metrics; then
+      echo "an untouched container was accepted as a recreation"; exit 1
+    fi
+    if _self_services_on_image "$NEW" updater; then
+      echo "a container still on the old image was accepted as running the new digest"; exit 1
+    fi
+
+    # One service moved, the other did not: still a failure, not a partial win.
+    CID_OF[updater]=c2; IMG_OF[c2]=imgnew
+    if _self_services_recreated "$before" updater metrics; then
+      echo "a half-finished recreation was accepted"; exit 1
+    fi
+    _self_services_recreated "$before" updater \
+      || { echo "a genuinely recreated service was rejected"; exit 1; }
+    _self_services_on_image "$NEW" updater \
+      || { echo "a service running the new digest was rejected"; exit 1; }
+
+    # Both moved, but onto an image that is NOT the verified digest — what a
+    # `pull_policy: always` re-pull can land on.
+    CID_OF[metrics]=m2; IMG_OF[m2]=imgold
+    _self_services_recreated "$before" updater metrics \
+      || { echo "two recreated services were rejected"; exit 1; }
+    if _self_services_on_image "$NEW" updater metrics; then
+      echo "a service recreated on an unverified digest was accepted"; exit 1
+    fi
+
+    # No running container at all (the sidecar died at start) fails both.
+    CID_OF[updater]=""
+    if _self_services_recreated "$before" updater; then echo "a service with no container passed the id check"; exit 1; fi
+    if _self_services_on_image "$NEW" updater; then echo "a service with no container passed the image check"; exit 1; fi
+    echo OK') || fail "self swap identity unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "self swap identity unit did not print OK: $out"
+  pass "the self-update helper only trusts a swap it can see: a new container id AND the verified digest running in it"
 }
 
 t_discover() {
@@ -822,6 +939,13 @@ LABEL test.selfupdate=\"1\"" "unbound-autoupdate:1")
   cosign_test_keys "$dir"
   local id1; id1=$(fixture_service_image_id "$dir" updater)
   [ -n "$id1" ] || fail "setup: updater service not running"
+  # Container ids, not just image ids: a self-update that reported success
+  # without Compose actually recreating anything is the failure mode the
+  # helper's identity gate exists to catch, and only the id can see it.
+  local cid_u_before cid_m_before
+  cid_u_before=$(fixture_service_cid "$dir" updater)
+  cid_m_before=$(fixture_service_cid "$dir" metrics)
+  [ -n "$cid_u_before" ] && [ -n "$cid_m_before" ] || fail "setup: sidecar services have no containers"
 
   # Same tag, new bits, signed with the test key.
   v2=$(registry_publish "FROM $UPDATER_IMAGE
@@ -831,10 +955,24 @@ LABEL test.selfupdate=\"2\"" "unbound-autoupdate:1")
   [ "$id1" != "$id2" ] || fail "setup: v1 and v2 have the same image id"
 
   local out
-  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 2>&1) || fail "cycle with a pending self-update failed: $out"
+  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 SELF_LOCK_WAIT=777 2>&1) \
+    || fail "cycle with a pending self-update failed: $out"
   grep -q 'launching the apply helper' <<<"$out" || fail "self-update was not launched: $out"
 
-  local _i
+  # SELF_LOCK_WAIT is documented as user-settable, and it is the HELPER that
+  # waits for the cycle lock — an operator who tunes it on the sidecar has
+  # tuned nothing at all unless it is forwarded. Catch the helper while it is
+  # alive: it soaks the new sidecar for 30 s, so the window is wide.
+  local _i helper=""
+  for _i in $(seq 1 30); do
+    helper=$(docker ps -q --filter label=unbound-autoupdate.helper=1 | head -1)
+    [ -n "$helper" ] && break
+    sleep 1
+  done
+  [ -n "$helper" ] || fail "the apply helper was never seen running"
+  docker inspect "$helper" --format '{{.Config.Env}}' | grep -q 'SELF_LOCK_WAIT=777' \
+    || fail "the helper did not inherit SELF_LOCK_WAIT: $(docker inspect "$helper" --format '{{.Config.Env}}')"
+
   for _i in $(seq 1 30); do
     [ "$(fixture_service_image_id "$dir" updater)" = "$id2" ] \
       && [ "$(fixture_service_image_id "$dir" metrics)" = "$id2" ] && break
@@ -842,6 +980,13 @@ LABEL test.selfupdate=\"2\"" "unbound-autoupdate:1")
   done
   [ "$(fixture_service_image_id "$dir" updater)" = "$id2" ] || fail "updater service is not on the new image after 90s"
   [ "$(fixture_service_image_id "$dir" metrics)" = "$id2" ] || fail "metrics service is not on the new image after 90s"
+  # Both services must be on NEW CONTAINERS, not merely on containers that
+  # happen to report the new image: Compose declining to recreate is exactly
+  # the case the helper must refuse to call a successful self-update.
+  [ "$(fixture_service_cid "$dir" updater)" != "$cid_u_before" ] \
+    || fail "the updater service kept its container across the self-update"
+  [ "$(fixture_service_cid "$dir" metrics)" != "$cid_m_before" ] \
+    || fail "the metrics service kept its container across the self-update"
   sleep 3
   [ -z "$(docker ps -aq --filter label=unbound-autoupdate.helper=1)" ] || fail "the apply helper container was left behind"
   updater_exec "$dir" grep -q '^SELF_UPDATE_TS=[0-9]' /var/lib/unbound-autoupdate/state.env \
@@ -1016,9 +1161,17 @@ t_metrics_scrape() {
   # The resolver stopped: the scrape must still answer 200 with the sidecar
   # metrics and say the unbound part failed — never a 5xx or a hang.
   docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" stop unbound >/dev/null 2>&1
-  local code
-  code=$(curl -s -o "$out" -w '%{http_code}' --max-time 20 "http://$addr/metrics")
+  # Timed, not just bounded by --max-time: the collection step must be under
+  # ONE timeout that covers discovery as well as the exec. Bounding only the
+  # exec left every `docker ps` / `docker inspect` discovery makes unbounded,
+  # so a wedged daemon hung the scrape in the step before the bounded one —
+  # and a scrape that hangs is worse than one that says it failed.
+  local code elapsed
+  code=$(curl -s -o "$out" -w '%{http_code} %{time_total}' --max-time 20 "http://$addr/metrics")
+  elapsed="${code#* }"; code="${code%% *}"
   [ "$code" = 200 ] || fail "/metrics returned HTTP $code with the resolver down"
+  awk -v t="$elapsed" 'BEGIN { exit !(t < 15) }' \
+    || fail "/metrics took ${elapsed}s with the resolver down — collection is not bounded"
   grep -q '^unbound_exporter_scrape_success 0$' "$out" || fail "scrape_success not 0 with the resolver down: $(head -20 "$out")"
   grep -q '^unbound_autoupdate_last_cycle_status' "$out" || fail "sidecar metrics missing with the resolver down"
   promtool_check "$out" || fail "degraded /metrics rejected by promtool"
@@ -1273,6 +1426,7 @@ ALL_TESTS="
   t0_stats_to_prometheus_unit
   t0_cycle_metrics_unit
   t0_helper_lock_unit
+  t0_self_swap_identity_unit
   t_discover
   t_config_fingerprint_handles_spaces
   t_validate

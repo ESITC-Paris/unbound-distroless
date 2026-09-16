@@ -145,10 +145,16 @@ self_update() {
     case "$f" in "$COMPOSE_WORKDIR"/*) : ;; *) mounts+=(-v "$f:$f:ro") ;; esac
   done
 
+  # SELF_LOCK_WAIT is forwarded like the notification settings: it is the
+  # HELPER, not this cycle, that waits for the cycle lock, so an operator who
+  # tuned it here would otherwise have tuned nothing at all. `-e NAME` passes
+  # it only when it is actually set in the environment, leaving the helper on
+  # its own default otherwise.
   log_info "self-update: $running -> $declared; launching the apply helper for: ${ordered[*]}"
   if ! docker run -d --rm --label unbound-autoupdate.helper=1 \
         "${mounts[@]}" \
         -e WEBHOOK_URL -e HC_URL -e NOTIFY_HOST -e RETRY_AFTER -e "STATE_DIR=$STATE_DIR" \
+        -e SELF_LOCK_WAIT \
         --entrypoint /usr/local/bin/entrypoint.sh \
         "$declared" self-update-apply "$COMPOSE_PROJECT" "$COMPOSE_WORKDIR" "$running" "$declared" \
         "$(_compose_files_csv)" "${ordered[@]}" >/dev/null; then
@@ -171,6 +177,74 @@ _self_services_healthy() {
     [ -n "$cid" ] || return 1
     [ "$(docker inspect "$cid" --format '{{.State.Running}}' 2>/dev/null)" = true ] || return 1
     [ "$(docker inspect "$cid" --format '{{.RestartCount}}' 2>/dev/null)" = 0 ] || return 1
+  done
+  return 0
+}
+
+# _self_service_cids <services…> — "service<TAB>container-id" per line, the
+# snapshot a `compose up` must be seen to change. Taken BEFORE the command,
+# because "which container is this service on" is the only question whose
+# answer distinguishes a real recreation from Compose deciding it had nothing
+# to do.
+_self_service_cids() {
+  local s
+  for s in "$@"; do
+    printf '%s\t%s\n' "$s" "$(compose ps -q "$s" 2>/dev/null | head -1)"
+  done
+}
+
+# _self_services_recreated <before> <services…> — <before> is the output of
+# _self_service_cids for those same services; 0 when every one of them now
+# runs a DIFFERENT container.
+#
+# `compose up` exiting 0 is not proof it recreated anything, and the OLD
+# container satisfies _self_services_healthy perfectly: it is running and has
+# never restarted. Without this check a Compose that declines to recreate
+# (a stale config hash, an unexpected --no-deps interaction, anything) makes
+# the helper clear the quarantine, stamp SELF_UPDATE_TS and notify "updated"
+# while NOTHING changed — a false "updated" on every single cycle, forever.
+# The orchestrator already refuses to trust a swap it cannot see in the
+# running container; the helper holds to the same standard.
+_self_services_recreated() {
+  local before="$1"; shift
+  local s old now
+  for s in "$@"; do
+    old=$(printf '%s\n' "$before" | awk -F'\t' -v s="$s" '$1 == s { print $2 }')
+    now=$(compose ps -q "$s" 2>/dev/null | head -1)
+    [ -n "$now" ] || return 1
+    [ "$now" != "$old" ] || return 1
+  done
+  return 0
+}
+
+# _self_services_on_image <new_digest> <services…> — 0 when every one of them
+# runs exactly <new_digest>. A new container id says Compose did something; it
+# does not say WHAT it deployed. With `pull_policy: always` in the project, the
+# helper's own `compose up` pulls again and can land on a digest other than the
+# one verify_image approved — an unverified sidecar image, which is the single
+# thing this whole path exists to prevent.
+#
+# The container was created from the `image:` reference the compose file
+# declares (a tag), so .Config.Image is that tag and never a digest: the
+# identity has to come from the RepoDigests of the image the container
+# actually runs. The ImageManifestDescriptor fallback covers the containerd
+# image store hole _self_running_digest documents — the image record can be
+# gone while the container keeps running its content, and there an image ID IS
+# the digest of what was pulled.
+_self_services_on_image() {
+  local new="$1"; shift
+  local s cid img digests imd
+  for s in "$@"; do
+    cid=$(compose ps -q "$s" 2>/dev/null | head -1)
+    [ -n "$cid" ] || return 1
+    img=$(docker inspect "$cid" --format '{{.Image}}' 2>/dev/null) || return 1
+    [ -n "$img" ] || return 1
+    if digests=$(docker image inspect "$img" --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' 2>/dev/null) \
+       && printf '%s\n' "$digests" | grep -qxF "$new"; then
+      continue
+    fi
+    imd=$(docker inspect "$cid" --format '{{if .ImageManifestDescriptor}}{{.ImageManifestDescriptor.digest}}{{end}}' 2>/dev/null) || imd=""
+    [ -n "$imd" ] && [ "$(_image_repo "$new")@$imd" = "$new" ] || return 1
   done
   return 0
 }
@@ -235,6 +309,7 @@ self_update_apply() {
   # one container instead of every container on that image — and leaves the
   # metrics endpoint answering while the rollback happens.
   log_info "self-update helper: recreating $self_service on $new"
+  local before_self; before_self=$(_self_service_cids "$self_service")
   out=$(compose up -d --no-deps "$self_service" 2>&1) || ok=0
   if [ "$ok" = 0 ]; then
     log_error "self-update helper: docker compose up failed"
@@ -255,12 +330,29 @@ self_update_apply() {
     [ "$healthy" = 1 ] || { ok=0; log_error "self-update helper: the new sidecar is not running 30 s after recreation"; }
   fi
 
+  # Healthy is not the same as NEW. The gate below is the one the orchestrator
+  # already applies to production: a genuine Compose recreation always yields a
+  # different container id, and the container it yields must run the digest
+  # that was verified. Without it, a Compose that declines to recreate leaves
+  # the OLD container in place — running, never restarted, passing the soak
+  # above perfectly — and the helper clears the quarantine, stamps
+  # SELF_UPDATE_TS and notifies "updated" while nothing changed at all.
+  if [ "$ok" = 1 ] && ! _self_services_recreated "$before_self" "$self_service"; then
+    ok=0
+    log_error "self-update helper: compose did not recreate $self_service — it is still on the container it had before"
+  fi
+  if [ "$ok" = 1 ] && ! _self_services_on_image "$new" "$self_service"; then
+    ok=0
+    log_error "self-update helper: $self_service was recreated but does not run $new"
+  fi
+
   # Only now the rest of the project's services on that image. They are
   # recorded as moved even if the command failed, because some of them may
   # already have been recreated and must be pinned back with the others.
   if [ "$ok" = 1 ] && [ "${#services[@]}" -gt 1 ]; then
     local rest=("${services[@]:1}")
     log_info "self-update helper: the new sidecar is healthy — moving ${rest[*]} to $new"
+    local before_rest; before_rest=$(_self_service_cids "${rest[@]}")
     out=$(compose up -d --no-deps "${rest[@]}" 2>&1) || ok=0
     moved=("${services[@]}")
     if [ "$ok" = 0 ]; then
@@ -269,6 +361,12 @@ self_update_apply() {
     elif ! _self_services_healthy "${rest[@]}"; then
       ok=0
       log_error "self-update helper: ${rest[*]} did not come up on $new"
+    elif ! _self_services_recreated "$before_rest" "${rest[@]}"; then
+      ok=0
+      log_error "self-update helper: compose did not recreate ${rest[*]} — they are still on the containers they had before"
+    elif ! _self_services_on_image "$new" "${rest[@]}"; then
+      ok=0
+      log_error "self-update helper: ${rest[*]} were recreated but do not run $new"
     fi
   fi
 

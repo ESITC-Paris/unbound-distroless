@@ -222,12 +222,19 @@ running_ref() {
   docker inspect "$cid" --format '{{.Image}}'
 }
 
+# fixture_service_cid <dir> <service> — container id the service runs, or
+# empty when it has no running container. The id, not the image, is what
+# tells a real recreation from Compose deciding it had nothing to do.
+fixture_service_cid() {
+  docker compose -p "$(fixture_project "$1")" --project-directory "$1" \
+    -f "$1/docker-compose.yml" ps -q "$2" 2>/dev/null | head -1
+}
+
 # fixture_service_image_id <dir> <service> — image ID the service's container
 # runs, or empty when it has no running container.
 fixture_service_image_id() {
   local cid
-  cid=$(docker compose -p "$(fixture_project "$1")" --project-directory "$1" \
-        -f "$1/docker-compose.yml" ps -q "$2" 2>/dev/null | head -1)
+  cid=$(fixture_service_cid "$1" "$2")
   [ -n "$cid" ] || { echo ""; return 0; }
   docker inspect "$cid" --format '{{.Image}}' 2>/dev/null || echo ""
 }
