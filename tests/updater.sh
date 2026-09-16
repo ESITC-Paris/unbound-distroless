@@ -453,6 +453,38 @@ t_canary_replicates_declared_runtime() {
   pass "canary replicates read_only, tmpfs, environment, ulimits and sysctls from the declared service"
 }
 
+t_canary_refused_in_host_network_mode() {
+  # A sidecar declared with network_mode: host (which target_probe_ip
+  # requires whenever the resolver itself runs in host mode) cannot be
+  # connected to the canary's isolated bridge network: the daemon refuses
+  # `docker network connect` for host-networked containers. The canary is
+  # therefore unsupported there — and that must be said up front, in one
+  # precise message, before any canary object is created, rather than
+  # discovered as a generic "cannot join the canary network" after a network,
+  # a volume, a cloned state and a container have already been made.
+  local dir="$TEST_TMPDIR/upd-hostmode-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  FIXTURE_UPDATER_EXTRA='    network_mode: host' \
+    fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  local out rc=0 start elapsed
+  start=$(date -u +%s)
+  out=$(updater_exec "$dir" /bin/bash -c '
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/canary.sh
+    discover_target
+    if canary_up "$DECLARED_IMAGE_REF"; then canary_down; echo "canary started under network_mode: host"; exit 1; fi
+    echo REFUSED' 2>&1) || rc=$?
+  elapsed=$(( $(date -u +%s) - start ))
+  grep -q '^REFUSED$' <<<"$out" || fail "host-mode canary: canary_up did not fail: $out"
+  grep -q 'network_mode: host' <<<"$out" || fail "host-mode canary: the refusal does not name network_mode: host as the cause: $out"
+  [ "$elapsed" -lt 20 ] || fail "host-mode canary: refusal took ${elapsed}s — it built the canary before failing"
+  docker ps -a --format '{{.Names}}' | grep -q 'unbound-canary' && fail "host-mode canary: a canary container was created before the refusal"
+  docker network ls --format '{{.Name}}' | grep -q 'unbound-canary' && fail "host-mode canary: a canary network was created before the refusal"
+  pass "host-networked sidecar: canary refused up front with a precise message, nothing created"
+}
+
 t6_unsigned_image_refused() {
   local dir="$TEST_TMPDIR/upd-t6-$$"
   trap 'fixture_destroy "$dir"; registry_down' RETURN
@@ -771,6 +803,7 @@ ALL_TESTS="
   t5_healthcheck_breaking_conf
   t_canary_lifecycle
   t_canary_replicates_declared_runtime
+  t_canary_refused_in_host_network_mode
   t1_image_update_actually_lands
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle

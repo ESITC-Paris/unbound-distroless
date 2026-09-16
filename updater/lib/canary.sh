@@ -73,6 +73,19 @@ canary_down() {
 canary_up() {
   local ref="$1"
   _canary_names
+
+  # The canary is reached by joining its isolated bridge network, and the
+  # daemon refuses to connect a host-networked container to any other
+  # network. A sidecar declared with network_mode: host (which
+  # target_probe_ip requires whenever the resolver itself runs in host mode)
+  # therefore cannot run the canary at all. Say so here, precisely and
+  # before creating anything, rather than after a network, a volume, a
+  # cloned state and a container have been built only to fail at the join.
+  if [ "$(docker inspect "$SELF_ID" --format '{{.HostConfig.NetworkMode}}')" = host ]; then
+    log_error "canary: this sidecar runs with network_mode: host and cannot join the canary's isolated network — the canary is not supported for host-networked deployments"
+    return 1
+  fi
+
   canary_down   # clear leftovers from an interrupted run
 
   docker network create "$CANARY_NET" >/dev/null || { log_error "canary: cannot create network"; return 1; }
