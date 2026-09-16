@@ -275,6 +275,29 @@ STATS
   done
   # Families must be grouped: HELP for a name appears exactly once.
   [ "$(grep -c '^# HELP unbound_thread_queries_total ' "$out")" = 1 ] || fail "thread family emitted more than once"
+
+  # unbound-control does not only print key=value: a failed connection prints
+  # free-form text, and the socket can hand back a blank line. A record with
+  # no value would be emitted as a value-less sample, which makes a Prometheus
+  # parser reject the WHOLE document — losing every other metric exactly when
+  # something is already wrong. A key can also carry characters that are not
+  # legal unescaped inside a label value (unbound prints unknown RR types as
+  # TYPE<n>, and a quote there must not break out of the label).
+  local bad="$TEST_TMPDIR/upd-stats-bad-$$.prom"
+  docker run --rm -i --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    stats_to_prometheus' > "$bad" <<'BADSTATS'
+error: connect failed
+
+total.num.queries=12
+num.query.type.TYPE"65=1
+weird.back\slash.and"quote=3
+BADSTATS
+  promtool_check "$bad" || fail "malformed stats lines poisoned the document: $(cat "$bad")"
+  if grep -q 'name="error' "$bad"; then fail "a free-form error line was emitted as a sample: $(cat "$bad")"; fi
+  if grep -qE '^[a-zA-Z_][a-zA-Z0-9_]*(\{[^}]*\})? *$' "$bad"; then fail "a value-less sample was emitted: $(cat "$bad")"; fi
+  grep -qE '^unbound_queries_total 12$' "$bad" || fail "malformed lines swallowed the valid ones: $(cat "$bad")"
+  rm -f "$bad"
   rm -f "$out"
   pass "stats_to_prometheus: valid exposition text, labels, grouped families, cumulative histogram"
 }

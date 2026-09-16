@@ -14,6 +14,12 @@ CYCLE_STATUSES="up_to_date updated check_ok skipped blocked rollback critical er
 stats_to_prometheus() {
   awk -F= '
   function sanitize(s) { gsub(/[^a-zA-Z0-9_]/, "_", s); return s }
+  # esc — label VALUES are quoted strings: a backslash or a double quote in a
+  # statistic name (unbound prints unknown RR types as TYPE<n>, and the socket
+  # is not a trusted schema) would otherwise break out of the label and make
+  # the whole document unparseable. Doubled replacements on purpose: gsub eats
+  # one level of backslash in the replacement text itself.
+  function esc(s) { gsub(/\\/, "\\\\\\\\", s); gsub(/"/, "\\\\\"", s); return s }
   function family(name, type, help) {
     if (!(name in ftype)) { ftype[name]=type; fhelp[name]=help; forder[++nf]=name }
   }
@@ -24,9 +30,14 @@ stats_to_prometheus() {
   }
   function labelled(key, prefix, name, type, help, label,   l) {
     l = key; sub("^" prefix, "", l)
-    family(name, type, help); sample(name, label "=\"" l "\"", $2)
+    family(name, type, help); sample(name, label "=\"" esc(l) "\"", $2)
   }
   {
+    # unbound-control also prints free-form text (a failed connection, a blank
+    # line). A record with no value would become a value-less sample, which
+    # makes a Prometheus parser reject the ENTIRE document — every other
+    # metric lost precisely when something is already going wrong. Drop it.
+    if (NF < 2 || $1 == "") next
     k=$1; v=$2
     if (k ~ /^thread[0-9]+\./) {
       t=k; sub(/^thread/, "", t); sub(/\..*$/, "", t)
@@ -94,12 +105,12 @@ stats_to_prometheus() {
       # series by the naming rules of the exposition format; "entries" says the
       # same thing and lints clean.
       c=k; sub(/\.cache\.count$/, "", c)
-      family("unbound_cache_entries", "gauge", "Number of entries per cache."); sample("unbound_cache_entries", "cache=\"" c "\"", v); next
+      family("unbound_cache_entries", "gauge", "Number of entries per cache."); sample("unbound_cache_entries", "cache=\"" esc(c) "\"", v); next
     }
     if (k == "unwanted.queries") { family("unbound_unwanted_queries_total", "counter", "Queries refused by access control.");            sample("unbound_unwanted_queries_total", "", v); next }
     if (k == "unwanted.replies") { family("unbound_unwanted_replies_total", "counter", "Unsolicited replies, a cache-poisoning signal."); sample("unbound_unwanted_replies_total", "", v); next }
     family("unbound_stat", "gauge", "Any other unbound-control statistic, by name.")
-    sample("unbound_stat", "name=\"" k "\"", v)
+    sample("unbound_stat", "name=\"" esc(k) "\"", v)
   }
   END {
     for (i=1; i<=nf; i++) { n=forder[i]; printf "# HELP %s %s\n# TYPE %s %s\n%s", n, fhelp[n], n, ftype[n], fsamples[n] }
