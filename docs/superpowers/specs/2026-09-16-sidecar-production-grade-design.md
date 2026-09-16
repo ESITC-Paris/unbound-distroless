@@ -173,20 +173,30 @@ retourne un code non nul sans elles, et le test l'exige.
 
 | Clé `stats_noreset` | Métrique |
 |---|---|
-| `total.num.queries`, `total.num.cachehits`, … | `unbound_total_num_queries` (counter), etc. : préfixe `unbound_`, points remplacés par `_` |
-| `thread<N>.num.queries`, … | `unbound_thread_num_queries{thread="N"}` |
+| `total.num.<x>` | `unbound_<x>_total` (counter) : `unbound_queries_total`, `unbound_cachehits_total`, `unbound_recursivereplies_total`, … |
+| autre `total.<x>` (`requestlist.*`, `tcpusage`) | `unbound_<x>` (gauge), points remplacés par `_` |
+| `thread<N>.num.<x>` | `unbound_thread_<x>_total{thread="N"}` (counter) |
+| autre `thread<N>.<x>` | `unbound_thread_<x>{thread="N"}` (gauge) |
 | `num.query.type.<T>` | `unbound_query_types_total{type="T"}` |
 | `num.query.class.<C>` | `unbound_query_classes_total{class="C"}` |
 | `num.query.opcode.<O>` | `unbound_query_opcodes_total{opcode="O"}` |
 | `num.answer.rcode.<R>` | `unbound_answer_rcodes_total{rcode="R"}` |
 | `num.query.flags.<F>` | `unbound_query_flags_total{flag="F"}` |
-| `num.answer.secure`, `num.answer.bogus` | `unbound_answers_secure_total`, `unbound_answers_bogus_total` |
-| `histogram.<lo>.to.<hi>` | seaux cumulés de `unbound_response_time_seconds` (histogram), `_sum` depuis `total.recursion.time.avg × total.num.recursivereplies`, `_count` = `total.num.recursivereplies` |
-| `total.recursion.time.avg`, `.median` | `unbound_recursion_time_seconds{quantile="avg"\|"median"}` (gauge) |
+| `num.query.aggressive.<R>` | `unbound_query_aggressive_total{rcode="R"}` |
+| `num.answer.secure`, `num.answer.bogus`, `num.rrset.bogus` | `unbound_answers_secure_total`, `unbound_answers_bogus_total`, `unbound_rrset_bogus_total` |
+| `histogram.<lo>.to.<hi>` | seaux cumulés de `unbound_response_time_seconds` (histogram), `_sum` depuis `total.recursion.time.avg × total.num.recursivereplies`, `_count` = somme des seaux |
+| `total.recursion.time.avg`, `.median` | `unbound_recursion_time_seconds{stat="avg"\|"median"}` (gauge) |
 | `time.up`, `time.now`, `time.elapsed` | `unbound_time_up_seconds`, … (gauge) |
-| `mem.*`, `msg.cache.count`, `rrset.cache.count`, `infra.cache.count`, `key.cache.count` | gauges `unbound_mem_*_bytes`, `unbound_cache_count{cache="…"}` |
+| `mem.*` | `unbound_mem_<x>_bytes` (gauge) |
+| `msg.cache.count`, `rrset.cache.count`, `infra.cache.count`, `key.cache.count` | `unbound_cache_entries{cache="…"}` (gauge) |
 | `unwanted.queries`, `unwanted.replies` | `unbound_unwanted_queries_total`, `unbound_unwanted_replies_total` |
 | toute autre clé | `unbound_stat{name="<clé>"}` (gauge), pour ne rien perdre |
+
+Les noms suivent les conventions que `promtool check metrics` (promlint) impose,
+et le test le vérifie avec le parseur de référence : un compteur porte le
+suffixe `_total`, une jauge ne porte ni `_count` ni label `quantile`. Ces
+noms ne sont donc pas ceux d'`unbound_exporter`, ce que la spec n'a jamais
+promis.
 
 Les compteurs sont cumulatifs parce que la configuration livrée déclare
 `statistics-cumulative: yes` et que le script appelle `stats_noreset`. Si une
