@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Replaced in the metrics task.
+printf 'Content-Type: text/plain\r\n\r\nnot implemented\n'

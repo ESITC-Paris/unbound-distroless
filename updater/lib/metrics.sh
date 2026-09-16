@@ -180,3 +180,8 @@ record_cycle() {
   state_inc "CYCLES_${status^^}"
   write_cycle_metrics
 }
+
+# Provisional stub, replaced by the real busybox-httpd server in the metrics
+# task. Declared here so `entrypoint.sh metrics` fails by name rather than
+# with an unbound-command error.
+exec_metrics_server() { log_die "metrics mode: not implemented yet"; }

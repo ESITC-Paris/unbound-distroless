@@ -747,6 +747,56 @@ LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
   pass "T8: major bump refused by default; ALLOW_MAJOR=1 passes the version guard and is stopped only by the cosign gate"
 }
 
+t_modes() {
+  local dir="$TEST_TMPDIR/upd-modes-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$OLD_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  local before; before=$(running_ref "$dir")
+
+  fixture_set_image "$dir" "$MOVING_REF"
+  # check mode validates everything but must never swap.
+  local out
+  out=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" \
+        -f "$dir/docker-compose.yml" exec -T updater \
+        /usr/local/bin/entrypoint.sh check 2>&1) || fail "check mode failed: $out"
+  grep -q 'check mode' <<<"$out" || fail "check mode did not announce itself: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "check mode swapped production"
+  pass "check mode validates the update without deploying it"
+
+  out=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" \
+        -f "$dir/docker-compose.yml" exec -T updater \
+        /usr/local/bin/entrypoint.sh once 2>&1) || fail "once mode failed: $out"
+  [ "$(running_ref "$dir")" != "$before" ] || fail "once mode did not deploy"
+  pass "once mode runs exactly one cycle and deploys"
+
+  # An unknown mode is a hard, named error — not a silent loop.
+  local rc=0
+  out=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$UPDATER_IMAGE" bogus 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "unknown mode was accepted"
+  grep -q "unknown mode 'bogus'" <<<"$out" || fail "unknown mode not named: $out"
+  # The image carries the version it was built with.
+  out=$(docker run --rm --entrypoint cat "$UPDATER_IMAGE" /usr/local/lib/unbound-autoupdate/VERSION)
+  [ -n "$out" ] || fail "VERSION file is empty"
+  pass "unknown mode refused by name; VERSION file present ($out)"
+}
+
+t_loop_sigterm() {
+  # loop mode sleeps between cycles; SIGTERM must interrupt that sleep, or
+  # every `docker compose down` waits for Docker's 10 s kill timeout. The
+  # container here is not compose-managed, so its first cycle fails fast
+  # (discovery) and the loop goes to sleep — which is exactly what we stop.
+  local name="upd-sigterm-$$" t0 t1
+  docker run -d --name "$name" -e INTERVAL=1h -v /var/run/docker.sock:/var/run/docker.sock "$UPDATER_IMAGE" loop >/dev/null
+  blocker_track "$name"
+  sleep 6
+  docker logs "$name" 2>&1 | grep -q 'next cycle in' || fail "loop did not reach its sleep: $(docker logs "$name" 2>&1 | tail -5)"
+  t0=$(date +%s); docker stop "$name" >/dev/null; t1=$(date +%s)
+  [ $(( t1 - t0 )) -lt 4 ] || fail "docker stop took $(( t1 - t0 ))s — SIGTERM is not reaching the sleep"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  pass "loop mode stops in under 4 s on SIGTERM"
+}
+
 t1_image_update_actually_lands() {
   local dir="$TEST_TMPDIR/upd-t1-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -1002,6 +1052,8 @@ ALL_TESTS="
   t_canary_lifecycle
   t_canary_replicates_declared_runtime
   t_canary_refused_in_host_network_mode
+  t_modes
+  t_loop_sigterm
   t1_image_update_actually_lands
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle
