@@ -137,6 +137,47 @@ t0_compose_file_args_unit() {
   pass "compose file list: single, multiple, trailing separator, relative paths, rollback override filtered"
 }
 
+t0_config_fingerprint_directory_unit() {
+  # A declared bind mount may be a DIRECTORY (the shipped unbound.conf's DoT
+  # example mounts a whole tls/ directory). The fingerprint must cover the
+  # files inside it — a rotated certificate is exactly the kind of change
+  # that must trigger a canary — and must never silently degrade to hashing
+  # nothing: `cat` on a directory fails, and a `printf "$(pipeline)"` wrapper
+  # used to swallow that failure and return the hash of an empty input.
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    export STATE_DIR=/tmp/st
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    mkdir -p /tmp/st /tls; echo conf > /u.conf; echo cert1 > /tls/server.pem
+    empty=$(printf "" | sha256sum | cut -d" " -f1)
+
+    DECLARED_BIND_MOUNTS=(-v /tls:/etc/unbound/tls:ro)
+    h_dir=$(config_fingerprint 2>/dev/null) || { echo "directory-only mount failed"; exit 1; }
+    [ "$h_dir" != "$empty" ] || { echo "a directory mount hashed as empty input"; exit 1; }
+
+    DECLARED_BIND_MOUNTS=(-v /u.conf:/etc/unbound/unbound.conf:ro -v /tls:/etc/unbound/tls:ro)
+    h1=$(config_fingerprint 2>/dev/null)
+    echo cert2 > /tls/server.pem
+    h2=$(config_fingerprint 2>/dev/null)
+    [ "$h1" != "$h2" ] || { echo "a file changed inside a mounted directory but the fingerprint did not"; exit 1; }
+
+    # Renaming a file inside the directory is a change too (a cert that
+    # unbound.conf no longer finds under its old name is a broken config).
+    mv /tls/server.pem /tls/renamed.pem
+    h3=$(config_fingerprint 2>/dev/null)
+    [ "$h2" != "$h3" ] || { echo "a rename inside a mounted directory was invisible"; exit 1; }
+
+    # An unreadable path must fail loudly, never hash partially.
+    DECLARED_BIND_MOUNTS=(-v /u.conf:/etc/unbound/unbound.conf:ro -v /does/not/exist:/etc/unbound/x:ro)
+    if config_fingerprint >/dev/null 2>&1; then echo "a missing path was silently hashed"; exit 1; fi
+    echo OK') || fail "config_fingerprint directory unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "config_fingerprint directory unit did not print OK: $out"
+  pass "config_fingerprint covers files inside directory mounts, sees renames, fails loudly on a missing path"
+}
+
 t_discover() {
   local dir="$TEST_TMPDIR/upd-discover-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -618,22 +659,31 @@ t7b_rollback_restores_previous_digest() {
   pass "T7b: rollback restores the previous digest, resolver validates, digest quarantined"
 }
 
-t0_image_sane
-t0_state_unit
-t0_logfmt_unit
-t0_compose_file_args_unit
-t_discover
-t_config_fingerprint_handles_spaces
-t_validate
-t4_invalid_conf_rejected
-t5_healthcheck_breaking_conf
-t_canary_lifecycle
-t1_image_update_actually_lands
-t1b_moved_tag_update_actually_lands
-t2_noop_second_cycle
-t3_config_change_triggers
-t6_unsigned_image_refused
-t8_major_bump_refused
-t7a_failed_swap_is_loud
-t7b_rollback_restores_previous_digest
+ALL_TESTS="
+  t0_image_sane
+  t0_state_unit
+  t0_logfmt_unit
+  t0_compose_file_args_unit
+  t0_config_fingerprint_directory_unit
+  t_discover
+  t_config_fingerprint_handles_spaces
+  t_validate
+  t4_invalid_conf_rejected
+  t5_healthcheck_breaking_conf
+  t_canary_lifecycle
+  t1_image_update_actually_lands
+  t1b_moved_tag_update_actually_lands
+  t2_noop_second_cycle
+  t3_config_change_triggers
+  t6_unsigned_image_refused
+  t8_major_bump_refused
+  t7a_failed_swap_is_loud
+  t7b_rollback_restores_previous_digest
+"
+# ONLY="t_a t_b" runs a subset while iterating on one test; the default is
+# the whole suite, which is what CI runs.
+for t in ${ONLY:-$ALL_TESTS}; do
+  info "$t"
+  "$t"
+done
 echo "ALL UPDATER TESTS PASSED"

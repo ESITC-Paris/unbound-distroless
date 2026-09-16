@@ -167,10 +167,23 @@ declared_digest() {
   printf '%s\n' "$rd"
 }
 
-# config_fingerprint — one sha256 over every declared bind-mounted file,
-# ordered. Covering all of them (not just unbound.conf) is intended: a
-# rotated certificate or any other bind-mounted file changing must trigger a
-# canary and a redeploy just as surely as an edited unbound.conf does.
+# config_fingerprint — one sha256 over every declared bind mount, ordered.
+# Covering all of them (not just unbound.conf) is intended: a rotated
+# certificate or any other bind-mounted file changing must trigger a canary
+# and a redeploy just as surely as an edited unbound.conf does.
+#
+# A declared mount may be a DIRECTORY (the shipped unbound.conf's DoT example
+# mounts a whole tls/ directory), so every mount is expanded to the regular
+# files beneath it. Each file contributes its content hash AND its path
+# relative to the mount, so a rename inside the directory changes the
+# fingerprint too: a certificate unbound.conf can no longer find under its
+# old name is just as much a change as new bytes in it.
+#
+# Any failure (an unreadable file, a path that vanished between discovery
+# and here) makes the function return non-zero. It must never hash whatever
+# happened to be readable and present that as the fingerprint of the whole
+# configuration: a silently partial hash is precisely the kind of quiet
+# wrongness this project exists to remove.
 config_fingerprint() {
   local src paths=()
   local i
@@ -180,14 +193,30 @@ config_fingerprint() {
     paths+=("$src")
   done
   if [ "${#paths[@]}" -eq 0 ]; then
-    printf '%s\n' "$(printf '' | sha256sum | cut -d' ' -f1)"
+    printf '' | sha256sum | cut -d' ' -f1
     return 0
   fi
   # NUL-delimited throughout: a declared path may contain spaces (a compose
   # project can live anywhere on the host), and `sort`/`xargs`'s default
   # whitespace splitting would silently hash the wrong files instead of
-  # failing loudly.
-  printf '%s\n' "$(printf '%s\0' "${paths[@]}" | sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1)"
+  # failing loudly. The subshell sets pipefail on its own so the verdict does
+  # not depend on the caller's shell options.
+  (
+    set -o pipefail
+    for src in "${paths[@]}"; do
+      if [ -d "$src" ]; then
+        # Relative names, so the same directory hashes the same wherever the
+        # project lives on the host; sorted, so order is deterministic.
+        ( cd "$src" && find . -type f -print0 | sort -z \
+            | xargs -0 -r sha256sum ) || exit 1
+      elif [ -f "$src" ]; then
+        sha256sum < "$src" || exit 1
+      else
+        log_error "config fingerprint: '$src' is neither a file nor a directory"
+        exit 1
+      fi
+    done | sha256sum | cut -d' ' -f1
+  )
 }
 
 image_version_label() {

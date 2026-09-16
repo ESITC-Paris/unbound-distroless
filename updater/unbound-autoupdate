@@ -51,7 +51,14 @@ if ! pull_out=$(compose pull --quiet "$TARGET_SERVICE" 2>&1); then
   exit 1
 fi
 DECLARED=$(declared_digest)
-CONF_HASH=$(config_fingerprint)
+# An explicit failure path rather than letting `set -e` kill the script: a
+# fingerprint that cannot be computed must still reach Healthchecks as a
+# failed cycle, not as a start ping that never completes.
+if ! CONF_HASH=$(config_fingerprint); then
+  log_error "cannot fingerprint the declared configuration"
+  hc_fail "config fingerprint failed"
+  exit 1
+fi
 LAST_CONF=$(state_get LAST_CONFIG_HASH)
 
 image_changed=0; conf_changed=0
