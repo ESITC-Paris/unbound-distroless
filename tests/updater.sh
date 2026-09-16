@@ -350,6 +350,41 @@ t0_cycle_metrics_unit() {
   pass "record_cycle persists status and counters and writes a valid metrics.prom"
 }
 
+t0_helper_lock_unit() {
+  # The self-update helper writes the SAME state file a cycle writes, from a
+  # different container, and the sidecar it has just recreated may already be
+  # running its first cycle. state_set is read-modify-write, so an interleaved
+  # writer silently drops the other's keys — and the key at risk is the self
+  # quarantine, without which a sidecar image that cannot start is relaunched
+  # every cycle forever. The helper must therefore take the cycle lock.
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    export STATE_DIR=/tmp/st RETRY_AFTER=24h
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    . /usr/local/lib/unbound-autoupdate/selfupdate.sh
+    state_init
+    # A cycle is already holding the lock, as one legitimately can be.
+    flock "$LOCK_FILE" sleep 4 &
+    holder=$!
+    sleep 0.5
+    start=$(date -u +%s)
+    _self_update_record_failure "repo@sha256:deadbeef"
+    waited=$(( $(date -u +%s) - start ))
+    wait "$holder"
+    [ "$waited" -ge 3 ] || { echo "the helper wrote state after ${waited}s — it did not wait for the cycle lock"; exit 1; }
+    [ "$(state_get SELF_QUARANTINE_DIGEST)" = "repo@sha256:deadbeef" ] || { echo "the quarantine key did not land"; exit 1; }
+    grep -q "^unbound_autoupdate_quarantine_active{axis=\"self\"} 1$" "$METRICS_FILE" \
+      || { echo "metrics.prom was not rewritten"; exit 1; }
+    # And the lock is released again, or the next cycle would block forever.
+    flock -w 5 "$LOCK_FILE" true || { echo "the helper did not release the cycle lock"; exit 1; }
+    echo OK') || fail "helper lock unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "helper lock unit did not print OK: $out"
+  pass "the self-update helper waits for the cycle lock before writing state, and releases it"
+}
+
 t_discover() {
   local dir="$TEST_TMPDIR/upd-discover-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -795,7 +830,32 @@ LABEL test.selfupdate=\"2\"" "unbound-autoupdate:1")
     || fail "SELF_UPDATE_TS not recorded"
   updater_exec "$dir" grep -qE '^unbound_autoupdate_self_update_last_timestamp_seconds [0-9]{10}$' /var/lib/unbound-autoupdate/metrics.prom \
     || fail "metrics.prom does not reflect the self-update"
-  pass "self-update: a key-signed newer sidecar image is applied to both services by the ephemeral helper"
+
+  # A helper from an earlier cycle may still be at work. A second one would
+  # run `compose up` on the very services the first is still waiting on, so a
+  # cycle that sees one must skip its own self-update entirely — even with a
+  # genuinely newer, signed image available. The relay lives in the sidecar
+  # container, which the self-update just replaced, so it has to be re-armed
+  # before the registry is reachable from inside it again.
+  registry_forward "$dir"
+  local blocker="upd-selfup-helper-$$"
+  blocker_track "$blocker"
+  docker run -d --name "$blocker" --label unbound-autoupdate.helper=1 \
+    --entrypoint sleep "$UPDATER_IMAGE" 300 >/dev/null
+  local v3
+  v3=$(registry_publish "FROM $UPDATER_IMAGE
+LABEL test.selfupdate=\"3\"" "unbound-autoupdate:1")
+  registry_sign "$dir" "$v3"
+  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 2>&1) \
+    || fail "cycle with a helper still running failed: $out"
+  grep -q 'a helper is still running' <<<"$out" \
+    || fail "a second helper was launched while one was still running: $out"
+  [ "$(fixture_service_image_id "$dir" updater)" = "$id2" ] \
+    || fail "the sidecar moved again while a helper was still running"
+  [ "$(docker ps -q --filter label=unbound-autoupdate.helper=1 | wc -l)" -eq 1 ] \
+    || fail "a second apply helper was started"
+  docker rm -f "$blocker" >/dev/null
+  pass "self-update: a key-signed newer sidecar image is applied to both services by the ephemeral helper, and no second helper is ever launched"
 }
 
 t_self_update_rolls_back() {
@@ -1194,6 +1254,7 @@ ALL_TESTS="
   t0_config_fingerprint_directory_unit
   t0_stats_to_prometheus_unit
   t0_cycle_metrics_unit
+  t0_helper_lock_unit
   t_discover
   t_config_fingerprint_handles_spaces
   t_validate

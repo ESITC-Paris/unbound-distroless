@@ -69,6 +69,18 @@ self_update() {
   SELF_UPDATE_LAUNCHED=0
   [ "$SELF_UPDATE" = 1 ] || return 0
 
+  # A helper launched by an earlier cycle may still be at work: it recreates
+  # the sidecar, then waits 30 s on it before moving the other services. A
+  # second helper would run `compose up` on the very containers the first one
+  # is still judging, and each would draw its verdict from the other's work.
+  # One at a time, always — the next cycle picks the update up.
+  local helpers
+  helpers=$(docker ps -q --filter label=unbound-autoupdate.helper=1 2>/dev/null) || helpers=""
+  if [ -n "$helpers" ]; then
+    log_info "self-update: a helper is still running — skipped"
+    return 0
+  fi
+
   local self_service running cfg self_ref declared s
   self_service=$(_label "$SELF_ID" com.docker.compose.service)
   running=$(_self_running_digest)
@@ -158,6 +170,41 @@ _self_services_healthy() {
   return 0
 }
 
+# _self_take_cycle_lock / _self_release_cycle_lock — the helper writes the SAME
+# state file a cycle writes, from a different container, and by the time it
+# gets here the sidecar it has just recreated may already be running its first
+# cycle under that cycle's own flock. state_set is read-modify-write (grep -v
+# into a temporary file, then mv), so two writers interleaving silently drop
+# each other's keys — and the key at stake on the failure path is the self
+# quarantine: lose it and the sidecar image that cannot start is relaunched on
+# every single cycle, which is precisely what the quarantine exists to stop.
+# The compose work deliberately stays OUTSIDE the lock; only the state
+# mutations need it, and holding it across a 30 s soak would block cycles for
+# no reason.
+_self_take_cycle_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -w 120 9 || log_die "self-update helper: could not take the cycle lock within 120 s"
+}
+_self_release_cycle_lock() { exec 9>&-; }
+
+# _self_update_record_success / _self_update_record_failure <new_digest> — the
+# helper's state mutations, under the cycle lock, in functions of their own so
+# the locking itself can be tested directly.
+_self_update_record_success() {
+  _self_take_cycle_lock
+  self_quarantine_clear
+  state_set SELF_UPDATE_TS "$(date -u +%s)"
+  write_cycle_metrics
+  _self_release_cycle_lock
+}
+
+_self_update_record_failure() {
+  _self_take_cycle_lock
+  self_quarantine_set "$1"
+  write_cycle_metrics
+  _self_release_cycle_lock
+}
+
 # self_update_apply <project> <workdir> <old_digest> <new_digest> <files_csv> <self_service> [services…]
 # Runs in the ephemeral helper, on the NEW image. Never returns.
 self_update_apply() {
@@ -212,9 +259,7 @@ self_update_apply() {
   fi
 
   if [ "$ok" = 1 ]; then
-    self_quarantine_clear
-    state_set SELF_UPDATE_TS "$(date -u +%s)"
-    write_cycle_metrics
+    _self_update_record_success
     log_info "self-update helper: sidecar now runs $new (services: ${moved[*]})"
     notify updated "sidecar updated" "unbound-autoupdate moved from $old to $new (unbound-autoupdate $(image_version_label "$new")) and its services (${moved[*]}) are running."
     exit 0
@@ -230,8 +275,7 @@ self_update_apply() {
   out=$(compose up -d --no-deps "${moved[@]}" 2>&1) || rb_ok=0
   unset COMPOSE_EXTRA_FILE
   [ "$rb_ok" = 1 ] || { log_error "self-update helper: rollback compose up failed"; printf '%s\n' "$out" >&2; }
-  self_quarantine_set "$new"
-  write_cycle_metrics
+  _self_update_record_failure "$new"
   if [ "$rb_ok" = 1 ]; then
     notify critical "sidecar self-update FAILED — rolled back" "The new sidecar image $new did not come up. Services ${moved[*]} were pinned back to $old. $new is quarantined for RETRY_AFTER=${RETRY_AFTER:-24h}. The compose file still declares the failing tag."
   else
