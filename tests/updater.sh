@@ -215,12 +215,18 @@ t_discover() {
     echo "fp=$(config_fingerprint)"
     echo "running=$(running_digest)"
     echo "composefiles=${COMPOSE_FILE_ARGS[*]}"
+    echo "selfimageid=$SELF_IMAGE_ID"
+    echo "repo=$(_image_repo "127.0.0.1:5000/unbound-x:1") $(_image_repo "127.0.0.1:5000/unbound-x@sha256:abc") $(_image_repo "esitcparis/unbound-distroless:1.26.0-r3")"
     echo "notifyhost=$(_notify_host)"') || fail "discover_target failed: $out"
 
   # With the socket mounted, notifications carry the DAEMON host's name —
   # the machine the operator knows — not the sidecar's container id.
   grep -q "^notifyhost=$(docker info --format '{{.Name}}')\$" <<<"$out" \
     || fail "notify host is not the docker daemon's host name: $out"
+
+  grep -qE '^selfimageid=sha256:[0-9a-f]{64}$' <<<"$out" || fail "SELF_IMAGE_ID not derived: $out"
+  grep -q '^repo=127.0.0.1:5000/unbound-x 127.0.0.1:5000/unbound-x esitcparis/unbound-distroless$' <<<"$out" \
+    || fail "_image_repo mishandles a registry port, a digest or a tag: $out"
 
   grep -q '^service=unbound$'                       <<<"$out" || fail "bad service: $out"
   grep -q "^workdir=$dir\$"                         <<<"$out" || fail "bad workdir: $out"
@@ -236,7 +242,7 @@ t_discover() {
   # which adds a second -f, ever noticed.
   grep -q "^composefiles=-f $dir/docker-compose.yml\$" <<<"$out" \
     || fail "COMPOSE_FILE_ARGS was not derived from the compose label: $out"
-  pass "discovery derives service, workdir, declared ref, volume, bind mounts, compose file args"
+  pass "discovery derives service, workdir, declared ref, volume, bind mounts, compose file args; a sibling on the sidecar's own image is never a candidate"
 }
 
 t_config_fingerprint_handles_spaces() {

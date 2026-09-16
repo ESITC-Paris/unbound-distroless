@@ -52,6 +52,11 @@ info() { echo "---- $*"; }
 # four spaces, i.e. service-level keys) appended to the respective service,
 # for tests that need a differently shaped project at CREATION time — a
 # read-only rootfs, a host-networked sidecar. Empty by default.
+#
+# FIXTURE_UPDATER_IMAGE: image reference for BOTH sidecar services (updater and
+# metrics); defaults to the locally built test image. The self-update tests
+# point it at the throwaway registry so that `compose pull` has somewhere to
+# pull from and the running sidecar carries a repository digest.
 fixture_create() {
   local dir="$1" ref="$2"
   mkdir -p "$dir"
@@ -69,8 +74,8 @@ services:
       - ./unbound.conf:/etc/unbound/unbound.conf:ro
 ${FIXTURE_UNBOUND_EXTRA:-}
   updater:
-    image: $UPDATER_IMAGE
-    entrypoint: ["sleep", "infinity"]
+    image: ${FIXTURE_UPDATER_IMAGE:-$UPDATER_IMAGE}
+    command: ["idle"]
     environment:
       STATE_DIR: /var/lib/unbound-autoupdate
     volumes:
@@ -78,6 +83,14 @@ ${FIXTURE_UNBOUND_EXTRA:-}
       - $dir:$dir:ro
       - ustate:/var/lib/unbound-autoupdate
 ${FIXTURE_UPDATER_EXTRA:-}
+  metrics:
+    image: ${FIXTURE_UPDATER_IMAGE:-$UPDATER_IMAGE}
+    command: ["metrics"]
+    ports:
+      - "127.0.0.1::9167"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ustate:/var/lib/unbound-autoupdate:ro
 volumes:
   state:
   ustate:

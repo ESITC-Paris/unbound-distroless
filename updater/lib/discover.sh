@@ -65,22 +65,44 @@ _compose_file_args() {
   done < <(printf '%s\n' "$files" | tr ',' '\n')
 }
 
-discover_target() {
+# _image_repo <ref> — the repository part of an image reference: no tag, no
+# digest. "127.0.0.1:5000/unbound-x:1" and "127.0.0.1:5000/unbound-x@sha256:…"
+# both give "127.0.0.1:5000/unbound-x". The registry port is not a tag: only
+# the LAST path component is inspected for a colon.
+_image_repo() {
+  local ref="${1%%@*}" last
+  last="${ref##*/}"
+  case "$last" in *:*) ref="${ref%:*}" ;; esac
+  printf '%s\n' "$ref"
+}
+
+# discover_target_container — SELF_* and the target container, from labels
+# only. Enough for the metrics CGI, which must not need the compose project
+# files; discover_target builds on it.
+discover_target_container() {
   SELF_ID=$(discover_self_id) || log_die "cannot determine my own container id — is /var/run/docker.sock mounted?"
   # Produced for callers (target_probe_ip's network_mode: host check, and
   # later tasks); shellcheck cannot see that use from this file alone.
   # shellcheck disable=SC2034
   SELF_IMAGE=$(docker inspect "$SELF_ID" --format '{{.Config.Image}}')
+  # shellcheck disable=SC2034
+  SELF_IMAGE_ID=$(docker inspect "$SELF_ID" --format '{{.Image}}')
 
   COMPOSE_PROJECT=$(_label "$SELF_ID" com.docker.compose.project)
   [ -n "$COMPOSE_PROJECT" ] || log_die "this container is not managed by docker compose"
 
   # Candidate = sibling service in the same project whose image repository
   # mentions unbound. Deliberately loose so forks and private mirrors work.
-  local candidates=() cid
+  # A sibling running the sidecar's OWN image (the metrics service, a second
+  # updater) is never the resolver, whatever its repository name contains —
+  # and "unbound-autoupdate" does contain "unbound".
+  local candidates=() cid img self_repo
+  self_repo=$(_image_repo "$SELF_IMAGE")
   while read -r cid; do
     [ "$cid" = "$SELF_ID" ] && continue
-    case "$(docker inspect "$cid" --format '{{.Config.Image}}')" in
+    img=$(docker inspect "$cid" --format '{{.Config.Image}}' 2>/dev/null) || continue
+    [ "$(_image_repo "$img")" = "$self_repo" ] && continue
+    case "$img" in
       *unbound*) candidates+=("$cid") ;;
     esac
   done < <(docker ps --no-trunc --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.ID}}')
@@ -99,6 +121,11 @@ discover_target() {
   fi
 
   TARGET_SERVICE=$(_label "$TARGET_CONTAINER" com.docker.compose.service)
+}
+
+discover_target() {
+  discover_target_container
+
   COMPOSE_WORKDIR=$(_label "$TARGET_CONTAINER" com.docker.compose.project.working_dir)
   local files; files=$(_label "$TARGET_CONTAINER" com.docker.compose.project.config_files)
   [ -n "$files" ] && [ -n "$COMPOSE_WORKDIR" ] || log_die "target container carries no compose file labels"
