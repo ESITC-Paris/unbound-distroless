@@ -752,6 +752,99 @@ LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
   pass "T8: major bump refused by default; ALLOW_MAJOR=1 passes the version guard and is stopped only by the cosign gate"
 }
 
+t_self_update_applies() {
+  # The sidecar's own services are declared on a throwaway-registry tag. A
+  # newer, key-signed image appears under that tag; at the end of an
+  # up-to-date cycle the sidecar must verify it and hand the recreation to
+  # an ephemeral helper running the NEW image, because a `compose up` run
+  # from inside the container being replaced dies when Compose stops it.
+  local dir="$TEST_TMPDIR/upd-selfup-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  local v1 v2
+  v1=$(registry_publish "FROM $UPDATER_IMAGE
+LABEL test.selfupdate=\"1\"" "unbound-autoupdate:1")
+  FIXTURE_UPDATER_IMAGE="$v1" fixture_create "$dir" "$MOVING_REF"
+  registry_forward "$dir"
+  cosign_test_keys "$dir"
+  local id1; id1=$(fixture_service_image_id "$dir" updater)
+  [ -n "$id1" ] || fail "setup: updater service not running"
+
+  # Same tag, new bits, signed with the test key.
+  v2=$(registry_publish "FROM $UPDATER_IMAGE
+LABEL test.selfupdate=\"2\"" "unbound-autoupdate:1")
+  registry_sign "$dir" "$v2"
+  local id2; id2=$(docker image inspect "$v2" --format '{{.Id}}')
+  [ "$id1" != "$id2" ] || fail "setup: v1 and v2 have the same image id"
+
+  local out
+  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 2>&1) || fail "cycle with a pending self-update failed: $out"
+  grep -q 'launching the apply helper' <<<"$out" || fail "self-update was not launched: $out"
+
+  local _i
+  for _i in $(seq 1 30); do
+    [ "$(fixture_service_image_id "$dir" updater)" = "$id2" ] \
+      && [ "$(fixture_service_image_id "$dir" metrics)" = "$id2" ] && break
+    sleep 3
+  done
+  [ "$(fixture_service_image_id "$dir" updater)" = "$id2" ] || fail "updater service is not on the new image after 90s"
+  [ "$(fixture_service_image_id "$dir" metrics)" = "$id2" ] || fail "metrics service is not on the new image after 90s"
+  sleep 3
+  [ -z "$(docker ps -aq --filter label=unbound-autoupdate.helper=1)" ] || fail "the apply helper container was left behind"
+  updater_exec "$dir" grep -q '^SELF_UPDATE_TS=[0-9]' /var/lib/unbound-autoupdate/state.env \
+    || fail "SELF_UPDATE_TS not recorded"
+  updater_exec "$dir" grep -qE '^unbound_autoupdate_self_update_last_timestamp_seconds [0-9]{10}$' /var/lib/unbound-autoupdate/metrics.prom \
+    || fail "metrics.prom does not reflect the self-update"
+  pass "self-update: a key-signed newer sidecar image is applied to both services by the ephemeral helper"
+}
+
+t_self_update_rolls_back() {
+  # The newer image is signed and pulls fine, but the updater container
+  # built from it dies at start: its entrypoint no longer knows the fixture's
+  # `idle` mode. The breakage is deliberately confined to that mode so the
+  # helper (which runs on the same new image, in self-update-apply mode) and
+  # the metrics service both work — this test is about the helper noticing
+  # a dead sidecar, pinning both services back to the previous digest, and
+  # quarantining the new digest so the next cycle does not try again.
+  local dir="$TEST_TMPDIR/upd-selfrb-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  local v1 v2
+  v1=$(registry_publish "FROM $UPDATER_IMAGE
+LABEL test.selfupdate=\"1\"" "unbound-autoupdate:1")
+  FIXTURE_UPDATER_IMAGE="$v1" fixture_create "$dir" "$MOVING_REF"
+  registry_forward "$dir"
+  cosign_test_keys "$dir"
+  local id1; id1=$(fixture_service_image_id "$dir" updater)
+
+  v2=$(registry_publish "FROM $UPDATER_IMAGE
+RUN sed -i 's/^  idle)\$/  idle-gone)/' /usr/local/bin/entrypoint.sh
+LABEL test.selfupdate=\"broken\"" "unbound-autoupdate:1")
+  registry_sign "$dir" "$v2"
+  local d2; d2=$(docker image inspect "$v2" --format '{{index .RepoDigests 0}}')
+
+  local out
+  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 2>&1) || fail "cycle failed before launching the helper: $out"
+  grep -q 'launching the apply helper' <<<"$out" || fail "self-update was not launched: $out"
+
+  # The helper waits up to 30 s before rolling back; give it time.
+  local _i
+  for _i in $(seq 1 40); do
+    updater_exec "$dir" grep -q "^SELF_QUARANTINE_DIGEST=$d2\$" /var/lib/unbound-autoupdate/state.env 2>/dev/null && break
+    sleep 3
+  done
+  updater_exec "$dir" grep -q "^SELF_QUARANTINE_DIGEST=$d2\$" /var/lib/unbound-autoupdate/state.env \
+    || fail "the broken sidecar image was not quarantined: $(updater_exec "$dir" cat /var/lib/unbound-autoupdate/state.env 2>/dev/null)"
+  [ "$(fixture_service_image_id "$dir" updater)" = "$id1" ] || fail "updater service was not rolled back to the previous image"
+  [ "$(fixture_service_image_id "$dir" metrics)" = "$id1" ] || fail "metrics service was not rolled back to the previous image"
+  updater_exec "$dir" grep -q '^unbound_autoupdate_quarantine_active{axis="self"} 1$' /var/lib/unbound-autoupdate/metrics.prom \
+    || fail "metrics.prom does not show the self quarantine"
+  # And the next cycle must deliberately leave it alone.
+  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 2>&1) || fail "cycle after a self-rollback failed: $out"
+  grep -q 'quarantined after a failed self-update' <<<"$out" || fail "quarantined sidecar image was retried: $out"
+  pass "self-update: a sidecar image that cannot start is rolled back on both services and quarantined"
+}
+
 t_modes() {
   local dir="$TEST_TMPDIR/upd-modes-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -1120,6 +1213,8 @@ ALL_TESTS="
   t_verify_key_accepts_signed
   t6_unsigned_image_refused
   t8_major_bump_refused
+  t_self_update_applies
+  t_self_update_rolls_back
   t7a_failed_swap_is_loud
   t7b_rollback_restores_previous_digest
 "

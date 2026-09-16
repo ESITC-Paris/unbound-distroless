@@ -222,6 +222,16 @@ running_ref() {
   docker inspect "$cid" --format '{{.Image}}'
 }
 
+# fixture_service_image_id <dir> <service> — image ID the service's container
+# runs, or empty when it has no running container.
+fixture_service_image_id() {
+  local cid
+  cid=$(docker compose -p "$(fixture_project "$1")" --project-directory "$1" \
+        -f "$1/docker-compose.yml" ps -q "$2" 2>/dev/null | head -1)
+  [ -n "$cid" ] || { echo ""; return 0; }
+  docker inspect "$cid" --format '{{.Image}}' 2>/dev/null || echo ""
+}
+
 # OLD_REF is an immutable published revision; MOVING_REF is the tag users
 # actually track. A cycle must move the container from one to the other.
 OLD_REF="${OLD_REF:-esitcparis/unbound-distroless:1.26.0-r0}"

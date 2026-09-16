@@ -23,6 +23,8 @@ LIB=/usr/local/lib/unbound-autoupdate
 . "$LIB/verify.sh"
 # shellcheck source=updater/lib/metrics.sh
 . "$LIB/metrics.sh"
+# shellcheck source=updater/lib/selfupdate.sh
+. "$LIB/selfupdate.sh"
 
 WATCH_CONFIG="${WATCH_CONFIG:-1}"
 ALLOW_MAJOR="${ALLOW_MAJOR:-0}"
@@ -112,8 +114,9 @@ fi
 
 if [ "$image_changed" = 0 ] && [ "$conf_changed" = 0 ] && [ "$CHECK_ONLY" != 1 ]; then
   log_info "up to date ($RUNNING)"
-  hc_success
-  finish up_to_date 0
+  if self_update; then hc_success; finish up_to_date 0; fi
+  hc_fail "sidecar self-update refused"
+  finish blocked 1
 fi
 
 if [ "$image_changed" = 1 ] && quarantine_active "$DECLARED"; then
@@ -254,8 +257,9 @@ if [ "$post_swap_ok" = 1 ]; then
   version=$(image_version_label "$DECLARED")
   log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
   notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
-  hc_success
-  finish updated 0
+  if self_update; then hc_success; finish updated 0; fi
+  hc_fail "sidecar self-update refused"
+  finish blocked 1
 fi
 
 # _TEST_FORCE_POSTSWAP_FAIL exists so the integration suite can exercise the
