@@ -208,13 +208,16 @@ t0_stats_to_prometheus_unit() {
 thread0.num.queries=7
 thread0.num.cachehits=3
 thread0.requestlist.avg=0.5
+thread0.query.queue_time_us.max=0
 thread1.num.queries=5
 thread1.num.cachehits=2
 thread1.requestlist.avg=0
+thread1.query.queue_time_us.max=1500
 total.num.queries=12
 total.num.cachehits=5
 total.num.recursivereplies=4
 total.requestlist.avg=0.25
+total.query.queue_time_us.max=1500
 total.recursion.time.avg=0.125000
 total.recursion.time.median=0.05
 total.tcpusage=0
@@ -259,6 +262,8 @@ STATS
     '^unbound_query_aggressive_total{rcode="NXDOMAIN"} 1$' \
     '^unbound_answers_secure_total 9$' \
     '^unbound_recursion_time_seconds{stat="median"} 0.05$' \
+    '^unbound_query_queue_time_seconds\{stat="max"\} 0.001500$' \
+    '^unbound_thread_query_queue_time_seconds\{thread="1",stat="max"\} 0.001500$' \
     '^unbound_time_up_seconds 100.5' \
     '^unbound_mem_cache_rrset_bytes 4096$' \
     '^unbound_cache_entries{cache="rrset"} 20$' \
@@ -797,6 +802,59 @@ t_loop_sigterm() {
   pass "loop mode stops in under 4 s on SIGTERM"
 }
 
+t_metrics_scrape() {
+  local dir="$TEST_TMPDIR/upd-metrics-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+
+  local addr out="$TEST_TMPDIR/upd-metrics-$$.prom" _i
+  # An up-to-date cycle never queries production, and unbound prints no
+  # num.query.type.* key at all for a type it has never seen. Ask the
+  # resolver something real first, or the per-type and per-rcode assertions
+  # below would be asserting the absence of traffic rather than the exporter.
+  for _i in $(seq 1 5); do
+    updater_exec "$dir" dig +time=5 +tries=2 @unbound example.com A 2>/dev/null \
+      | grep -q 'status: NOERROR' && break
+    [ "$_i" -lt 5 ] || fail "the fixture resolver never answered a query — the scrape would carry no per-type statistics"
+    sleep 3
+  done
+  addr=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" port metrics 9167)
+  [ -n "$addr" ] || fail "metrics service publishes no port"
+  for _i in $(seq 1 15); do
+    curl -fsS -o "$out" "http://$addr/metrics" 2>/dev/null && break
+    sleep 1
+  done
+  [ -s "$out" ] || fail "/metrics never answered on $addr: $(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" logs metrics 2>&1 | tail -5)"
+  promtool_check "$out" || fail "/metrics rejected by promtool: $(head -40 "$out")"
+  local expect
+  for expect in \
+    '^unbound_exporter_scrape_success 1$' \
+    '^unbound_exporter_scrape_duration_seconds [0-9.]+$' \
+    '^unbound_queries_total [0-9]+$' \
+    '^unbound_query_types_total{type="A"} [0-9]+$' \
+    '^unbound_response_time_seconds_bucket{le="\+Inf"} [0-9]+$' \
+    '^unbound_time_up_seconds [0-9.]+$' \
+    '^unbound_autoupdate_last_cycle_status{status="up_to_date"} 1$' \
+    '^unbound_autoupdate_cycles_total{status="up_to_date"} 1$' \
+    '^unbound_autoupdate_target_image_info{digest="esitcparis/unbound-distroless@sha256:'; do
+    grep -qE "$expect" "$out" || fail "/metrics: missing '$expect' in: $(head -60 "$out")"
+  done
+  pass "/metrics serves unbound statistics and sidecar cycle metrics, promtool-clean"
+
+  # The resolver stopped: the scrape must still answer 200 with the sidecar
+  # metrics and say the unbound part failed — never a 5xx or a hang.
+  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" stop unbound >/dev/null 2>&1
+  local code
+  code=$(curl -s -o "$out" -w '%{http_code}' --max-time 20 "http://$addr/metrics")
+  [ "$code" = 200 ] || fail "/metrics returned HTTP $code with the resolver down"
+  grep -q '^unbound_exporter_scrape_success 0$' "$out" || fail "scrape_success not 0 with the resolver down: $(head -20 "$out")"
+  grep -q '^unbound_autoupdate_last_cycle_status' "$out" || fail "sidecar metrics missing with the resolver down"
+  promtool_check "$out" || fail "degraded /metrics rejected by promtool"
+  rm -f "$out"
+  pass "/metrics degrades to scrape_success=0 with HTTP 200 when the resolver is down"
+}
+
 t1_image_update_actually_lands() {
   local dir="$TEST_TMPDIR/upd-t1-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -1054,6 +1112,7 @@ ALL_TESTS="
   t_canary_refused_in_host_network_mode
   t_modes
   t_loop_sigterm
+  t_metrics_scrape
   t1_image_update_actually_lands
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle

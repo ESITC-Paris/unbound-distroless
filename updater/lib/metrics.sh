@@ -39,6 +39,22 @@ stats_to_prometheus() {
     # metric lost precisely when something is already going wrong. Drop it.
     if (NF < 2 || $1 == "") next
     k=$1; v=$2
+    # unbound 1.26 prints the queue-time maximum in MICROseconds
+    # (total.query.queue_time_us.max). Passed through verbatim it becomes
+    # unbound_query_queue_time_us_max, which promlint rejects twice over: an
+    # abbreviated unit, and not the base unit Prometheus mandates. Converted
+    # to seconds here, and carrying the same "stat" label as the recursion
+    # times below rather than a _max suffix, so the two time families in this
+    # exposition have one shape.
+    if (k ~ /^thread[0-9]+\.query\.queue_time_us\.max$/) {
+      t=k; sub(/^thread/, "", t); sub(/\..*$/, "", t)
+      family("unbound_thread_query_queue_time_seconds", "gauge", "Per-thread longest time a query waited in the queue, in seconds.")
+      sample("unbound_thread_query_queue_time_seconds", "thread=\"" t "\",stat=\"max\"", sprintf("%.6f", v / 1000000)); next
+    }
+    if (k == "total.query.queue_time_us.max") {
+      family("unbound_query_queue_time_seconds", "gauge", "Longest time a query waited in the queue, in seconds.")
+      sample("unbound_query_queue_time_seconds", "stat=\"max\"", sprintf("%.6f", v / 1000000)); next
+    }
     if (k ~ /^thread[0-9]+\./) {
       t=k; sub(/^thread/, "", t); sub(/\..*$/, "", t)
       rest=k; sub(/^thread[0-9]+\./, "", rest)
@@ -181,7 +197,13 @@ record_cycle() {
   write_cycle_metrics
 }
 
-# Provisional stub, replaced by the real busybox-httpd server in the metrics
-# task. Declared here so `entrypoint.sh metrics` fails by name rather than
-# with an unbound-command error.
-exec_metrics_server() { log_die "metrics mode: not implemented yet"; }
+# exec_metrics_server — busybox httpd in the foreground, docroot www/, with
+# a proxy rule so the public path is /metrics rather than /cgi-bin/metrics.
+# httpd is the process; tini forwards SIGTERM to it.
+exec_metrics_server() {
+  local port="${METRICS_PORT:-9167}" conf=/tmp/httpd.conf
+  case "$port" in ''|*[!0-9]*) log_die "invalid METRICS_PORT: $port";; esac
+  sed "s/@PORT@/$port/" "$_LIB_DIR/www/httpd.conf.tmpl" > "$conf"
+  log_info "unbound-autoupdate $(cat "$_LIB_DIR/VERSION" 2>/dev/null || echo dev) metrics mode: serving /metrics on port $port"
+  exec httpd -f -p "$port" -h "$_LIB_DIR/www" -c "$conf"
+}
