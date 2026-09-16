@@ -206,7 +206,7 @@ time.
 | Situation | Exit code | Healthchecks | Notification event | Metric status |
 |---|---|---|---|---|
 | Nothing new | 0 | `/start`, success | — | `up_to_date` |
-| First cycle on a host (baseline recorded; the cycle then continues) | — | — | `baseline` | the cycle's own |
+| First cycle on a host (baseline recorded; the cycle then continues) | the cycle's own | `/start`, then the cycle's own | `baseline` | the cycle's own |
 | `check` mode, everything validated | 0 | `/start`, success | — | `check_ok` |
 | Pull or config fingerprint failed | 1 | `/start`, `/fail` | — | `blocked` |
 | Unsigned image (cosign refused it) | 1 | `/start`, `/fail` | `blocked` | `blocked` |

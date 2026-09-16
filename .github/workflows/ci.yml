@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['docs/**', '*.md']
+    paths-ignore: ['**.md', 'docs/superpowers/**']
   pull_request:
-    paths-ignore: ['docs/**', '*.md']
+    paths-ignore: ['**.md', 'docs/superpowers/**']
   workflow_dispatch:
 
 permissions:
