@@ -83,6 +83,10 @@ jobs:
           NEW_COSIGN: ${{ steps.digests.outputs.cosign }}
         run: |
           # The logic lives in a script so tests/monitor.sh can exercise it.
+          # pipefail: without it the pipeline's status is tee's, so a crashed
+          # decision script would be a green step with empty outputs — and an
+          # empty action would then be treated as "publish" downstream.
+          set -o pipefail
           bash .github/scripts/decide-updates.sh | tee -a "$GITHUB_OUTPUT"
 
       - name: Update pins for a new Unbound version
@@ -148,7 +152,9 @@ jobs:
           echo "UPDATER_REVISION=$NEWREV" >> "$GITHUB_ENV"
 
       - name: Commit state, tag, and dispatch releases
-        if: steps.decide.outputs.action != 'none' || steps.decide.outputs.updater_action != 'none'
+        # Positive guards only: an empty output (a crashed decision step) must
+        # never be read as "something to publish".
+        if: steps.decide.outputs.action == 'version' || steps.decide.outputs.action == 'revision' || steps.decide.outputs.updater_action == 'revision'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTION: ${{ steps.decide.outputs.action }}
@@ -162,9 +168,19 @@ jobs:
           . ./versions.env
           printf '{\n  "debian": "%s",\n  "distroless": "%s",\n  "alpine": "%s",\n  "cosign": "%s"\n}\n' \
             "$NEW_DEBIAN" "$NEW_DISTROLESS" "$NEW_ALPINE" "$NEW_COSIGN" > .build-state.json
+          # Explicit `if`, not `[ … ] && TAGS+=(…)`: an &&-list whose left half
+          # fails is exempt from `set -e` only by a subtlety no reader should
+          # have to recall. Only the two decisions that mean "publish" add a tag.
           TAGS=()
-          [ "$ACTION" != none ] && TAGS+=("v${UNBOUND_VERSION}-r${REVISION}")
-          [ "$UPDATER_ACTION" != none ] && TAGS+=("updater-v${UPDATER_VERSION}-r${UPDATER_REVISION}")
+          if [ "$ACTION" = version ] || [ "$ACTION" = revision ]; then
+            TAGS+=("v${UNBOUND_VERSION}-r${REVISION}")
+          fi
+          if [ "$UPDATER_ACTION" = revision ]; then
+            TAGS+=("updater-v${UPDATER_VERSION}-r${UPDATER_REVISION}")
+          fi
+          # Belt and braces: reaching here with nothing to tag means the decision
+          # outputs were not what the step guard claimed. Never commit blind.
+          [ "${#TAGS[@]}" -gt 0 ] || { echo "::error::no tag to publish despite a non-none decision"; exit 1; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add versions.env .build-state.json

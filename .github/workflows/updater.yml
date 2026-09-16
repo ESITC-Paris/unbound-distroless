@@ -326,7 +326,9 @@ jobs:
           DIGEST_HUB: ${{ steps.digest.outputs.hub }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh issue create \
+          # --repo is required: this job never checks the repository out, so gh
+          # has no git remote to infer it from.
+          gh issue create --repo "$GITHUB_REPOSITORY" \
             --title "Published $TAG" \
             --assignee euca01 \
             --body "$(printf 'Sidecar release %s was published automatically.\n\nImage: %s:%s\nDigest: %s\nRun: %s\n\nThis is a notification issue — close it after reading.' \
