@@ -292,6 +292,37 @@ t_validate() {
   pass "readiness probe and DNS criteria (UDP, TCP, AD flag); dead address rejected"
 }
 
+t_validate_dnssec_optional() {
+  # A resolver deliberately run without the validator (module-config
+  # "iterator", e.g. a forwarder to an internal, unsigned upstream) never
+  # sets the AD flag. Requiring it by default is right — but with no way to
+  # opt out, such a deployment would be refused on EVERY cycle forever, the
+  # permanent-update-block class the sidecar exists to remove.
+  local dir="$TEST_TMPDIR/upd-nodnssec-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+  sed -i.bak 's/^  module-config: "validator iterator"$/  module-config: "iterator"/' "$dir/unbound.conf"
+  rm -f "$dir/unbound.conf.bak"
+  grep -q '^  module-config: "iterator"$' "$dir/unbound.conf" || fail "test setup: could not disable the validator"
+  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d --force-recreate unbound ) >/dev/null 2>&1
+
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    . /usr/local/lib/unbound-autoupdate/validate.sh
+    discover_target
+    ip=$(target_probe_ip)
+    wait_resolver "$ip" 90 || { echo "readiness failed"; exit 1; }
+    if validate_resolver "$ip" 2>/dev/null; then echo "a non-validating resolver passed with DNSSEC required"; exit 1; fi
+    REQUIRE_DNSSEC=0 validate_resolver "$ip" || { echo "REQUIRE_DNSSEC=0 still demanded the AD flag"; exit 1; }
+    echo OK') || fail "dnssec-optional validation failed: $out"
+  grep -q '^OK$' <<<"$out" || fail "dnssec-optional validation did not reach OK: $out"
+  pass "DNSSEC AD flag is required by default and waived with REQUIRE_DNSSEC=0"
+}
+
 t4_invalid_conf_rejected() {
   local dir="$TEST_TMPDIR/upd-t4-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -693,6 +724,7 @@ ALL_TESTS="
   t_discover
   t_config_fingerprint_handles_spaces
   t_validate
+  t_validate_dnssec_optional
   t4_invalid_conf_rejected
   t5_healthcheck_breaking_conf
   t_canary_lifecycle
