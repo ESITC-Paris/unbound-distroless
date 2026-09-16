@@ -18,8 +18,12 @@ One cycle, every `INTERVAL`:
    then the declared repository digest against the running one. Independently,
    a SHA-256 fingerprint over *every* declared bind mount (not just
    `unbound.conf`: a rotated certificate is a change too) against the one
-   recorded at the last successful cycle. Nothing changed and nothing is due:
-   the cycle ends there.
+   recorded at the last successful cycle. A mount that is a directory is
+   expanded to the files beneath it **with symlinks followed**, so a `tls/`
+   directory in the Let's Encrypt `live/` layout is covered like any other;
+   a dangling symlink, or a directory mount that expands to no file at all,
+   fails the cycle loudly rather than quietly contributing nothing. Nothing
+   changed and nothing is due: the cycle ends there.
 3. **Quarantine** — an image digest or a configuration fingerprint that
    already failed a deployment is not retried before `RETRY_AFTER`. The two
    are separate axes, so a bad configuration does not hold back a good image,
