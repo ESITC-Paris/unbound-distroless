@@ -137,6 +137,24 @@ t0_compose_file_args_unit() {
   pass "compose file list: single, multiple, trailing separator, relative paths, rollback override filtered"
 }
 
+t0_notify_host_unit() {
+  # Notifications name the machine they come from. Inside a container,
+  # `hostname` is the container's short id, which tells an operator with a
+  # fleet of resolvers nothing. NOTIFY_HOST wins when set; otherwise the
+  # Docker daemon's own host name; only then the container hostname.
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    [ "$(NOTIFY_HOST=resolver-1.example _notify_host)" = "resolver-1.example" ] \
+      || { echo "NOTIFY_HOST override ignored"; exit 1; }
+    # No docker socket in this bare container: the fallback is the hostname.
+    [ "$(_notify_host)" = "$(hostname)" ] || { echo "fallback is not the hostname"; exit 1; }
+    echo OK') || fail "notify host unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "notify host unit did not print OK: $out"
+  pass "_notify_host honours NOTIFY_HOST and falls back to the container hostname"
+}
+
 t0_config_fingerprint_directory_unit() {
   # A declared bind mount may be a DIRECTORY (the shipped unbound.conf's DoT
   # example mounts a whole tls/ directory). The fingerprint must cover the
@@ -196,7 +214,13 @@ t_discover() {
     echo "bindmounts=${DECLARED_BIND_MOUNTS[*]}"
     echo "fp=$(config_fingerprint)"
     echo "running=$(running_digest)"
-    echo "composefiles=${COMPOSE_FILE_ARGS[*]}"') || fail "discover_target failed: $out"
+    echo "composefiles=${COMPOSE_FILE_ARGS[*]}"
+    echo "notifyhost=$(_notify_host)"') || fail "discover_target failed: $out"
+
+  # With the socket mounted, notifications carry the DAEMON host's name —
+  # the machine the operator knows — not the sidecar's container id.
+  grep -q "^notifyhost=$(docker info --format '{{.Name}}')\$" <<<"$out" \
+    || fail "notify host is not the docker daemon's host name: $out"
 
   grep -q '^service=unbound$'                       <<<"$out" || fail "bad service: $out"
   grep -q "^workdir=$dir\$"                         <<<"$out" || fail "bad workdir: $out"
@@ -664,6 +688,7 @@ ALL_TESTS="
   t0_state_unit
   t0_logfmt_unit
   t0_compose_file_args_unit
+  t0_notify_host_unit
   t0_config_fingerprint_directory_unit
   t_discover
   t_config_fingerprint_handles_spaces

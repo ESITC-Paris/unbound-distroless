@@ -27,13 +27,26 @@ log_warn()  { _log warn  "$1"; }
 log_error() { _log error "$1" >&2; }
 log_die()   { log_error "$1"; exit 1; }
 
+# _notify_host — the machine name a notification is attributed to. Inside a
+# container `hostname` is the container's short id, useless to an operator
+# running several resolvers. NOTIFY_HOST wins when set; otherwise the Docker
+# daemon's own host name (the sidecar always has the socket in normal
+# operation); the container hostname is only the last resort.
+_notify_host() {
+  local h
+  if [ -n "${NOTIFY_HOST:-}" ]; then printf '%s\n' "$NOTIFY_HOST"; return 0; fi
+  h=$(docker info --format '{{.Name}}' 2>/dev/null) || h=""
+  [ -n "$h" ] || h=$(hostname)
+  printf '%s\n' "$h"
+}
+
 # notify <event> <subject> <body>
 notify() {
   local event="$1" subject="$2" body="$3"
   printf 'ts=%s level=notice event=%s subject="%s"\n' "$(_ts)" "$event" "$(_logfmt_escape "$subject")"
   [ -n "${WEBHOOK_URL:-}" ] || return 0
   local payload
-  payload=$(jq -nc --arg e "$event" --arg h "$(hostname)" --arg s "$subject" --arg b "$body" \
+  payload=$(jq -nc --arg e "$event" --arg h "$(_notify_host)" --arg s "$subject" --arg b "$body" \
     '{event:$e, host:$h, subject:$s, body:$b, text:("[unbound-autoupdate] " + $h + " — " + $s + "\n" + $b)}')
   curl -fsS -m 15 --retry 2 -H 'Content-Type: application/json' \
     -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 \
