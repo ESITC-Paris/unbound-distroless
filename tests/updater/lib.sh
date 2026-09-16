@@ -149,6 +149,56 @@ registry_publish() {
   printf '%s\n' "$ref"
 }
 
+# registry_forward <dir> — make 127.0.0.1:5000 INSIDE the fixture's sidecar
+# reach the throwaway registry. The daemon pulls through the host's published
+# port, but cosign runs inside the sidecar where 127.0.0.1 is the container's
+# own loopback. The registry is connected to the fixture network under the
+# alias "registry" and a relay listens on the sidecar's own loopback for the
+# life of the fixture. Without this, an unsigned-image test fails on
+# "connection refused" instead of "no signatures found" — the right verdict
+# for the wrong reason.
+#
+# socat, installed into the test container at run time and NEVER into the
+# image: a busybox `nc -l -p 5000 -e nc registry 5000` loop serves exactly
+# one connection and then has to be respawned, and cosign's first request to
+# a loopback registry is an HTTPS probe immediately followed by the real HTTP
+# request — the second one lands in that gap and is refused. socat's `fork`
+# accepts them back to back.
+registry_forward() {
+  local dir="$1" net
+  net="$(fixture_project "$dir")_default"
+  docker network connect --alias registry "$net" "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  updater_exec "$dir" /bin/sh -c \
+    'command -v socat >/dev/null 2>&1 || apk add --no-cache socat >/dev/null 2>&1; \
+     nohup socat TCP-LISTEN:5000,fork,reuseaddr TCP:registry:5000 >/dev/null 2>&1 &'
+  # Prove the relay before any test relies on it.
+  local _i
+  for _i in $(seq 1 10); do
+    updater_exec "$dir" /bin/sh -c 'wget -qO- http://127.0.0.1:5000/v2/ >/dev/null 2>&1' && return 0
+    sleep 1
+  done
+  fail "registry relay inside the sidecar never came up"
+}
+
+# cosign_test_keys <dir> — a throwaway key pair in the sidecar's state volume,
+# so the same path is valid inside the updater container, the metrics
+# container and the self-update helper. Empty password; never leaves /tmp.
+cosign_test_keys() {
+  updater_exec "$1" /bin/sh -c \
+    'cd /var/lib/unbound-autoupdate && rm -f testkey.key testkey.pub && COSIGN_PASSWORD="" cosign generate-key-pair --output-key-prefix testkey >/dev/null 2>&1'
+}
+# shellcheck disable=SC2034  # read by tests/updater.sh, which sources this file
+TEST_PUBKEY=/var/lib/unbound-autoupdate/testkey.pub
+
+# registry_sign <dir> <ref> — sign <ref> in the throwaway registry with the
+# test key, from inside the sidecar (which is where the relay lives). No
+# transparency-log upload: this is a private, ephemeral registry.
+registry_sign() {
+  updater_exec "$1" /bin/sh -c \
+    "COSIGN_PASSWORD='' cosign sign --key /var/lib/unbound-autoupdate/testkey.key --tlog-upload=false --yes '$2' >/dev/null 2>&1" \
+    || fail "could not sign $2 with the test key"
+}
+
 # updater_exec <dir> <command…> — runs a command inside the fixture's sidecar.
 updater_exec() {
   local dir="$1"; shift

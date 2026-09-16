@@ -19,12 +19,12 @@ LIB=/usr/local/lib/unbound-autoupdate
 . "$LIB/validate.sh"
 # shellcheck source=updater/lib/canary.sh
 . "$LIB/canary.sh"
+# shellcheck source=updater/lib/verify.sh
+. "$LIB/verify.sh"
 
 WATCH_CONFIG="${WATCH_CONFIG:-1}"
 ALLOW_MAJOR="${ALLOW_MAJOR:-0}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
-COSIGN_IDENTITY_REGEXP="${COSIGN_IDENTITY_REGEXP:-https://github.com/ESITC-Paris/unbound-distroless/.*}"
-COSIGN_ISSUER="${COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 
 state_init
 exec 9>"$LOCK_FILE"
@@ -124,9 +124,7 @@ if [ "$image_changed" = 1 ]; then
   fi
   [ -n "$old_v" ] && [ -n "$new_v" ] || log_warn "one of the images carries no version label — major-version guard skipped"
 
-  if ! cosign verify "$DECLARED" \
-        --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" \
-        --certificate-oidc-issuer "$COSIGN_ISSUER" >/dev/null 2>&1; then
+  if ! verify_image "$DECLARED"; then
     log_error "cosign verification FAILED for $DECLARED — refusing to deploy"
     notify blocked "signature verification FAILED" "Image $DECLARED is not signed by the expected release pipeline. Deployment refused; production untouched. Investigate immediately."
     hc_fail "signature verification failed"

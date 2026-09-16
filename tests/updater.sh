@@ -491,6 +491,41 @@ t_canary_refused_in_host_network_mode() {
   pass "host-networked sidecar: canary refused up front with a precise message, nothing created"
 }
 
+t_verify_key_accepts_signed() {
+  # Key-based verification, for private mirrors that re-sign: an image
+  # signed with the configured public key passes, the same bits unsigned do
+  # not, and the refusal carries cosign's own reason — not a connection
+  # error, which is what an unreachable registry would produce.
+  local dir="$TEST_TMPDIR/upd-keyed-$$"
+  trap 'fixture_destroy "$dir"; registry_down' RETURN
+  registry_up
+  fixture_create "$dir" "$MOVING_REF"
+  registry_forward "$dir"
+  cosign_test_keys "$dir"
+  local signed unsigned
+  signed=$(registry_publish "FROM $MOVING_REF
+LABEL test.keyed=\"1\"" "unbound-keyed:1")
+  unsigned=$(registry_publish "FROM $MOVING_REF
+LABEL test.keyed=\"0\"" "unbound-unkeyed:1")
+  registry_sign "$dir" "$signed"
+
+  local out
+  out=$(updater_exec "$dir" /bin/bash -c "
+    set -uo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/verify.sh
+    export COSIGN_PUBLIC_KEY=$TEST_PUBKEY COSIGN_IGNORE_TLOG=1
+    verify_image '$signed' 2>/tmp/err || { echo 'signed image refused:'; cat /tmp/err; exit 1; }
+    if verify_image '$unsigned' 2>/tmp/err; then echo 'unsigned image accepted'; exit 1; fi
+    grep -qiE 'no signatures found|no matching signatures' /tmp/err || { echo 'refusal is not about signatures:'; cat /tmp/err; exit 1; }
+    # An unreadable key file must be a clear refusal, never a fall-through to keyless.
+    if COSIGN_PUBLIC_KEY=/does/not/exist verify_image '$signed' 2>/tmp/err; then echo 'missing key file was ignored'; exit 1; fi
+    grep -q 'not readable' /tmp/err || { echo 'missing key not reported:'; cat /tmp/err; exit 1; }
+    echo OK") || fail "key verification: $out"
+  grep -q '^OK$' <<<"$out" || fail "key verification did not reach OK: $out"
+  pass "verify_image: key mode accepts a key-signed image, refuses an unsigned one with cosign's reason, refuses a missing key"
+}
+
 t6_unsigned_image_refused() {
   local dir="$TEST_TMPDIR/upd-t6-$$"
   trap 'fixture_destroy "$dir"; registry_down' RETURN
@@ -501,6 +536,7 @@ t6_unsigned_image_refused() {
   fake=$(registry_publish "FROM $MOVING_REF" "unbound-unsigned:1")
 
   fixture_create "$dir" "$MOVING_REF"
+  registry_forward "$dir"
   updater_run "$dir" >/dev/null || fail "baseline cycle failed"
   local before; before=$(running_ref "$dir")
 
@@ -510,6 +546,10 @@ t6_unsigned_image_refused() {
   [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted"
   grep -qi 'cosign verification FAILED' <<<"$out" \
     || fail "T6: the run failed, but not at the signature gate — the test proves nothing: $out"
+  # With the registry reachable from inside the sidecar, the refusal must be
+  # cosign's verdict on the image, not a network error dressed up as one.
+  grep -qiE 'no signatures found|no matching signatures' <<<"$out" \
+    || fail "T6: cosign did not report a missing signature — was the registry reachable from the sidecar? $out"
   [ "$(running_ref "$dir")" = "$before" ] || fail "T6: production changed despite a failed signature check"
   pass "T6: unsigned image refused at the cosign gate, production untouched"
 }
@@ -527,6 +567,7 @@ t8_major_bump_refused() {
 LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
 
   fixture_create "$dir" "$MOVING_REF"
+  registry_forward "$dir"
   updater_run "$dir" >/dev/null || fail "baseline cycle failed"
   local before; before=$(running_ref "$dir")
 
@@ -814,6 +855,7 @@ ALL_TESTS="
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle
   t3_config_change_triggers
+  t_verify_key_accepts_signed
   t6_unsigned_image_refused
   t8_major_bump_refused
   t7a_failed_swap_is_loud
