@@ -196,6 +196,132 @@ t0_config_fingerprint_directory_unit() {
   pass "config_fingerprint covers files inside directory mounts, sees renames, fails loudly on a missing path"
 }
 
+t0_stats_to_prometheus_unit() {
+  # A canned stats_noreset excerpt (the shapes unbound 1.26 actually prints)
+  # must come out as valid exposition text: grouped families, HELP and TYPE
+  # on every one, labels where the key encodes a dimension, and a real
+  # cumulative histogram built from unbound's non-cumulative buckets.
+  local out="$TEST_TMPDIR/upd-stats-$$.prom"
+  docker run --rm -i --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    stats_to_prometheus' > "$out" <<'STATS'
+thread0.num.queries=7
+thread0.num.cachehits=3
+thread0.requestlist.avg=0.5
+thread1.num.queries=5
+thread1.num.cachehits=2
+thread1.requestlist.avg=0
+total.num.queries=12
+total.num.cachehits=5
+total.num.recursivereplies=4
+total.requestlist.avg=0.25
+total.recursion.time.avg=0.125000
+total.recursion.time.median=0.05
+total.tcpusage=0
+time.now=1789568511.123456
+time.up=100.500000
+time.elapsed=100.500000
+mem.cache.rrset=4096
+mem.cache.message=2048
+mem.mod.validator=512
+histogram.000000.000000.to.000000.000001=0
+histogram.000000.000001.to.000000.000002=1
+histogram.000000.000002.to.000000.000004=2
+histogram.000000.000004.to.000000.000008=1
+num.query.type.A=10
+num.query.type.AAAA=2
+num.query.class.IN=12
+num.query.opcode.QUERY=12
+num.query.tcp=1
+num.query.flags.RD=12
+num.query.edns.present=12
+num.answer.rcode.NOERROR=11
+num.answer.rcode.NXDOMAIN=1
+num.query.aggressive.NXDOMAIN=1
+num.answer.secure=9
+num.answer.bogus=0
+num.rrset.bogus=0
+unwanted.queries=0
+unwanted.replies=0
+msg.cache.count=8
+rrset.cache.count=20
+infra.cache.count=3
+key.cache.count=2
+STATS
+  promtool_check "$out" || fail "stats_to_prometheus output rejected by promtool: $(cat "$out")"
+  local expect
+  for expect in \
+    '^unbound_queries_total 12$' \
+    '^unbound_thread_queries_total{thread="1"} 5$' \
+    '^unbound_thread_requestlist_avg{thread="0"} 0.5$' \
+    '^unbound_query_types_total{type="AAAA"} 2$' \
+    '^unbound_answer_rcodes_total{rcode="NXDOMAIN"} 1$' \
+    '^unbound_query_aggressive_total{rcode="NXDOMAIN"} 1$' \
+    '^unbound_answers_secure_total 9$' \
+    '^unbound_recursion_time_seconds{stat="median"} 0.05$' \
+    '^unbound_time_up_seconds 100.5' \
+    '^unbound_mem_cache_rrset_bytes 4096$' \
+    '^unbound_cache_entries{cache="rrset"} 20$' \
+    '^unbound_stat{name="num.query.tcp"} 1$' \
+    '^unbound_response_time_seconds_bucket{le="2e-06"} 1$' \
+    '^unbound_response_time_seconds_bucket{le="8e-06"} 4$' \
+    '^unbound_response_time_seconds_bucket\{le="\+Inf"\} 4$' \
+    '^unbound_response_time_seconds_count 4$' \
+    '^unbound_response_time_seconds_sum 0.5$' \
+    '^# TYPE unbound_queries_total counter$' \
+    '^# TYPE unbound_requestlist_avg gauge$' \
+    '^# TYPE unbound_response_time_seconds histogram$'; do
+    grep -qE "$expect" "$out" || fail "stats_to_prometheus: missing '$expect' in: $(cat "$out")"
+  done
+  # Families must be grouped: HELP for a name appears exactly once.
+  [ "$(grep -c '^# HELP unbound_thread_queries_total ' "$out")" = 1 ] || fail "thread family emitted more than once"
+  rm -f "$out"
+  pass "stats_to_prometheus: valid exposition text, labels, grouped families, cumulative histogram"
+}
+
+t0_cycle_metrics_unit() {
+  local out="$TEST_TMPDIR/upd-cycle-$$.prom" res
+  res=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    export STATE_DIR=/tmp/st RETRY_AFTER=1h
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    state_init
+    state_inc CYCLES_TEST; state_inc CYCLES_TEST
+    [ "$(state_get CYCLES_TEST)" = 2 ] || { echo "state_inc failed: $(state_get CYCLES_TEST)"; exit 1; }
+    self_quarantine_active "d1" && { echo "self quarantine should be inactive"; exit 1; }
+    self_quarantine_set "d1"
+    self_quarantine_active "d1" || { echo "self quarantine should be active"; exit 1; }
+    _quarantine_window_open SELF_QUARANTINE_TS || { echo "window should be open"; exit 1; }
+    _quarantine_window_open QUARANTINE_TS && { echo "image window should be closed"; exit 1; }
+    state_set LAST_IMAGE_DIGEST "esitcparis/unbound-distroless@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    record_cycle rollback 42
+    record_cycle up_to_date 3
+    echo "===="
+    cat /tmp/st/metrics.prom') || fail "cycle metrics unit failed: $res"
+  printf '%s\n' "${res#*====$'\n'}" > "$out"
+  promtool_check "$out" || fail "metrics.prom rejected by promtool: $(cat "$out")"
+  local expect
+  for expect in \
+    '^unbound_autoupdate_last_cycle_status{status="up_to_date"} 1$' \
+    '^unbound_autoupdate_last_cycle_status{status="rollback"} 0$' \
+    '^unbound_autoupdate_last_cycle_duration_seconds 3$' \
+    '^unbound_autoupdate_cycles_total{status="rollback"} 1$' \
+    '^unbound_autoupdate_cycles_total{status="up_to_date"} 1$' \
+    '^unbound_autoupdate_cycles_total{status="critical"} 0$' \
+    '^unbound_autoupdate_quarantine_active{axis="self"} 1$' \
+    '^unbound_autoupdate_quarantine_active{axis="image"} 0$' \
+    '^unbound_autoupdate_target_image_info{digest="esitcparis/unbound-distroless@sha256:0000' \
+    '^unbound_autoupdate_info{version="' \
+    '^unbound_autoupdate_self_update_last_timestamp_seconds 0$' \
+    '^unbound_autoupdate_last_cycle_timestamp_seconds [0-9]{10}$'; do
+    grep -qE "$expect" "$out" || fail "cycle metrics: missing '$expect' in: $(cat "$out")"
+  done
+  rm -f "$out"
+  pass "record_cycle persists status and counters and writes a valid metrics.prom"
+}
+
 t_discover() {
   local dir="$TEST_TMPDIR/upd-discover-$$"
   trap 'fixture_destroy "$dir"' RETURN
@@ -842,6 +968,8 @@ ALL_TESTS="
   t0_compose_file_args_unit
   t0_notify_host_unit
   t0_config_fingerprint_directory_unit
+  t0_stats_to_prometheus_unit
+  t0_cycle_metrics_unit
   t_discover
   t_config_fingerprint_handles_spaces
   t_validate

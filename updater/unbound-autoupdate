@@ -21,6 +21,8 @@ LIB=/usr/local/lib/unbound-autoupdate
 . "$LIB/canary.sh"
 # shellcheck source=updater/lib/verify.sh
 . "$LIB/verify.sh"
+# shellcheck source=updater/lib/metrics.sh
+. "$LIB/metrics.sh"
 
 WATCH_CONFIG="${WATCH_CONFIG:-1}"
 ALLOW_MAJOR="${ALLOW_MAJOR:-0}"
@@ -31,6 +33,32 @@ exec 9>"$LOCK_FILE"
 # A concurrent cycle already holding the lock is a deliberate skip, not
 # "nothing to do" — it gets the same exit code as quarantine/major-bump.
 flock -n 9 || { log_info "another cycle is already running"; exit 2; }
+
+CYCLE_START=$(date -u +%s)
+FINISHED=0
+CANARY_ACTIVE=0
+
+# finish <status> <code> — the ONLY way out of a cycle once the lock is held:
+# persists the outcome and its counter, rewrites metrics.prom, exits.
+finish() {
+  FINISHED=1
+  record_cycle "$1" $(( $(date -u +%s) - CYCLE_START ))
+  exit "$2"
+}
+
+# One EXIT trap for the whole cycle. It tears down a live canary and, when
+# the script died on its own (log_die, set -e) rather than through finish,
+# records the cycle as an error so the staleness and failure alerts fire
+# instead of the previous status lingering as if nothing had happened.
+_on_exit() {
+  local rc=$?
+  [ "$CANARY_ACTIVE" = 1 ] && canary_down
+  if [ "$FINISHED" = 0 ]; then
+    record_cycle error $(( $(date -u +%s) - CYCLE_START )) || true
+  fi
+  exit "$rc"
+}
+trap _on_exit EXIT
 
 hc_start
 discover_target
@@ -48,7 +76,7 @@ if ! pull_out=$(compose pull --quiet "$TARGET_SERVICE" 2>&1); then
   log_error "docker compose pull failed"
   printf '%s\n' "$pull_out" >&2
   hc_fail "pull failed"
-  exit 1
+  finish blocked 1
 fi
 DECLARED=$(declared_digest)
 # An explicit failure path rather than letting `set -e` kill the script: a
@@ -57,7 +85,7 @@ DECLARED=$(declared_digest)
 if ! CONF_HASH=$(config_fingerprint); then
   log_error "cannot fingerprint the declared configuration"
   hc_fail "config fingerprint failed"
-  exit 1
+  finish blocked 1
 fi
 LAST_CONF=$(state_get LAST_CONFIG_HASH)
 
@@ -85,14 +113,14 @@ fi
 if [ "$image_changed" = 0 ] && [ "$conf_changed" = 0 ] && [ "$CHECK_ONLY" != 1 ]; then
   log_info "up to date ($RUNNING)"
   hc_success
-  exit 0
+  finish up_to_date 0
 fi
 
 if [ "$image_changed" = 1 ] && quarantine_active "$DECLARED"; then
   log_warn "image $DECLARED is quarantined after a failed deployment — not retrying yet"
   notify skipped "update skipped (quarantine)" "Image $DECLARED previously failed its post-swap validation and was rolled back. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until a different image is published."
   hc_fail "quarantined image"
-  exit 2
+  finish skipped 2
 fi
 
 # Same mechanism, keyed on the configuration fingerprint instead of the image
@@ -111,7 +139,7 @@ if [ "$conf_changed" = 1 ] && config_quarantine_active "$CONF_HASH"; then
   log_warn "configuration $CONF_HASH is quarantined after a failed deployment — not retrying yet"
   notify skipped "update skipped (quarantine)" "The current configuration (fingerprint $CONF_HASH) previously failed its post-swap validation and was rolled back; the image is unaffected and unchanged. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until the configuration is edited again."
   hc_fail "quarantined configuration"
-  exit 2
+  finish skipped 2
 fi
 
 if [ "$image_changed" = 1 ]; then
@@ -120,7 +148,7 @@ if [ "$image_changed" = 1 ]; then
     log_warn "major version bump $old_v -> $new_v refused (set ALLOW_MAJOR=1 to accept)"
     notify skipped "major version bump not deployed" "The declared image moves Unbound from $old_v to $new_v. Major bumps are a deliberate human decision; set ALLOW_MAJOR=1 to allow them."
     hc_fail "major bump refused"
-    exit 2
+    finish skipped 2
   fi
   [ -n "$old_v" ] && [ -n "$new_v" ] || log_warn "one of the images carries no version label — major-version guard skipped"
 
@@ -128,7 +156,7 @@ if [ "$image_changed" = 1 ]; then
     log_error "cosign verification FAILED for $DECLARED — refusing to deploy"
     notify blocked "signature verification FAILED" "Image $DECLARED is not signed by the expected release pipeline. Deployment refused; production untouched. Investigate immediately."
     hc_fail "signature verification failed"
-    exit 1
+    finish blocked 1
   fi
   log_info "cosign signature verified for $DECLARED"
 fi
@@ -136,31 +164,31 @@ fi
 if ! preflight_checkconf "$DECLARED"; then
   notify blocked "configuration rejected in preflight" "The declared configuration is not valid for image $DECLARED. Production untouched. See the updater logs for unbound-checkconf's own message."
   hc_fail "preflight failed"
-  exit 1
+  finish blocked 1
 fi
 
-trap canary_down EXIT
+CANARY_ACTIVE=1
 if ! canary_up "$DECLARED"; then
   notify blocked "canary could not start" "Image $DECLARED with the declared configuration failed to start in the canary. Production untouched."
   canary_logs >&2
   hc_fail "canary start failed"
-  exit 1
+  finish blocked 1
 fi
 if ! wait_resolver "$CANARY_IP" 90 || ! validate_resolver "$CANARY_IP"; then
   log_error "canary validation FAILED — production untouched"
   canary_logs >&2
   notify blocked "canary rejected the update" "Image $DECLARED with the declared configuration and a clone of production state failed DNS validation. Production untouched; the cycle will retry."
   hc_fail "canary validation failed"
-  exit 1
+  finish blocked 1
 fi
 log_info "canary validated: image, production state and configuration work together"
 canary_down
-trap - EXIT
+CANARY_ACTIVE=0
 
 if [ "$CHECK_ONLY" = 1 ]; then
   log_info "check mode: everything validated, no swap performed"
   hc_success
-  exit 0
+  finish check_ok 0
 fi
 
 # Compose keys recreation on the service's config hash, which the CONTENTS of
@@ -227,7 +255,7 @@ if [ "$post_swap_ok" = 1 ]; then
   log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
   notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
   hc_success
-  exit 0
+  finish updated 0
 fi
 
 # _TEST_FORCE_POSTSWAP_FAIL exists so the integration suite can exercise the
@@ -278,9 +306,11 @@ if [ "$rollback_ok" = 1 ] && [ -n "$TARGET_CONTAINER" ] \
   notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.${config_note}
 
 WARNING: the compose file still declares the failing image. Running 'docker compose up -d' by hand would redeploy it. The updater will not retry before RETRY_AFTER=${RETRY_AFTER:-24h}."
+  hc_fail "post-swap validation failed"
+  finish rollback 1
 else
   log_error "rollback did NOT restore a healthy resolver — MANUAL INTERVENTION REQUIRED"
   notify critical "CRITICAL: rollback failed" "The swap to $DECLARED failed AND the rollback to $RUNNING did not restore a working resolver. DNS is likely down on this host.${config_note} MANUAL INTERVENTION REQUIRED."
+  hc_fail "post-swap validation failed"
+  finish critical 1
 fi
-hc_fail "post-swap validation failed"
-exit 1

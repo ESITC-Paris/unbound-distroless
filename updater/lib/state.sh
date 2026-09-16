@@ -14,6 +14,11 @@ LOCK_FILE="$STATE_DIR/lock"
 # shellcheck disable=SC2034
 ROLLBACK_FILE="$STATE_DIR/rollback.yml"
 
+# The self-update helper's own override (Task 5), excluded from the compose
+# file list exactly like ROLLBACK_FILE.
+# shellcheck disable=SC2034
+SELF_ROLLBACK_FILE="$STATE_DIR/self-rollback.yml"
+
 state_init() {
   mkdir -p "$STATE_DIR"
   [ -f "$STATE_FILE" ] || : > "$STATE_FILE"
@@ -35,55 +40,45 @@ state_set() {
   mv -f "$tmp" "$STATE_FILE"
 }
 
-quarantine_set() {
-  state_set QUARANTINE_DIGEST "$1"
-  state_set QUARANTINE_TS "$(date -u +%s)"
+# state_inc <key> — increment an integer counter (unset counts as 0).
+state_inc() {
+  local cur; cur=$(state_get "$1"); : "${cur:=0}"
+  state_set "$1" $(( cur + 1 ))
 }
 
-quarantine_clear() {
-  state_set QUARANTINE_DIGEST ""
-  state_set QUARANTINE_TS ""
-}
-
-# quarantine_active <digest> — returns 0 when this digest is quarantined and
-# the RETRY_AFTER window has not elapsed. A different digest is never
-# quarantined: a newly published image deserves a fresh attempt.
-quarantine_active() {
-  local d ts now
-  d=$(state_get QUARANTINE_DIGEST)
-  [ -n "$d" ] && [ "$d" = "$1" ] || return 1
-  ts=$(state_get QUARANTINE_TS); [ -n "$ts" ] || return 1
+# Three quarantine axes share one mechanism, keyed on what changed:
+#   image  — QUARANTINE_DIGEST / QUARANTINE_TS          (a resolver image)
+#   config — CONFIG_QUARANTINE_HASH / CONFIG_QUARANTINE_TS (a config fingerprint)
+#   self   — SELF_QUARANTINE_DIGEST / SELF_QUARANTINE_TS  (a sidecar image)
+# A quarantined value is not retried before RETRY_AFTER elapses; a DIFFERENT
+# value on the same axis always gets a fresh attempt. A config-only failure
+# has no image worth quarantining, and a broken sidecar image must not block
+# resolver updates: hence separate axes.
+_quarantine_set()   { state_set "$1" "$3"; state_set "$2" "$(date -u +%s)"; }
+_quarantine_clear() { state_set "$1" ""; state_set "$2" ""; }
+# _quarantine_window_open <tskey> — 0 while the axis's timestamp is set and
+# RETRY_AFTER has not elapsed, whatever value is quarantined (metrics use it).
+_quarantine_window_open() {
+  local ts now
+  ts=$(state_get "$1"); [ -n "$ts" ] || return 1
   now=$(date -u +%s)
   [ $(( now - ts )) -lt "$(to_seconds "${RETRY_AFTER:-24h}")" ]
 }
-
-# config_quarantine_{set,clear,active} — the same digest-quarantine mechanism
-# above, but keyed on the configuration fingerprint rather than the image
-# digest. A config-only redeploy that fails post-swap validation has NO image
-# digest worth quarantining (the image never changed), so without a separate
-# axis the orchestrator would either quarantine the still-good running image
-# (wrong, and never consulted anyway) or retry the same broken configuration
-# every cycle, breaking DNS on each attempt. Editing the file again (which
-# changes the fingerprint) always gets a fresh attempt, exactly like a newly
-# published image does on the digest axis.
-config_quarantine_set() {
-  state_set CONFIG_QUARANTINE_HASH "$1"
-  state_set CONFIG_QUARANTINE_TS "$(date -u +%s)"
+_quarantine_active() {  # <valuekey> <tskey> <value>
+  local v; v=$(state_get "$1")
+  [ -n "$v" ] && [ "$v" = "$3" ] || return 1
+  _quarantine_window_open "$2"
 }
 
-config_quarantine_clear() {
-  state_set CONFIG_QUARANTINE_HASH ""
-  state_set CONFIG_QUARANTINE_TS ""
-}
-
-config_quarantine_active() {
-  local h ts now
-  h=$(state_get CONFIG_QUARANTINE_HASH)
-  [ -n "$h" ] && [ "$h" = "$1" ] || return 1
-  ts=$(state_get CONFIG_QUARANTINE_TS); [ -n "$ts" ] || return 1
-  now=$(date -u +%s)
-  [ $(( now - ts )) -lt "$(to_seconds "${RETRY_AFTER:-24h}")" ]
-}
+quarantine_set()           { _quarantine_set    QUARANTINE_DIGEST QUARANTINE_TS "$1"; }
+quarantine_clear()         { _quarantine_clear  QUARANTINE_DIGEST QUARANTINE_TS; }
+quarantine_active()        { _quarantine_active QUARANTINE_DIGEST QUARANTINE_TS "$1"; }
+config_quarantine_set()    { _quarantine_set    CONFIG_QUARANTINE_HASH CONFIG_QUARANTINE_TS "$1"; }
+config_quarantine_clear()  { _quarantine_clear  CONFIG_QUARANTINE_HASH CONFIG_QUARANTINE_TS; }
+config_quarantine_active() { _quarantine_active CONFIG_QUARANTINE_HASH CONFIG_QUARANTINE_TS "$1"; }
+self_quarantine_set()      { _quarantine_set    SELF_QUARANTINE_DIGEST SELF_QUARANTINE_TS "$1"; }
+self_quarantine_clear()    { _quarantine_clear  SELF_QUARANTINE_DIGEST SELF_QUARANTINE_TS; }
+self_quarantine_active()   { _quarantine_active SELF_QUARANTINE_DIGEST SELF_QUARANTINE_TS "$1"; }
 
 # to_seconds <duration> — 45s | 30m | 1h | 2d | bare integer (seconds).
 to_seconds() {

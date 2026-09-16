@@ -59,7 +59,7 @@ _compose_file_args() {
     # would then compare that pin against itself, report "up to date" on
     # every subsequent cycle, and never update again or even reach the
     # quarantine check: a silently frozen updater, green forever.
-    if [ "$f" = "$ROLLBACK_FILE" ]; then continue; fi
+    if [ "$f" = "$ROLLBACK_FILE" ] || [ "$f" = "${SELF_ROLLBACK_FILE:-}" ]; then continue; fi
     [ -r "$f" ] || log_die "compose file '$f' is not readable from inside the sidecar — mount the project directory read-only at the SAME absolute path"
     COMPOSE_FILE_ARGS+=(-f "$f")
   done < <(printf '%s\n' "$files" | tr ',' '\n')

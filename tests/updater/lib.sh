@@ -199,6 +199,14 @@ registry_sign() {
     || fail "could not sign $2 with the test key"
 }
 
+# promtool_check <file> — the Prometheus text exposition format has a
+# reference parser; use it rather than hand-rolled greps. Exit 3 means lint
+# problems (a metric without HELP, a bad name), which count as failures.
+PROMTOOL_IMAGE="prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996"
+promtool_check() {
+  docker run --rm -i --entrypoint promtool "$PROMTOOL_IMAGE" check metrics < "$1"
+}
+
 # updater_exec <dir> <command…> — runs a command inside the fixture's sidecar.
 updater_exec() {
   local dir="$1"; shift
