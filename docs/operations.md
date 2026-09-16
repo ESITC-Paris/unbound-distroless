@@ -103,6 +103,10 @@ never trigger a build.
 
 ## Automatic server-side updates
 
-Production servers keep themselves current with the same rigor as the
-publishing pipeline (cosign verification, canary with cloned state, health
-gates, automatic rollback): see [deploy/README.md](../deploy/README.md).
+Production servers keep themselves current with the [`updater/`](../updater/)
+sidecar: cosign verification, `unbound-checkconf` preflight, a canary run on
+a clone of the production state with the declared configuration, a post-swap
+gate that checks the container really moved to the declared image, and an
+automatic rollback with quarantine. The host-side script that used to live in
+`deploy/` has been removed; see [deploy/README.md](../deploy/README.md) for
+why and how to uninstall it.
