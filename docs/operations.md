@@ -81,10 +81,11 @@ Three independent layers:
 2. **Workflow layer (GitHub):** if a triggered check or a release pipeline
    fails, the workflow opens an issue assigned to the administrator
    (guaranteed e-mail / mobile notification), deduplicated per problem.
-3. **Publication layer:** every published release opens a notification issue
-   and appears on the
-   [releases page](https://github.com/ESITC-Paris/unbound-distroless/releases)
-   (subscribe via Watch → Custom → Releases).
+3. **Publication layer:** every published release (resolver `vX.Y.Z-rN` and
+   sidecar `updater-vX.Y.Z-rN`) appears on the
+   [releases page](https://github.com/ESITC-Paris/unbound-distroless/releases).
+   Successful releases open no issue — subscribe via Watch → Custom →
+   Releases to be notified; issues are reserved for failures.
 
 ## Manual operations
 
