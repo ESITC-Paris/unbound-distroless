@@ -49,7 +49,7 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "Last update cycle failed ({{ $labels.status }}) on {{ $labels.instance }}"
-          description: "Signature, preflight, canary or an unexpected error stopped the last cycle. Production was not touched. See the sidecar logs."
+          description: "Signature, preflight, canary or an unexpected error stopped the last cycle. Production was not touched, except when a successful update was followed by a refused sidecar self-update (status blocked, see runbook (c)). See the sidecar logs."
 
       - alert: UnboundAutoupdateRolledBack
         expr: increase(unbound_autoupdate_cycles_total{status="rollback"}[1h]) > 0
