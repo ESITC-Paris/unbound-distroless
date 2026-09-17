@@ -193,9 +193,15 @@ TEST_PUBKEY=/var/lib/unbound-autoupdate/testkey.pub
 # registry_sign <dir> <ref> — sign <ref> in the throwaway registry with the
 # test key, from inside the sidecar (which is where the relay lives). No
 # transparency-log upload: this is a private, ephemeral registry.
+# --use-signing-config=false: cosign v3 (the version the image now embeds)
+# defaults to the Sigstore public signing config, which mandates a
+# transparency log and so rejects --tlog-upload=false outright. Turning the
+# signing config off is what makes "sign with a local key, log nothing"
+# expressible in v3; it only affects how these throwaway fixtures are signed,
+# never how the sidecar verifies them.
 registry_sign() {
   updater_exec "$1" /bin/sh -c \
-    "COSIGN_PASSWORD='' cosign sign --key /var/lib/unbound-autoupdate/testkey.key --tlog-upload=false --yes '$2' >/dev/null 2>&1" \
+    "COSIGN_PASSWORD='' cosign sign --key /var/lib/unbound-autoupdate/testkey.key --use-signing-config=false --tlog-upload=false --yes '$2' >/dev/null 2>&1" \
     || fail "could not sign $2 with the test key"
 }
 

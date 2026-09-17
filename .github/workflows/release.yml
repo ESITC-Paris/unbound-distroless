@@ -280,8 +280,11 @@ jobs:
         with:
           # Deliberately pinned to the cosign v2 CLI: the action's default is
           # now cosign v3, whose signature/bundle format changes what users
-          # verify against the README's documented command. Moving to v3 is a
-          # conscious future change made together with the verify docs.
+          # verify against the README's documented command. SIGNING stays on
+          # v2 for that reason. The sidecar now VERIFIES with cosign v3.1.3
+          # (updater/Dockerfile) — v3 verifies v2-produced signatures, so the
+          # two sides stay compatible. Moving signing to v3 is a conscious
+          # future change made together with the verify docs.
           cosign-release: v2.6.5
 
       - name: Sign images (keyless OIDC)

@@ -4,7 +4,7 @@
 # in .build-state.json, kept current by upstream-check.yml, which also
 # triggers a rebuild when they move). Local builds get the floating tags.
 ARG ALPINE_BASE=alpine:3.24
-ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v2.6.5
+ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.3
 
 FROM ${COSIGN_IMAGE} AS cosign
 
@@ -17,13 +17,23 @@ LABEL org.opencontainers.image.title="unbound-autoupdate" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="ESITC Paris"
 
+# The base is digest-pinned so the *base* is reproducible; `apk upgrade` then
+# applies the security updates Alpine published after that digest was cut, in
+# the same layer as the install. Without it the image ships whatever CVEs the
+# pinned base carried at pin time, which the Trivy OS gate refuses. Rebuilds
+# are still triggered by the monitor's digest tracking (upstream-check.yml),
+# so the pin keeps moving forward rather than drifting silently.
 # bash: arrays and `local -n` are used throughout. util-linux: flock.
 # tini: loop mode must forward SIGTERM so `docker compose down` is prompt.
 # busybox-extras: httpd (the /metrics endpoint) and nc.
-RUN apk add --no-cache \
+RUN apk upgrade --no-cache \
+ && apk add --no-cache \
       bash docker-cli docker-cli-compose bind-tools curl ca-certificates \
       coreutils util-linux tini jq busybox-extras
 
+# cosign v3 CLI (the image is distroless; /ko-app/cosign is its binary). v3
+# verifies signatures produced by cosign v2, which is what release.yml still
+# signs with — see updater/README.md.
 COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign
 
 COPY lib/ /usr/local/lib/unbound-autoupdate/

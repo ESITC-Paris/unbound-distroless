@@ -216,10 +216,14 @@ Signature verification, run exactly as `updater/lib/verify.sh` runs it — this
 is both the egress test and the manual check for runbook (d). Any image
 carrying the `cosign` binary, or a local `cosign`, does the same job; the
 upstream image is used here because it resolves today, whereas
-`esitcparis/unbound-autoupdate:1` does not yet (see the note further down):
+`esitcparis/unbound-autoupdate:1` does not yet (see the note further down).
+The tag below is cosign **v3.1.3** — the version the sidecar image itself
+embeds, and which verifies the signatures the release workflows produce with
+cosign v2.6.5 (the transcript is from a real run against the published
+image):
 
 ```console
-$ docker run --rm ghcr.io/sigstore/cosign/cosign:v2.6.5 verify \
+$ docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.3 verify \
     --certificate-identity-regexp 'https://github.com/ESITC-Paris/unbound-distroless/.*' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     esitcparis/unbound-distroless:1.26.1-r0

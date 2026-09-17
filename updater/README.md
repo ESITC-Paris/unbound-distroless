@@ -354,6 +354,13 @@ The two modes are exclusive: with `COSIGN_PUBLIC_KEY` set, the identity and
 issuer settings are not used. A key path that cannot be read is a refusal to
 verify, not a fallback — the cycle stops.
 
+**Which cosign is inside.** The image embeds the **cosign v3.1.3** CLI, copied
+from `ghcr.io/sigstore/cosign/cosign` and pinned by digest in
+`.build-state.json`. The release workflows still **sign** with cosign v2.6.5,
+so the verify command documented in [docs/trust.md](../docs/trust.md) keeps
+working for users on a v2 CLI; cosign v3 verifies v2-produced signatures, so
+the sidecar's own fail-closed check is unaffected by the difference.
+
 ## What it does not do
 
 - **Kubernetes.** This is Compose-native by design: it reads Compose labels,

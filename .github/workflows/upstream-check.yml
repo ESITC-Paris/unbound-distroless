@@ -65,7 +65,7 @@ jobs:
           DEBIAN=$(resolve debian:trixie) || { echo "debian digest resolution failed"; exit 1; }
           DISTROLESS=$(resolve gcr.io/distroless/base-debian13:nonroot) || { echo "distroless digest resolution failed"; exit 1; }
           ALPINE=$(resolve alpine:3.24) || { echo "alpine digest resolution failed"; exit 1; }
-          COSIGN=$(resolve ghcr.io/sigstore/cosign/cosign:v2.6.5) || { echo "cosign digest resolution failed"; exit 1; }
+          COSIGN=$(resolve ghcr.io/sigstore/cosign/cosign:v3.1.3) || { echo "cosign digest resolution failed"; exit 1; }
           {
             echo "debian=$DEBIAN"
             echo "distroless=$DISTROLESS"

@@ -3,6 +3,28 @@
 Date : 2026-09-16 · Statut : validé, prêt pour la planification d'implémentation
 Prolonge : `2026-09-06-sidecar-autoupdate-design.md` (cycle, canari, rollback, quarantaine)
 
+> **Amendement du 2026-09-17 — cosign v3.1.3 et politique Trivy du sidecar.**
+> Ce document décrit l'état validé au 2026-09-16 ; il n'est pas réécrit. Trois
+> points ont changé depuis, dans le code :
+>
+> 1. `updater/Dockerfile` exécute `apk upgrade --no-cache` avant `apk add`,
+>    dans la même couche. La base reste épinglée par digest (reproductibilité
+>    de la base) mais les correctifs de sécurité publiés par Alpine après ce
+>    digest sont appliqués à la construction ; le suivi de digest du moniteur
+>    continue de déclencher les reconstructions.
+> 2. `COSIGN_IMAGE` passe de `ghcr.io/sigstore/cosign/cosign:v2.6.5` à
+>    `:v3.1.3` (sections 7.2 et 7.3 : les références à `v2.6.5` pour l'image
+>    copiée et pour la résolution du moniteur se lisent désormais `v3.1.3`).
+>    `release.yml` et le job `merge` d'`updater.yml` **signent toujours** avec
+>    le CLI cosign v2.6.5 : cosign v3 vérifie les signatures produites par v2,
+>    donc la commande de vérification documentée reste valable pour les
+>    utilisateurs restés en v2.
+> 3. La porte Trivy du sidecar est scindée en deux, par origine de paquet :
+>    paquets Alpine `CRITICAL,HIGH` avec `skip-files: usr/local/bin/cosign`,
+>    et image entière `CRITICAL` (le binaire cosign vendoré porte des
+>    vulnérabilités de dépendances Go dont aucune version publiée de cosign
+>    n'est exempte ; il est suivi sur la dernière version amont).
+
 ## 1. Point de départ
 
 Tout ce qui suit est constaté dans le code de la branche `feat/autoupdate-sidecar`

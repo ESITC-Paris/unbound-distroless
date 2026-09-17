@@ -113,8 +113,10 @@ The sidecar applies that same check itself, fail-closed, before it runs
 anything: every resolver image it is about to canary, and every sidecar image
 it is about to replace itself with, must pass `cosign verify` against this
 identity (or against your own key — see
-[updater/README.md](../updater/README.md)). An image that does not verify is
-never started, and the cycle reports it as a supply-chain incident.
+[updater/README.md](../updater/README.md)). It runs with the **cosign v3.1.3**
+CLI the sidecar image embeds, which verifies the signatures the release
+workflows produce with cosign v2.6.5. An image that does not verify is never
+started, and the cycle reports it as a supply-chain incident.
 
 ## DNSSEC trust anchor and root data lifecycle
 
