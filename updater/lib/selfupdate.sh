@@ -45,9 +45,16 @@ _self_state_mount() {
 # part of my own reference plus that ID reconstructs the digest exactly.
 # ImageManifestDescriptor is populated only by the containerd image store, so
 # its presence is what makes relying on that identity safe.
+# The repository matters here for the same reason it does in discover.sh: the
+# sidecar's own image record can carry several repository digests, and what
+# has to be compared against the declared reference — and verified — is the
+# digest of the repository the sidecar is declared on, not whichever one is
+# listed first.
 _self_running_digest() {
-  local rd imd
-  if rd=$(docker image inspect "$SELF_IMAGE_ID" --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' 2>/dev/null); then
+  local rd imd digests
+  if digests=$(_repo_digests "$SELF_IMAGE_ID"); then
+    rd=$(_digest_for_repo "$(_image_repo "$SELF_IMAGE")" "$digests") \
+      || rd=$(printf '%s\n' "$digests" | head -1)
     printf '%s\n' "$rd"
     return 0
   fi
@@ -112,7 +119,10 @@ self_update() {
     printf '%s\n' "$pull_out" >&2
     return 0
   fi
-  declared=$(docker image inspect "$self_ref" --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' 2>/dev/null) || declared=""
+  local self_digests
+  self_digests=$(_repo_digests "$self_ref") || self_digests=""
+  declared=$(_digest_for_repo "$(_image_repo "$self_ref")" "$self_digests") \
+    || declared=$(printf '%s\n' "$self_digests" | head -1)
   [ -n "$declared" ] || { log_warn "self-update: '$self_ref' has no repository digest after pull — skipped"; return 0; }
   [ "$declared" != "$running" ] || return 0
 

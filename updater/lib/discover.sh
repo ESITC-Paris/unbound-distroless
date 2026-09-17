@@ -230,11 +230,45 @@ _read_running_mounts() {
   [ -n "$TARGET_STATE_VOLUME" ] || log_die "service '$TARGET_SERVICE' has no named volume on /var/lib/unbound — required to persist the DNSSEC trust anchor and to clone state for the canary"
 }
 
+# _repo_digests <image-ref-or-id> — the image record's RepoDigests, one per
+# line. Exits non-zero when there is no such image record at all, which is a
+# different thing from a record that carries no repository digest.
+_repo_digests() {
+  docker image inspect "$1" --format '{{range .RepoDigests}}{{.}}{{"\n"}}{{end}}' 2>/dev/null
+}
+
+# _digest_for_repo <repo> <digest-list> — the entry of <digest-list> whose
+# repository is <repo>; non-zero when there is none.
+#
+# ONE image record can carry SEVERAL repository digests: the same bits pulled
+# from one repository and pushed to another (a mirror, a staging copy, a test
+# registry) are a single local image, and every push adds an entry to it.
+# `index .RepoDigests 0` then returns whichever repository happens to be
+# listed first — which need not be the one the compose file declares. What
+# must be compared against what is running, and handed to cosign, is the
+# digest of the DECLARED repository: a signature lives in the repository it
+# was made in, and a digest from a different repository is not a statement
+# about the image this project deploys.
+_digest_for_repo() {
+  local repo="$1" e
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    if [ "$(_image_repo "$e")" = "$repo" ]; then printf '%s\n' "$e"; return 0; fi
+  done <<<"$2"
+  return 1
+}
+
 # running_digest — repo@sha256:… actually in service.
 running_digest() {
-  local img rd
+  local img digests rd
   img=$(docker inspect "$TARGET_CONTAINER" --format '{{.Image}}')
-  rd=$(docker image inspect "$img" --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}')
+  digests=$(_repo_digests "$img") || digests=""
+  # The declared repository's own entry when the running image has one. It
+  # legitimately has none the moment the declaration moves to a different
+  # repository, and the first entry is then simply what this image is known
+  # as — silently, because that is an ordinary update, not an anomaly.
+  rd=$(_digest_for_repo "$(_image_repo "${DECLARED_IMAGE_REF:-}")" "$digests") \
+    || rd=$(printf '%s\n' "$digests" | head -1)
   [ -n "$rd" ] || log_die "the running image has no repository digest (locally built?) — refusing to guess whether an update is due"
   printf '%s\n' "$rd"
 }
@@ -242,8 +276,19 @@ running_digest() {
 # declared_digest — repo@sha256:… of the declared image. Caller must have
 # pulled first. Pulling before verifying is safe: pulling is not running.
 declared_digest() {
-  local rd
-  rd=$(docker image inspect "$DECLARED_IMAGE_REF" --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' 2>/dev/null)
+  local repo digests rd
+  repo=$(_image_repo "$DECLARED_IMAGE_REF")
+  digests=$(_repo_digests "$DECLARED_IMAGE_REF") || digests=""
+  if ! rd=$(_digest_for_repo "$repo" "$digests"); then
+    rd=$(printf '%s\n' "$digests" | head -1)
+    # Here the fallback IS worth a word: the image was just pulled from this
+    # very repository, so an entry for it should exist. Carrying on with
+    # another repository's digest is deliberate (it is still the right bits),
+    # but the operator should see which repository the verdict came from.
+    if [ -n "$rd" ]; then
+      log_warn "declared image '$DECLARED_IMAGE_REF' carries no repository digest for '$repo' — using '$rd' instead"
+    fi
+  fi
   [ -n "$rd" ] || log_die "declared image '$DECLARED_IMAGE_REF' has no repository digest after pull"
   printf '%s\n' "$rd"
 }

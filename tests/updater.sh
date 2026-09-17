@@ -847,7 +847,38 @@ LABEL test.keyed=\"0\"" "unbound-unkeyed:1")
     grep -q 'not readable' /tmp/err || { echo 'missing key not reported:'; cat /tmp/err; exit 1; }
     echo OK") || fail "key verification: $out"
   grep -q '^OK$' <<<"$out" || fail "key verification did not reach OK: $out"
-  pass "verify_image: key mode accepts a key-signed image, refuses an unsigned one with cosign's reason, refuses a missing key"
+
+  # One image record can carry SEVERAL repository digests: the same bits
+  # pushed under a second repository add a second RepoDigests entry to the
+  # very same record. `index .RepoDigests 0` then returns whichever
+  # repository happens to be listed first, which need not be the one the
+  # compose file declares — and that digest is what gets compared against
+  # what runs and handed to cosign. Assert the declared repository's own
+  # entry comes back. The registry is already up here, so the second push
+  # costs nothing; "unbound-keyed" sorts before "unbound-twin", so a naive
+  # index 0 lands on the wrong one.
+  local twin="$REGISTRY_HOST/unbound-twin:1"
+  docker tag "$signed" "$twin"
+  docker push -q "$twin" >/dev/null
+  fixture_set_image_raw "$dir" 'unbound-distroless' "$twin"
+  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d unbound ) >/dev/null 2>&1 \
+    || fail "could not redeploy the resolver on the twin-tagged image"
+  local dd
+  dd=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    discover_target
+    echo "declared=$(declared_digest)"
+    echo "running=$(running_digest)"' 2>&1) \
+    || fail "discovery failed on a multi-repository image: $dd"
+  grep -q "^declared=$REGISTRY_HOST/unbound-twin@sha256:" <<<"$dd" \
+    || fail "declared_digest returned a repository other than the declared one: $dd"
+  grep -q "^running=$REGISTRY_HOST/unbound-twin@sha256:" <<<"$dd" \
+    || fail "running_digest returned a repository other than the declared one: $dd"
+
+  pass "verify_image: key mode accepts a key-signed image, refuses an unsigned one with cosign's reason, refuses a missing key; digests come from the DECLARED repository when an image carries several"
 }
 
 t6_unsigned_image_refused() {
@@ -856,8 +887,17 @@ t6_unsigned_image_refused() {
   registry_up
   # Same bits as a real release, but pushed to a registry we control and
   # therefore never signed by the release pipeline. It must not reach production.
+  #
+  # The LABEL is what makes this image DISTINCT from its base on every image
+  # store. With a FROM-only Dockerfile the classic graphdriver store gives the
+  # build the base's own image id, and pushing then merely adds a second entry
+  # to that one image record's RepoDigests — so the declared and the running
+  # reference resolve to the same record, the cycle reports "up to date", exits
+  # 0, and the cosign gate this test exists to exercise is never reached. The
+  # containerd store yields a distinct manifest and hid the hole locally.
   local fake
-  fake=$(registry_publish "FROM $MOVING_REF" "unbound-unsigned:1")
+  fake=$(registry_publish "FROM $MOVING_REF
+LABEL test.unsigned=\"1\"" "unbound-unsigned:1")
 
   fixture_create "$dir" "$MOVING_REF"
   registry_forward "$dir"
@@ -867,7 +907,7 @@ t6_unsigned_image_refused() {
   fixture_set_image_raw "$dir" 'unbound-distroless' "$fake"
   local rc=0 out
   out=$(updater_run "$dir" 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted"
+  [ "$rc" -ne 0 ] || fail "T6: an unsigned image was accepted: $out"
   grep -qi 'cosign verification FAILED' <<<"$out" \
     || fail "T6: the run failed, but not at the signature gate — the test proves nothing: $out"
   # With the registry reachable from inside the sidecar, the refusal must be
