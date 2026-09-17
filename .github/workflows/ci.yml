@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['docs/**', '*.md']
+    paths-ignore: ['**.md', 'docs/superpowers/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/superpowers/**']
   workflow_dispatch:
 
 permissions:
@@ -21,6 +22,27 @@ jobs:
       # policy as SHA-pinned actions).
       - name: hadolint (Dockerfile)
         run: docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d < Dockerfile
+
+      - name: hadolint (updater/Dockerfile)
+        run: docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d < updater/Dockerfile
+
+      - name: shellcheck (every shell source)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck-alpine@sha256:c82fe42504fbc9fc68f15d36638e5ee2324ebb8b94e96a3c4e395bf361c49183 \
+            shellcheck -S warning \
+              tests/structure.sh tests/functional.sh tests/updater.sh tests/updater/lib.sh tests/monitor.sh \
+              updater/unbound-autoupdate updater/entrypoint.sh updater/lib/*.sh updater/www/cgi-bin/metrics \
+              .github/scripts/decide-updates.sh
+
+      - name: Monitor decision logic
+        run: bash tests/monitor.sh
+
+      - name: promtool (alert rules)
+        run: |
+          docker run --rm -v "$PWD/docs/observability:/obs:ro" --entrypoint promtool \
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            check rules /obs/alerts.yml
 
       - name: actionlint (workflows)
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
@@ -75,6 +97,48 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: unbound-distroless:test
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+  updater:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load pinned versions
+        run: cat versions.env >> "$GITHUB_ENV"
+
+      - name: Load pinned base image digests
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
+          state = json.load(open('.build-state.json'))
+          print(f"ALPINE_BASE=alpine:3.24@{state['alpine']}")
+          print(f"COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v2.6.5@{state['cosign']}")
+          PY
+
+      - name: Build the sidecar image
+        run: |
+          docker build -t unbound-autoupdate:test \
+            --build-arg "ALPINE_BASE=$ALPINE_BASE" \
+            --build-arg "COSIGN_IMAGE=$COSIGN_IMAGE" \
+            --build-arg "UPDATER_VERSION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
+            updater/
+
+      # The suite drives real containers, real DNS, real cosign verification
+      # against published images and a throwaway registry. It is the gate
+      # that would have caught the tag-mismatch defect of the retired
+      # host-side updater.
+      - name: Integration tests
+        run: bash tests/updater.sh unbound-autoupdate:test
+
+      - name: Trivy vulnerability scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-autoupdate:test
           format: table
           exit-code: '1'
           severity: CRITICAL,HIGH

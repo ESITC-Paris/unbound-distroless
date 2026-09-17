@@ -17,9 +17,11 @@ page for published issues.
   OIDC), and published with SBOM + SLSA provenance attestations.
 - Every release is gated on a functional test suite and a Trivy scan
   (CRITICAL/HIGH, unfixed excluded).
-- A daily job rebuilds the image whenever the Debian build stage or the
-  distroless runtime base publishes an update, so runtime libraries
-  (glibc, OpenSSL, libevent, expat) never lag upstream fixes for long.
+- The update monitor (`upstream-check.yml`, dispatched from outside GitHub —
+  see [docs/operations.md](docs/operations.md)) rebuilds the image whenever
+  the Debian build stage or the distroless runtime base publishes an update,
+  so runtime libraries (glibc, OpenSSL, libevent, expat) never lag upstream
+  fixes for long.
 - Harvested runtime libraries carry their dpkg metadata in
   `/var/lib/dpkg/status.d/`, so scanners (Trivy, Grype, Scout) can identify
   their exact package versions.

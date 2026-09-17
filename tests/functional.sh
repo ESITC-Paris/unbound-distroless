@@ -20,7 +20,7 @@ trap cleanup EXIT
 retry_dig() {  # retry_dig <expected-grep-pattern> <dig args...>
   local expect="$1"; shift
   local out
-  for attempt in 1 2 3 4; do
+  for _attempt in 1 2 3 4; do
     out=$($DIG "$@" 2>/dev/null) || out=""
     if echo "$out" | grep -qE "$expect"; then echo "$out"; return 0; fi
     sleep 5
@@ -40,7 +40,7 @@ docker run -d --name "$NAME" \
   "$IMG" >/dev/null
 
 # 1. Container reaches healthy state
-for i in $(seq 1 30); do
+for _i in $(seq 1 30); do
   STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$NAME" 2>/dev/null || echo starting)
   [ "$STATUS" = "healthy" ] && break
   [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" = "true" ] || fail "container exited"

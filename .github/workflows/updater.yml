@@ -1,12 +1,12 @@
-name: Release
+name: Updater release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['updater-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.26.0-r0)'
+        description: 'Release tag (e.g. updater-v1.0.0-r0)'
         required: true
 
 permissions:
@@ -17,23 +17,18 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release
+  group: updater-release
   cancel-in-progress: false
 
 env:
-  DOCKERHUB_IMAGE: esitcparis/unbound-distroless
-  GHCR_IMAGE: ghcr.io/esitc-paris/unbound-distroless
+  DOCKERHUB_IMAGE: esitcparis/unbound-autoupdate
+  GHCR_IMAGE: ghcr.io/esitc-paris/unbound-autoupdate
 
-# Every action is pinned to a full commit SHA (the trailing comment records the
-# tag that SHA was resolved from). These jobs hold contents:write,
-# packages:write and id-token:write, so a mutable tag on a third-party action
-# would be a direct path to a signed, published image.
-#
-# Each architecture builds and runs the FULL test gate natively on its own
-# runner (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64 — no QEMU
-# anywhere), then pushes its platform image by digest only (untagged). The
-# merge job assembles the multi-arch manifest lists, signs them, and creates
-# the GitHub Release. No user-visible tag exists until every gate has passed.
+# Same shape and guarantees as release.yml, different scope: every action is
+# pinned to a full commit SHA; each architecture builds and runs the FULL
+# integration suite natively on its own runner, then pushes by digest only;
+# the merge job assembles the multi-arch manifest lists, signs them, verifies
+# what it signed, and creates the GitHub Release.
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -51,13 +46,12 @@ jobs:
           RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           TAG="$RAW_TAG"
-          # Reject anything that is not exactly vX.Y.Z-rN before it can reach a registry.
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]]; then
-            echo "bad tag format: $TAG (expected vX.Y.Z-rN)"
+          if [[ ! "$TAG" =~ ^updater-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]]; then
+            echo "bad tag format: $TAG (expected updater-vX.Y.Z-rN)"
             exit 1
           fi
-          # v1.26.0-r2 -> full=1.26.0 rev=2 minor=1.26 major=1
-          FULL="${TAG#v}"; FULL="${FULL%-r*}"
+          # updater-v1.0.0-r2 -> full=1.0.0 rev=2 minor=1.0 major=1
+          FULL="${TAG#updater-v}"; FULL="${FULL%-r*}"
           REV="${TAG##*-r}"
           MINOR="${FULL%.*}"
           MAJOR="${FULL%%.*}"
@@ -81,13 +75,10 @@ jobs:
         run: |
           # shellcheck disable=SC1091
           . ./versions.env
-          [ "$UNBOUND_VERSION" = "$TAG_FULL" ] \
-            || { echo "tag $TAG_NAME does not match versions.env ($UNBOUND_VERSION)"; exit 1; }
-          # The revision half of the tag is just as load-bearing: it selects the
-          # -rN image tags. A tag whose rev disagrees with versions.env means the
-          # tag and the tree it points at came from different states.
-          [ "$REVISION" = "$TAG_REV" ] \
-            || { echo "tag $TAG_NAME revision r$TAG_REV does not match versions.env (REVISION=$REVISION)"; exit 1; }
+          [ "$UPDATER_VERSION" = "$TAG_FULL" ] \
+            || { echo "tag $TAG_NAME does not match versions.env (UPDATER_VERSION=$UPDATER_VERSION)"; exit 1; }
+          [ "$UPDATER_REVISION" = "$TAG_REV" ] \
+            || { echo "tag $TAG_NAME revision r$TAG_REV does not match versions.env (UPDATER_REVISION=$UPDATER_REVISION)"; exit 1; }
 
   build:
     needs: prepare
@@ -100,7 +91,7 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -114,8 +105,8 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_ENV"
           import json
           state = json.load(open('.build-state.json'))
-          print(f"DEBIAN_BASE=debian:trixie@{state['debian']}")
-          print(f"DISTROLESS_BASE=gcr.io/distroless/base-debian13:nonroot@{state['distroless']}")
+          print(f"ALPINE_BASE=alpine:3.24@{state['alpine']}")
+          print(f"COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v2.6.5@{state['cosign']}")
           PY
 
       - name: Sanitize platform name
@@ -128,31 +119,24 @@ jobs:
       - name: Build image for testing (native)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: .
+          context: updater
           load: true
           platforms: ${{ matrix.platform }}
-          tags: unbound-distroless:test
+          tags: unbound-autoupdate:test
           build-args: |
-            UNBOUND_VERSION=${{ env.UNBOUND_VERSION }}
-            UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
-            DEBIAN_BASE=${{ env.DEBIAN_BASE }}
-            DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+            ALPINE_BASE=${{ env.ALPINE_BASE }}
+            COSIGN_IMAGE=${{ env.COSIGN_IMAGE }}
+            UPDATER_VERSION=${{ env.UPDATER_VERSION }}-r${{ env.UPDATER_REVISION }}
+          cache-from: type=gha,scope=updater-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=updater-${{ env.PLATFORM_PAIR }}
 
-      - name: Structure tests
-        run: bash tests/structure.sh unbound-distroless:test
-
-      - name: Install dig
-        run: command -v dig >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq bind9-dnsutils)
-
-      - name: Functional tests
-        run: bash tests/functional.sh unbound-distroless:test
+      - name: Integration tests
+        run: bash tests/updater.sh unbound-autoupdate:test
 
       - name: Trivy vulnerability scan (gate)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: unbound-distroless:test
+          image-ref: unbound-autoupdate:test
           format: table
           exit-code: '1'
           severity: CRITICAL,HIGH
@@ -175,17 +159,16 @@ jobs:
         id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: .
+          context: updater
           platforms: ${{ matrix.platform }}
           sbom: true
           provenance: mode=max
           build-args: |
-            UNBOUND_VERSION=${{ env.UNBOUND_VERSION }}
-            UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
-            DEBIAN_BASE=${{ env.DEBIAN_BASE }}
-            DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+            ALPINE_BASE=${{ env.ALPINE_BASE }}
+            COSIGN_IMAGE=${{ env.COSIGN_IMAGE }}
+            UPDATER_VERSION=${{ env.UPDATER_VERSION }}-r${{ env.UPDATER_REVISION }}
           outputs: type=image,"name=${{ env.DOCKERHUB_IMAGE }},${{ env.GHCR_IMAGE }}",push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-from: type=gha,scope=updater-${{ env.PLATFORM_PAIR }}
 
       - name: Export digest
         env:
@@ -197,7 +180,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
+          name: updater-digests-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -211,7 +194,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: updater-digests-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -278,10 +261,9 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          # Deliberately pinned to the cosign v2 CLI: the action's default is
-          # now cosign v3, whose signature/bundle format changes what users
-          # verify against the README's documented command. Moving to v3 is a
-          # conscious future change made together with the verify docs.
+          # Pinned to the cosign v2 CLI, the version the sidecar image itself
+          # embeds and verifies with (updater/Dockerfile). Moving to v3 is a
+          # conscious change made together with release.yml and the image.
           cosign-release: v2.6.5
 
       - name: Sign images (keyless OIDC)
@@ -304,31 +286,6 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
           done
 
-      - name: Checkout for Docker Hub description
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
-
-      - name: Prepare Docker Hub README (absolute links)
-        run: |
-          python3 - <<'PY'
-          import re
-          md = open('README.md').read()
-          # Docker Hub cannot resolve repo-relative links; point them at GitHub.
-          md = re.sub(r'\]\((?!https?://|#)([^)]+)\)',
-                      r'](https://github.com/ESITC-Paris/unbound-distroless/blob/main/\1)', md)
-          open('README.dockerhub.md', 'w').write(md)
-          PY
-
-      - name: Sync Docker Hub description
-        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: esitcparis/unbound-distroless
-          short-description: Production-grade Unbound DNS resolver on a distroless base. Non-root, DNSSEC, signed, auto-updated.
-          readme-filepath: ./README.dockerhub.md
-
       - name: GitHub provenance attestation (Docker Hub image)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -342,12 +299,12 @@ jobs:
           subject-digest: ${{ steps.digest.outputs.ghcr }}
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
           body: |
-            **Unbound ${{ needs.prepare.outputs.full }}** (revision r${{ needs.prepare.outputs.rev }}) — multi-arch (amd64, arm64), distroless, signed.
+            **unbound-autoupdate ${{ needs.prepare.outputs.full }}** (revision r${{ needs.prepare.outputs.rev }}) — multi-arch (amd64, arm64), Alpine, signed.
 
             **Images:**
             - `${{ env.DOCKERHUB_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
@@ -369,13 +326,13 @@ jobs:
           DIGEST_HUB: ${{ steps.digest.outputs.hub }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Assigned issue = guaranteed email/mobile notification for the admin.
-          # Informational only — close it after reading.
-          gh issue create \
+          # --repo is required: this job never checks the repository out, so gh
+          # has no git remote to infer it from.
+          gh issue create --repo "$GITHUB_REPOSITORY" \
             --title "Published $TAG" \
             --assignee euca01 \
-            --body "$(printf 'Release %s was published automatically.\n\nImage: %s:%s\nDigest: %s\nRun: %s\n\nThis is a notification issue — close it after reading.' \
-              "$TAG" "$DOCKERHUB_IMAGE" "${TAG#v}" "$DIGEST_HUB" "$RUN_URL")"
+            --body "$(printf 'Sidecar release %s was published automatically.\n\nImage: %s:%s\nDigest: %s\nRun: %s\n\nThis is a notification issue — close it after reading.' \
+              "$TAG" "$DOCKERHUB_IMAGE" "${TAG#updater-v}" "$DIGEST_HUB" "$RUN_URL")"
 
   notify-failure:
     needs: [prepare, build, merge]
@@ -389,14 +346,12 @@ jobs:
           RAW_TAG: ${{ needs.prepare.outputs.tag || github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # One open issue per broken tag; repeats add comments instead of
-          # flooding the tracker.
-          TITLE="Release pipeline failed for $RAW_TAG"
+          TITLE="Updater release pipeline failed for $RAW_TAG"
           NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title \
             -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
           if [ -n "$NUM" ]; then
             gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body "Failed again: $RUN_URL"
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --assignee euca01 \
-              --body "$(printf 'The release pipeline failed — nothing was published.\n\nInvestigate: %s' "$RUN_URL")"
+              --body "$(printf 'The updater release pipeline failed — nothing was published.\n\nInvestigate: %s' "$RUN_URL")"
           fi

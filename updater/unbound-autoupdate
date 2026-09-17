@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# One update cycle: discover → compare → verify → preflight → canary →
+# validate → swap → post-swap gate → rollback on failure.
+#
+# Exit 0 = up to date, or updated and verified.
+# Exit 1 = a human is needed (no Healthchecks success ping).
+# Exit 2 = deliberately skipped (quarantine, a refused major bump, or a
+# concurrent cycle already holding the lock).
+set -euo pipefail
+
+LIB=/usr/local/lib/unbound-autoupdate
+# shellcheck source=updater/lib/log.sh
+. "$LIB/log.sh"
+# shellcheck source=updater/lib/state.sh
+. "$LIB/state.sh"
+# shellcheck source=updater/lib/discover.sh
+. "$LIB/discover.sh"
+# shellcheck source=updater/lib/validate.sh
+. "$LIB/validate.sh"
+# shellcheck source=updater/lib/canary.sh
+. "$LIB/canary.sh"
+# shellcheck source=updater/lib/verify.sh
+. "$LIB/verify.sh"
+# shellcheck source=updater/lib/metrics.sh
+. "$LIB/metrics.sh"
+# shellcheck source=updater/lib/selfupdate.sh
+. "$LIB/selfupdate.sh"
+
+WATCH_CONFIG="${WATCH_CONFIG:-1}"
+ALLOW_MAJOR="${ALLOW_MAJOR:-0}"
+CHECK_ONLY="${CHECK_ONLY:-0}"
+
+state_init
+exec 9>"$LOCK_FILE"
+# A concurrent cycle already holding the lock is a deliberate skip, not
+# "nothing to do" — it gets the same exit code as quarantine/major-bump.
+flock -n 9 || { log_info "another cycle is already running"; exit 2; }
+
+CYCLE_START=$(date -u +%s)
+FINISHED=0
+CANARY_ACTIVE=0
+
+# finish <status> <code> — the ONLY way out of a cycle once the lock is held:
+# persists the outcome and its counter, rewrites metrics.prom, exits.
+finish() {
+  FINISHED=1
+  record_cycle "$1" $(( $(date -u +%s) - CYCLE_START ))
+  exit "$2"
+}
+
+# One EXIT trap for the whole cycle. It tears down a live canary and, when
+# the script died on its own (log_die, set -e) rather than through finish,
+# records the cycle as an error so the staleness and failure alerts fire
+# instead of the previous status lingering as if nothing had happened.
+_on_exit() {
+  local rc=$?
+  [ "$CANARY_ACTIVE" = 1 ] && canary_down
+  if [ "$FINISHED" = 0 ]; then
+    record_cycle error $(( $(date -u +%s) - CYCLE_START )) || true
+  fi
+  exit "$rc"
+}
+trap _on_exit EXIT
+
+hc_start
+discover_target
+# Captured before anything else touches the service: whatever Compose does,
+# a genuine recreation always yields a brand new container ID. This is what
+# lets the post-swap gate detect "nothing happened" even on a config-only
+# change, where the image digest comparison alone is a tautology (see below).
+PRE_SWAP_CONTAINER="$TARGET_CONTAINER"
+
+RUNNING=$(running_digest)
+# Output captured rather than discarded: when this fails, the operator needs
+# docker compose's own error, not just "pull failed".
+pull_out=""
+if ! pull_out=$(compose pull --quiet "$TARGET_SERVICE" 2>&1); then
+  log_error "docker compose pull failed"
+  printf '%s\n' "$pull_out" >&2
+  hc_fail "pull failed"
+  finish blocked 1
+fi
+DECLARED=$(declared_digest)
+# An explicit failure path rather than letting `set -e` kill the script: a
+# fingerprint that cannot be computed must still reach Healthchecks as a
+# failed cycle, not as a start ping that never completes.
+if ! CONF_HASH=$(config_fingerprint); then
+  log_error "cannot fingerprint the declared configuration"
+  hc_fail "config fingerprint failed"
+  finish blocked 1
+fi
+LAST_CONF=$(state_get LAST_CONFIG_HASH)
+
+image_changed=0; conf_changed=0
+[ "$DECLARED" != "$RUNNING" ] && image_changed=1
+if [ "$WATCH_CONFIG" = 1 ] && [ -n "$LAST_CONF" ] && [ "$CONF_HASH" != "$LAST_CONF" ]; then
+  conf_changed=1
+fi
+
+# First ever run: record the baseline instead of canarying a system that is
+# already running fine. `check` mode is there for validating on demand.
+# conf_changed above was already computed against the PRIOR (empty) LAST_CONF,
+# so this baseline write cannot itself manufacture a spurious conf_changed=1.
+if [ -z "$LAST_CONF" ]; then
+  state_set LAST_CONFIG_HASH "$CONF_HASH"
+  # LAST_IMAGE_DIGEST is an operator-facing breadcrumb in state.env (handy
+  # for a human inspecting it by hand) — no code path reads it back as a
+  # control input. LAST_CONFIG_HASH and the quarantine keys are what gate
+  # cycles; this key never is.
+  state_set LAST_IMAGE_DIGEST "$RUNNING"
+  log_info "baseline recorded (image $RUNNING)"
+  notify baseline "baseline recorded" "The updater is now watching $TARGET_SERVICE in project $COMPOSE_PROJECT."
+fi
+
+if [ "$image_changed" = 0 ] && [ "$conf_changed" = 0 ] && [ "$CHECK_ONLY" != 1 ]; then
+  log_info "up to date ($RUNNING)"
+  if self_update; then hc_success; finish up_to_date 0; fi
+  hc_fail "sidecar self-update refused"
+  finish blocked 1
+fi
+
+if [ "$image_changed" = 1 ] && quarantine_active "$DECLARED"; then
+  log_warn "image $DECLARED is quarantined after a failed deployment — not retrying yet"
+  notify skipped "update skipped (quarantine)" "Image $DECLARED previously failed its post-swap validation and was rolled back. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until a different image is published."
+  hc_fail "quarantined image"
+  finish skipped 2
+fi
+
+# Same mechanism, keyed on the configuration fingerprint instead of the image
+# digest: a config-only failure has no image worth quarantining (the image
+# never changed and is still good), so without this axis the cycle would
+# either quarantine the wrong thing or retry — and break DNS — every hour.
+# Checked independently of image_changed (NOT only when the image is
+# unchanged): a mixed image+config failure quarantines BOTH axes on the way
+# out (below), and this fingerprint match is what makes that write side mean
+# something — otherwise, the moment the image's own quarantine window lapses
+# or a new digest is published, the cycle would retry with the SAME still-
+# broken configuration and re-break DNS. A different (edited) configuration
+# always gets a fresh attempt regardless of what the image is doing, exactly
+# as a different image digest does on its own axis.
+if [ "$conf_changed" = 1 ] && config_quarantine_active "$CONF_HASH"; then
+  log_warn "configuration $CONF_HASH is quarantined after a failed deployment — not retrying yet"
+  notify skipped "update skipped (quarantine)" "The current configuration (fingerprint $CONF_HASH) previously failed its post-swap validation and was rolled back; the image is unaffected and unchanged. It will not be retried before RETRY_AFTER=${RETRY_AFTER:-24h} elapses, or until the configuration is edited again."
+  hc_fail "quarantined configuration"
+  finish skipped 2
+fi
+
+if [ "$image_changed" = 1 ]; then
+  old_v=$(image_version_label "$RUNNING"); new_v=$(image_version_label "$DECLARED")
+  if [ -n "$old_v" ] && [ -n "$new_v" ] && [ "${old_v%%.*}" != "${new_v%%.*}" ] && [ "$ALLOW_MAJOR" != 1 ]; then
+    log_warn "major version bump $old_v -> $new_v refused (set ALLOW_MAJOR=1 to accept)"
+    notify skipped "major version bump not deployed" "The declared image moves Unbound from $old_v to $new_v. Major bumps are a deliberate human decision; set ALLOW_MAJOR=1 to allow them."
+    hc_fail "major bump refused"
+    finish skipped 2
+  fi
+  [ -n "$old_v" ] && [ -n "$new_v" ] || log_warn "one of the images carries no version label — major-version guard skipped"
+
+  if ! verify_image "$DECLARED"; then
+    log_error "cosign verification FAILED for $DECLARED — refusing to deploy"
+    notify blocked "signature verification FAILED" "Image $DECLARED is not signed by the expected release pipeline. Deployment refused; production untouched. Investigate immediately."
+    hc_fail "signature verification failed"
+    finish blocked 1
+  fi
+  log_info "cosign signature verified for $DECLARED"
+fi
+
+if ! preflight_checkconf "$DECLARED"; then
+  notify blocked "configuration rejected in preflight" "The declared configuration is not valid for image $DECLARED. Production untouched. See the updater logs for unbound-checkconf's own message."
+  hc_fail "preflight failed"
+  finish blocked 1
+fi
+
+CANARY_ACTIVE=1
+if ! canary_up "$DECLARED"; then
+  notify blocked "canary could not start" "Image $DECLARED with the declared configuration failed to start in the canary. Production untouched."
+  canary_logs >&2
+  hc_fail "canary start failed"
+  finish blocked 1
+fi
+if ! wait_resolver "$CANARY_IP" 90 || ! validate_resolver "$CANARY_IP"; then
+  log_error "canary validation FAILED — production untouched"
+  canary_logs >&2
+  notify blocked "canary rejected the update" "Image $DECLARED with the declared configuration and a clone of production state failed DNS validation. Production untouched; the cycle will retry."
+  hc_fail "canary validation failed"
+  finish blocked 1
+fi
+log_info "canary validated: image, production state and configuration work together"
+canary_down
+CANARY_ACTIVE=0
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  log_info "check mode: everything validated, no swap performed"
+  hc_success
+  finish check_ok 0
+fi
+
+# Compose keys recreation on the service's config hash, which the CONTENTS of
+# a bind-mounted file do not affect. Without --force-recreate a config-only
+# change would be a silent no-op that still reported success — the exact
+# failure mode this project exists to remove.
+recreate=()
+[ "$image_changed" = 0 ] && recreate=(--force-recreate)
+
+log_info "swapping $TARGET_SERVICE (brief restart)"
+swap_ok=1
+swap_out=$(compose up -d --no-deps "${recreate[@]}" "$TARGET_SERVICE" 2>&1) || swap_ok=0
+if [ "$swap_ok" = 0 ]; then
+  log_error "docker compose up failed while swapping to $DECLARED"
+  printf '%s\n' "$swap_out" >&2
+fi
+
+post_swap_ok=0
+if [ "$swap_ok" = 1 ]; then
+  # Every check below can fail (a service that never reappears, a probe
+  # address that cannot be determined) and must fall through to rollback
+  # rather than abort the whole script. Folding them into ONE `if` condition
+  # is what makes that safe: bash's `set -e` never fires for a command that
+  # is part of an if/while/until condition, so a bare assignment whose
+  # command substitution dies internally (target_probe_ip calls log_die) just
+  # makes this test false instead of exiting the script mid-way with no
+  # rollback and no notification.
+  #
+  # The running_digest comparison is the load-bearing check on the IMAGE
+  # path: Compose returning 0 is not proof the swap happened. If Compose
+  # ever declines to recreate the container (a stale config hash, an
+  # unexpected interaction between --no-deps and its diff logic, anything),
+  # the OLD container is still there, answers DNS perfectly, and the old bug
+  # this project exists to remove — "success" reported on an untouched image
+  # — comes right back.
+  #
+  # On a CONFIG-ONLY cycle, though, DECLARED == RUNNING, so the digest
+  # comparison alone is a tautology — it asserts nothing about whether
+  # --force-recreate actually fired. The container-id comparison closes that
+  # symmetrically: a genuine Compose recreation ALWAYS yields a new
+  # container id, on both the image path and the config-only path, so
+  # requiring it here covers the config door the digest check cannot see.
+  if [ "${_TEST_FORCE_POSTSWAP_FAIL:-0}" != 1 ] \
+     && TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE") && [ -n "$TARGET_CONTAINER" ] \
+     && [ "$TARGET_CONTAINER" != "$PRE_SWAP_CONTAINER" ] \
+     && [ "$(running_digest)" = "$DECLARED" ] \
+     && probe=$(target_probe_ip) \
+     && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
+    # 45s here, not the canary's 90s: the canary starts cold from a freshly
+    # cloned volume, production restarts warm on an existing one. A resolver
+    # silent for 45s after a swap is broken, and every extra second is
+    # broken DNS. A spurious rollback is itself safe — it restores the
+    # working image.
+    post_swap_ok=1
+  fi
+fi
+
+if [ "$post_swap_ok" = 1 ]; then
+  state_set LAST_IMAGE_DIGEST "$DECLARED"
+  state_set LAST_CONFIG_HASH "$CONF_HASH"
+  quarantine_clear
+  config_quarantine_clear
+  version=$(image_version_label "$DECLARED")
+  log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
+  notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
+  if self_update; then hc_success; finish updated 0; fi
+  hc_fail "sidecar self-update refused"
+  finish blocked 1
+fi
+
+# _TEST_FORCE_POSTSWAP_FAIL exists so the integration suite can exercise the
+# rollback machinery deterministically. It short-circuits ONLY the post-swap
+# verdict: the override file, the digest pin, the re-validation and the
+# quarantine below are the real code paths.
+
+# ── Rollback ────────────────────────────────────────────────────────────────
+log_error "post-swap validation failed — rolling back to $RUNNING"
+COMPOSE_EXTRA_FILE="$ROLLBACK_FILE"
+printf 'services:\n  %s:\n    image: %s\n' "$TARGET_SERVICE" "$RUNNING" > "$COMPOSE_EXTRA_FILE"
+rollback_ok=1
+rollback_out=$(compose up -d --no-deps "$TARGET_SERVICE" 2>&1) || rollback_ok=0
+if [ "$rollback_ok" = 0 ]; then
+  log_error "docker compose up failed while rolling back to $RUNNING"
+  printf '%s\n' "$rollback_out" >&2
+fi
+TARGET_CONTAINER=$(compose ps -q "$TARGET_SERVICE" || true)
+unset COMPOSE_EXTRA_FILE
+
+# Quarantine every axis that actually changed for this cycle — independently,
+# not either/or: when both the image and the configuration changed together
+# and the deployment failed, either one could be the culprit (or both), and
+# quarantining only one leaves the cycle free to retry — and re-break DNS —
+# on the other the moment its own window lapses or its tag moves again. An
+# axis that did NOT change is never quarantined: quarantining an unchanged,
+# still-good image or configuration would be wrong, and would be silently
+# ignored anyway (both quarantine checks are gated on their own *_changed).
+[ "$image_changed" = 1 ] && quarantine_set "$DECLARED"
+[ "$conf_changed" = 1 ] && config_quarantine_set "$CONF_HASH"
+
+# The rollback override pins only the image reference — it cannot revert a
+# bind-mounted configuration file's CONTENTS. Whenever the configuration
+# changed, "restored" would be a lie: production comes back on the previous
+# image but keeps reading the current (possibly still broken) file from disk.
+config_note=""
+if [ "$conf_changed" = 1 ]; then
+  config_note=" NOTE: the bind-mounted configuration file was NOT reverted — only the image was pinned back. Production is recreated on the previous image but is still reading the CURRENT configuration on disk. A human must fix or revert that file."
+fi
+
+if [ "$rollback_ok" = 1 ] && [ -n "$TARGET_CONTAINER" ] \
+   && probe=$(target_probe_ip) && wait_resolver "$probe" 45 && validate_resolver "$probe"; then
+  if [ "$conf_changed" = 1 ]; then
+    log_info "rollback successful — production restored on $RUNNING (configuration NOT reverted)"
+  else
+    log_info "rollback successful — production restored on $RUNNING"
+  fi
+  notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.${config_note}
+
+WARNING: the compose file still declares the failing image. Running 'docker compose up -d' by hand would redeploy it. The updater will not retry before RETRY_AFTER=${RETRY_AFTER:-24h}."
+  hc_fail "post-swap validation failed"
+  finish rollback 1
+else
+  log_error "rollback did NOT restore a healthy resolver — MANUAL INTERVENTION REQUIRED"
+  notify critical "CRITICAL: rollback failed" "The swap to $DECLARED failed AND the rollback to $RUNNING did not restore a working resolver. DNS is likely down on this host.${config_note} MANUAL INTERVENTION REQUIRED."
+  hc_fail "post-swap validation failed"
+  finish critical 1
+fi

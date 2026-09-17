@@ -10,3 +10,6 @@ ignored:
   # DL3066 (non-numeric USER): "nonroot" is the distroless convention; the
   # structure test suite independently asserts UID 65532.
   - DL3066
+  # DL3018 (pin apk versions): the sidecar's packages are governed by the
+  # digest-pinned Alpine base (.build-state.json), same policy as DL3008.
+  - DL3018

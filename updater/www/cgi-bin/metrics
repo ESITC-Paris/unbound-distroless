@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Prometheus scrape endpoint, run by busybox httpd per request.
+# Always answers 200: when the resolver cannot be reached, the sidecar's own
+# metrics are still served and unbound_exporter_scrape_success is 0. A
+# scrape must never hang or 5xx because DNS is down — that is precisely
+# when the metrics matter. Hence `set -uo pipefail` WITHOUT -e: a failing
+# step must degrade the scrape, never abort it midway.
+set -uo pipefail
+
+LIB=/usr/local/lib/unbound-autoupdate
+# shellcheck source=updater/lib/log.sh
+. "$LIB/log.sh"
+# shellcheck source=updater/lib/state.sh
+. "$LIB/state.sh"
+# shellcheck source=updater/lib/discover.sh
+. "$LIB/discover.sh"
+# shellcheck source=updater/lib/metrics.sh
+. "$LIB/metrics.sh"
+
+printf 'Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\r\n'
+start=$(date +%s.%N)
+ok=0
+
+# Collection runs in a child of its own, under ONE timeout that covers all of
+# it: discover_target_container dies (exit) when it cannot find the resolver,
+# and that must not end the scrape — and its own calls to the Docker socket
+# have to be bounded just as the exec is, or a wedged daemon hangs the scrape
+# in the step before the one that was bounded. A separate `bash -c` rather
+# than a subshell because a subshell cannot be the child `timeout` signals.
+if stats=$(timeout 10 bash -c '
+    set -uo pipefail
+    LIB=/usr/local/lib/unbound-autoupdate
+    . "$LIB/log.sh"
+    . "$LIB/state.sh"
+    . "$LIB/discover.sh"
+    . "$LIB/metrics.sh"
+    _collect_stats' 2>/dev/null); then
+  if [ -n "$stats" ]; then
+    stats_to_prometheus <<<"$stats"
+    ok=1
+  fi
+fi
+
+[ -r "$METRICS_FILE" ] && cat "$METRICS_FILE"
+
+printf '# HELP unbound_exporter_scrape_success 1 when unbound-control stats were collected on this scrape.\n# TYPE unbound_exporter_scrape_success gauge\n'
+printf 'unbound_exporter_scrape_success %d\n' "$ok"
+printf '# HELP unbound_exporter_scrape_duration_seconds Time spent collecting this scrape.\n# TYPE unbound_exporter_scrape_duration_seconds gauge\n'
+printf 'unbound_exporter_scrape_duration_seconds %s\n' "$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.3f", b - a }')"

@@ -75,6 +75,15 @@ rebuilt for base-image or library updates).
 Current versions are listed on the
 [releases page](https://github.com/ESITC-Paris/unbound-distroless/releases).
 
+## Automatic updates
+
+A companion sidecar keeps a Compose-managed resolver current: it verifies the
+new image's signature, runs it as a canary with **your** configuration and a
+clone of **your** state, swaps only if the canary validates, checks the swap
+actually happened, and rolls back if production fails. It also exposes
+`/metrics` for Prometheus. See **[updater/README.md](updater/README.md)** —
+it needs the Docker socket, which is root on the host, so read that first.
+
 ## Learn more
 
 - **[Usage guide](docs/usage.md)** — `docker run` recipes (localhost-only,
@@ -84,6 +93,10 @@ Current versions are listed on the
   source, dual-arch native tests, CVE scan, cosign signing, SBOM/SLSA),
   hourly automatic updates, how to verify an image, DNSSEC key & root zone
   lifecycle
+- **[updater/README.md](updater/README.md)** — the auto-update + metrics
+  sidecar: install, variables, per-outcome behaviour, `/metrics`, self-update
+- **[docs/observability/](docs/observability/)** — Prometheus scrape config and
+  alert rules for the resolver and the sidecar
 - **[SECURITY.md](SECURITY.md)** — vulnerability reporting
 - **[Releases](https://github.com/ESITC-Paris/unbound-distroless/releases)** —
   per-version digests and notes (Watch → Custom → Releases to get notified)

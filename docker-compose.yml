@@ -20,5 +20,37 @@ services:
       # Optional: your own configuration.
       # - ./unbound.conf:/etc/unbound/unbound.conf:ro
 
+  # ── Automatic updates + Prometheus metrics (optional) ──────────────────────
+  # Uncomment both services below AND the autoupdate-state volume at the end of
+  # this file, then replace /opt/unbound with this project's absolute
+  # directory — the same path must appear on both sides of that bind mount.
+  # Read updater/README.md first: the Docker socket is root on the host.
+  # (Everything commented with a "#" in the first column below is the block to
+  # uncomment; see updater/compose.snippet.yml for the same thing unindented.)
+#  unbound-autoupdate:
+#    image: esitcparis/unbound-autoupdate:1
+#    restart: unless-stopped
+#    environment:
+#      INTERVAL: 1h
+#      # One Healthchecks.io check per host. The updater pings /start, success
+#      # and /fail, so every failure alerts immediately.
+#      HC_URL: https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#      # NOTIFY_HOST: resolver-1.example   # defaults to the Docker daemon's host name
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock
+#      - /opt/unbound:/opt/unbound:ro
+#      - autoupdate-state:/var/lib/unbound-autoupdate
+#
+#  unbound-metrics:
+#    image: esitcparis/unbound-autoupdate:1
+#    command: ["metrics"]
+#    restart: unless-stopped
+#    ports:
+#      - "127.0.0.1:9167:9167"
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock
+#      - autoupdate-state:/var/lib/unbound-autoupdate:ro
+
 volumes:
   unbound-rootkey:
+#  autoupdate-state:

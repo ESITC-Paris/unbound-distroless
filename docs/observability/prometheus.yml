@@ -1,0 +1,11 @@
+# Scrape configuration excerpt for unbound-distroless hosts. The sidecar's
+# metrics service exposes both the resolver's statistics (unbound_*) and the
+# updater's own state (unbound_autoupdate_*) on one endpoint.
+scrape_configs:
+  - job_name: unbound
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['resolver-1.example:9167', 'resolver-2.example:9167']
+
+rule_files:
+  - alerts.yml
