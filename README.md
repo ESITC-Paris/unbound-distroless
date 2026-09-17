@@ -86,6 +86,9 @@ it needs the Docker socket, which is root on the host, so read that first.
 
 ## Learn more
 
+- **[Production deployment guide](docs/production.md)** — the enterprise
+  reference: two hosts, host prerequisites, a tested hardened Compose project,
+  Prometheus alerts, runbooks for every failure the update sidecar reports
 - **[Usage guide](docs/usage.md)** — `docker run` recipes (localhost-only,
   read-only rootfs), Kubernetes, DoT/DoH serving, Valkey/Redis shared cache,
   tuning, health checks, troubleshooting

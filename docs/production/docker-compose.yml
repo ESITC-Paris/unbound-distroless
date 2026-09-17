@@ -1,0 +1,132 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Reference production Compose project for unbound-distroless + the
+# unbound-autoupdate sidecar. Documented in ../production.md.
+#
+# This file is written for /opt/unbound. The project directory's absolute path
+# appears on BOTH sides of the sidecar's bind mount, and it must: the sidecar
+# runs `docker compose` against these very files, and the Docker daemon then
+# applies the project's bind mounts on the host (see updater/lib/discover.sh).
+# If you put the project somewhere else, change /opt/unbound everywhere below.
+#
+# Secrets (HC_URL, WEBHOOK_URL) live in a .env file next to this one, mode 600.
+# ──────────────────────────────────────────────────────────────────────────────
+name: unbound
+
+services:
+  unbound:
+    # MODE A — pinned, manual updates (this file's default).
+    #   An X.Y.Z-rN tag is immutable, so the sidecar will pull it forever and
+    #   forever find the same digest: it reports `up_to_date` and never swaps.
+    #   You move this line by hand when you decide to upgrade.
+    # MODE B — tracking a major tag, automatic updates.
+    #   Replace the reference below with `esitcparis/unbound-distroless:1`.
+    #   The sidecar re-pulls the DECLARED tag every cycle, so a moving tag is
+    #   what gives it something new to canary and deploy.
+    image: esitcparis/unbound-distroless:1.26.1-r0
+    container_name: unbound
+    restart: unless-stopped
+    # Time Docker waits after SIGTERM before SIGKILL when the service is
+    # stopped or recreated (default 10s).
+    stop_grace_period: 20s
+
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]     # binding :53 as UID 65532
+    security_opt: ["no-new-privileges:true"]
+
+    # The image writes in exactly two places: /var/lib/unbound (the volume
+    # below: DNSSEC trust anchor and the hyperlocal root zone copy) and
+    # /run/unbound (the control socket and the PID file). Everything else can
+    # be read-only.
+    read_only: true
+    tmpfs:
+      - "/run/unbound:uid=65532,gid=65532"
+
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+
+    volumes:
+      # Named volume, required: the sidecar refuses to run without a named
+      # volume on /var/lib/unbound (it clones it for the canary).
+      - unbound-data:/var/lib/unbound
+      # Your configuration. Compose resolves this relative path against the
+      # project directory, i.e. /opt/unbound/unbound.conf.
+      - ./unbound.conf:/etc/unbound/unbound.conf:ro
+      # Serving DoT/DoH? Mount the certificate directory too — the sidecar
+      # fingerprints EVERY declared bind mount, so a renewed certificate is
+      # canaried and redeployed like a configuration change:
+      # - ./tls:/etc/unbound/tls:ro
+
+    # outgoing-range (4096) × num-threads (2) from unbound.conf = 8192 sockets
+    # for the outgoing port pool alone. Raise both together if you raise
+    # either in unbound.conf.
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
+
+    # unbound.conf's caches: msg 64m + rrset 128m + key 32m + neg 16m = 240m,
+    # plus the infra cache (infra-cache-numhosts 50000), per-thread buffers and
+    # the binary itself. 512m leaves roughly 2× headroom over the cache total.
+    # Resize this WITH the cache sizes, never on its own.
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── Automatic updates ───────────────────────────────────────────────────────
+  # Same content as updater/compose.snippet.yml. The Docker socket is root on
+  # the host: read updater/README.md before enabling this.
+  unbound-autoupdate:
+    # The sidecar follows a major tag on purpose: it replaces itself (see
+    # updater/lib/selfupdate.sh), so a moving tag is how it gets its own
+    # updates. Pinning it immutably freezes the updater, not the resolver.
+    image: esitcparis/unbound-autoupdate:1
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      # Host A: a cycle at start, then every hour plus up to 6 minutes of jitter
+      # Host B: identical, but `docker compose up -d` it ~30 min after host A
+      # (see ../production.md — SPLAY jitters one host, it does not phase two).
+      INTERVAL: 1h
+      SPLAY: 10%
+      NOTIFY_HOST: resolver-1.example
+      HC_URL: ${HC_URL:?set HC_URL in .env}
+      # WEBHOOK_URL: ${WEBHOOK_URL}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/unbound:/opt/unbound:ro
+      - autoupdate-state:/var/lib/unbound-autoupdate
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  unbound-metrics:
+    image: esitcparis/unbound-autoupdate:1
+    command: ["metrics"]
+    restart: unless-stopped
+    ports:
+      # Bind to the monitoring interface only — /metrics needs the Docker
+      # socket, so it is never published publicly. 127.0.0.1 when Prometheus
+      # scrapes through a tunnel; the host's monitoring IP otherwise.
+      - "127.0.0.1:9167:9167"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - autoupdate-state:/var/lib/unbound-autoupdate:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  unbound-data:
+  autoupdate-state:

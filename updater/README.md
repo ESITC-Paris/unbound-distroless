@@ -142,6 +142,11 @@ DNSSEC trust anchor lives there, and it is what the canary clones) and must
 declare an image that carries a repository digest — a locally built image is
 refused rather than guessed at.
 
+For a full two-host production deployment — host prerequisites, a hardened
+Compose reference that was brought up and validated before being written down,
+Prometheus alerts and a runbook per failure mode — see
+[`../docs/production.md`](../docs/production.md).
+
 ## The same-absolute-path rule
 
 The sidecar runs `docker compose` itself, against your project's real files,
