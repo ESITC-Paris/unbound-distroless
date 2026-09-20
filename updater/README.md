@@ -293,6 +293,21 @@ unbound_exporter_scrape_success 1
 unbound_exporter_scrape_duration_seconds 0.061
 ```
 
+Two families are derived rather than copied from `unbound-control`:
+
+- `unbound_response_time_percentile_seconds{percentile="50"|"95"|"99"}` —
+  p50/p95/p99 of the recursion-time histogram (linear interpolation inside
+  the bucket, as `histogram_quantile` would), for consumers that cannot
+  compute quantiles from buckets. Cumulative since the counters were last
+  reset, like the histogram.
+- `unbound_trust_anchor_*` — the RFC 5011 state read from the resolver's
+  `root.key`: `last_success_timestamp_seconds` and `next_probe_timestamp_seconds`
+  of the root DNSKEY probe, `failed_probes` (consecutive failures) and one
+  `key_info{keytag,state}` sample per known root KSK. Alert when the last
+  success ages beyond a few days: that is the mechanism that carries the
+  resolver across a root KSK rollover.
+
+
 Anything `unbound-control` reports that has no family of its own lands in
 `unbound_stat{name="…"}`, so a new statistic in a future Unbound release is
 exported rather than dropped.

@@ -41,6 +41,19 @@ if stats=$(timeout 10 bash -c '
   fi
 fi
 
+# Trust-anchor state, same bounded-child contract. Absent (not an error) when
+# the resolver cannot be reached or the file is not there.
+if anchor=$(timeout 5 bash -c '
+    set -uo pipefail
+    LIB=/usr/local/lib/unbound-autoupdate
+    . "$LIB/log.sh"
+    . "$LIB/state.sh"
+    . "$LIB/discover.sh"
+    . "$LIB/metrics.sh"
+    _collect_anchor' 2>/dev/null); then
+  [ -n "$anchor" ] && anchor_to_prometheus <<<"$anchor"
+fi
+
 [ -r "$METRICS_FILE" ] && cat "$METRICS_FILE"
 
 printf '# HELP unbound_exporter_scrape_success 1 when unbound-control stats were collected on this scrape.\n# TYPE unbound_exporter_scrape_success gauge\n'

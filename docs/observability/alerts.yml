@@ -35,6 +35,13 @@ groups:
 
   - name: unbound-autoupdate
     rules:
+      - alert: UnboundTrustAnchorProbeStale
+        expr: time() - unbound_trust_anchor_last_success_timestamp_seconds > 3 * 86400
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "RFC 5011 root DNSKEY probe has not succeeded for 3 days on {{ $labels.instance }}"
+          description: "The trust anchor is not being refreshed; a root KSK rollover would then break validation. Check root.key writability and connectivity to the root servers."
       - alert: UnboundAutoupdateStale
         expr: time() - unbound_autoupdate_last_cycle_timestamp_seconds > 3 * 3600
         for: 10m

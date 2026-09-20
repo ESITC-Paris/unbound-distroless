@@ -300,6 +300,10 @@ STATS
     '^unbound_response_time_seconds_bucket\{le="\+Inf"\} 4$' \
     '^unbound_response_time_seconds_count 4$' \
     '^unbound_response_time_seconds_sum 0.5$' \
+    '^unbound_response_time_percentile_seconds\{percentile="50"\} 3e-06$' \
+    '^unbound_response_time_percentile_seconds\{percentile="95"\} 7.2e-06$' \
+    '^unbound_response_time_percentile_seconds\{percentile="99"\} 7.84e-06$' \
+    '^# TYPE unbound_response_time_percentile_seconds gauge$' \
     '^# TYPE unbound_queries_total counter$' \
     '^# TYPE unbound_requestlist_avg gauge$' \
     '^# TYPE unbound_response_time_seconds histogram$'; do
@@ -331,7 +335,47 @@ BADSTATS
   grep -qE '^unbound_queries_total 12$' "$bad" || fail "malformed lines swallowed the valid ones: $(cat "$bad")"
   rm -f "$bad"
   rm -f "$out"
-  pass "stats_to_prometheus: valid exposition text, labels, grouped families, cumulative histogram"
+  pass "stats_to_prometheus: valid exposition text, labels, grouped families, cumulative histogram, percentiles"
+}
+
+t0_anchor_to_prometheus_unit() {
+  # The RFC 5011 file unbound keeps (root.key) must come out as the probe
+  # timestamps, the failure counter and one info sample per key with its
+  # state — and a file that is not one (empty, or unbound's error text) must
+  # produce NOTHING rather than a value-less sample.
+  local out="$TEST_TMPDIR/upd-anchor-$$.prom"
+  docker run --rm -i --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    anchor_to_prometheus' > "$out" <<'ANCHOR'
+; autotrust trust anchor file
+;;id: . 1
+;;last_queried: 1789939971 ;;Sun Sep 20 21:32:51 2026
+;;last_success: 1789939971 ;;Sun Sep 20 21:32:51 2026
+;;next_probe_time: 1790019521 ;;Mon Sep 21 19:38:41 2026
+;;query_failed: 0
+;;query_interval: 43200
+;;retry_time: 8640
+.	86400	IN	DNSKEY	257 3 8 AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rmIHHqI4W+FZqOx4rrM ;{id = 38696 (ksk), size = 2048b} ;;state=2 [  VALID  ] ;;count=0 ;;lastchange=1736575223 ;;Sat Jan 11 06:00:23 2025
+.	86400	IN	DNSKEY	257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3 ;{id = 20326 (ksk), size = 2048b} ;;state=2 [  VALID  ] ;;count=0 ;;lastchange=1536000000 ;;Mon Sep  3 18:40:00 2018
+ANCHOR
+  promtool_check "$out" || fail "anchor_to_prometheus output rejected by promtool: $(cat "$out")"
+  local expect
+  for expect in \
+    '^unbound_trust_anchor_last_success_timestamp_seconds 1789939971$' \
+    '^unbound_trust_anchor_next_probe_timestamp_seconds 1790019521$' \
+    '^unbound_trust_anchor_failed_probes 0$' \
+    '^unbound_trust_anchor_key_info\{keytag="38696",state="VALID"\} 1$' \
+    '^unbound_trust_anchor_key_info\{keytag="20326",state="VALID"\} 1$' \
+    '^# TYPE unbound_trust_anchor_key_info gauge$'; do
+    grep -qE "$expect" "$out" || fail "anchor_to_prometheus: missing '$expect' in: $(cat "$out")"
+  done
+  local none
+  none=$(docker run --rm -i --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    . /usr/local/lib/unbound-autoupdate/metrics.sh
+    anchor_to_prometheus' <<<'Error response from daemon: No such container: unbound')
+  [ -z "$none" ] || fail "anchor_to_prometheus emitted samples for a non-anchor input: $none"
+  rm -f "$out"
+  pass "anchor_to_prometheus: probe timestamps, failure counter, one info sample per key, silent on garbage"
 }
 
 t0_cycle_metrics_unit() {
@@ -1464,6 +1508,7 @@ ALL_TESTS="
   t0_notify_host_unit
   t0_config_fingerprint_directory_unit
   t0_stats_to_prometheus_unit
+  t0_anchor_to_prometheus_unit
   t0_cycle_metrics_unit
   t0_helper_lock_unit
   t0_self_swap_identity_unit

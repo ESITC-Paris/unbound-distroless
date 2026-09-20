@@ -137,8 +137,68 @@ stats_to_prometheus() {
       printf "unbound_response_time_seconds_bucket{le=\"+Inf\"} %d\n", cum
       printf "unbound_response_time_seconds_sum %g\n", (rreplies+0) * (ravg+0)
       printf "unbound_response_time_seconds_count %d\n", cum
+      # Percentiles of the same distribution, so a system that cannot compute
+      # quantiles from buckets (Zabbix, a plain dashboard) still gets p50/p95/
+      # p99. Linear interpolation inside the bucket, as histogram_quantile
+      # does. The label is "percentile", not "quantile": the exposition format
+      # reserves "quantile" for summaries. Cumulative since the counters were
+      # last reset (stats_noreset), like the histogram itself.
+      if (cum > 0) {
+        printf "# HELP unbound_response_time_percentile_seconds Recursion time percentiles from the histogram, in seconds.\n# TYPE unbound_response_time_percentile_seconds gauge\n"
+        np=split("50 95 99", pct, " ")
+        for (j=1; j<=np; j++) {
+          target=cum*pct[j]/100; c=0; lo=0; val=hle[nh]
+          for (i=1; i<=nh; i++) {
+            if (c+hcount[i] >= target) {
+              val = lo + (hle[i]-lo) * ((hcount[i] > 0) ? (target-c)/hcount[i] : 0); break
+            }
+            c+=hcount[i]; lo=hle[i]
+          }
+          printf "unbound_response_time_percentile_seconds{percentile=\"%s\"} %g\n", pct[j], val
+        }
+      }
     }
   }'
+}
+
+# anchor_to_prometheus — stdin: the RFC 5011 trust-anchor file unbound keeps
+# in /var/lib/unbound/root.key (auto-trust-anchor-file). Emits the state of
+# the mechanism that keeps the resolver validating across a root KSK
+# rollover: when the last probe of the root DNSKEY succeeded, when the next
+# one is due, how many probes failed in a row, and every key with its RFC
+# 5011 state. Any line that does not match is ignored: the file format is
+# unbound's, not a schema this exporter owns.
+anchor_to_prometheus() {
+  awk '
+  function esc(s) { gsub(/\\/, "\\\\\\\\", s); gsub(/"/, "\\\\\"", s); return s }
+  /^;;last_success: [0-9]+/   { ls=$2 }
+  /^;;next_probe_time: [0-9]+/ { np=$2 }
+  /^;;query_failed: [0-9]+/    { qf=$2 }
+  /\{id = [0-9]+ \(ksk\)/ {
+    tag=$0; sub(/.*\{id = /, "", tag); sub(/ .*/, "", tag)
+    st=$0; sub(/.*;;state=[0-9] \[ */, "", st); sub(/ *\].*/, "", st)
+    if (tag ~ /^[0-9]+$/) keys[tag]=st
+  }
+  END {
+    if (ls == "") exit 0
+    printf "# HELP unbound_trust_anchor_last_success_timestamp_seconds Last successful RFC 5011 probe of the root DNSKEY, unix time.\n# TYPE unbound_trust_anchor_last_success_timestamp_seconds gauge\n"
+    printf "unbound_trust_anchor_last_success_timestamp_seconds %s\n", ls
+    printf "# HELP unbound_trust_anchor_next_probe_timestamp_seconds Next scheduled RFC 5011 probe, unix time.\n# TYPE unbound_trust_anchor_next_probe_timestamp_seconds gauge\n"
+    printf "unbound_trust_anchor_next_probe_timestamp_seconds %s\n", (np == "" ? 0 : np)
+    printf "# HELP unbound_trust_anchor_failed_probes Consecutive failed RFC 5011 probes.\n# TYPE unbound_trust_anchor_failed_probes gauge\n"
+    printf "unbound_trust_anchor_failed_probes %s\n", (qf == "" ? 0 : qf)
+    printf "# HELP unbound_trust_anchor_key_info Root KSKs known to the resolver and their RFC 5011 state.\n# TYPE unbound_trust_anchor_key_info gauge\n"
+    for (t in keys) printf "unbound_trust_anchor_key_info{keytag=\"%s\",state=\"%s\"} 1\n", t, esc(keys[t])
+  }'
+}
+
+# _collect_anchor — copy the trust-anchor file out of the resolver on stdout.
+# The image is distroless (no shell to cat it), so `docker cp` streams it as a
+# tar archive and tar unpacks it to stdout. Same exec/timeout contract as
+# _collect_stats: NOTHING may follow this call.
+_collect_anchor() {
+  discover_target_container
+  exec sh -c 'docker cp "$1":/var/lib/unbound/root.key - | tar -xO' _ "$TARGET_CONTAINER"
 }
 
 # _prom_escape <value> — a label VALUE is a quoted string, and the three
