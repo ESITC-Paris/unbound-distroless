@@ -25,6 +25,8 @@ LIB=/usr/local/lib/unbound-autoupdate
 . "$LIB/metrics.sh"
 # shellcheck source=updater/lib/selfupdate.sh
 . "$LIB/selfupdate.sh"
+# shellcheck source=updater/lib/cache.sh
+. "$LIB/cache.sh"
 
 WATCH_CONFIG="${WATCH_CONFIG:-1}"
 ALLOW_MAJOR="${ALLOW_MAJOR:-0}"
@@ -39,6 +41,7 @@ flock -n 9 || { log_info "another cycle is already running"; exit 2; }
 CYCLE_START=$(date -u +%s)
 FINISHED=0
 CANARY_ACTIVE=0
+CACHE_DUMP=""
 
 # finish <status> <code> — the ONLY way out of a cycle once the lock is held:
 # persists the outcome and its counter, rewrites metrics.prom, exits.
@@ -55,6 +58,7 @@ finish() {
 _on_exit() {
   local rc=$?
   [ "$CANARY_ACTIVE" = 1 ] && canary_down
+  [ -n "$CACHE_DUMP" ] && rm -f "$CACHE_DUMP"
   if [ "$FINISHED" = 0 ]; then
     record_cycle error $(( $(date -u +%s) - CYCLE_START )) || true
   fi
@@ -206,6 +210,18 @@ fi
 recreate=()
 [ "$image_changed" = 0 ] && recreate=(--force-recreate)
 
+# Export the cache of the outgoing resolver, reloaded into the new one once
+# it has passed its own validation (lib/cache.sh). Best effort: a failure
+# here only means starting cold, as before.
+if [ "$KEEP_CACHE" = 1 ]; then
+  if cache_compatible "$RUNNING" "$DECLARED"; then
+    CACHE_DUMP=$(mktemp)
+    cache_save "$PRE_SWAP_CONTAINER" "$CACHE_DUMP" || CACHE_DUMP=""
+  else
+    log_info "cache not preserved: the unbound version changes beyond a patch release"
+  fi
+fi
+
 log_info "swapping $TARGET_SERVICE (brief restart)"
 swap_ok=1
 swap_out=$(compose up -d --no-deps "${recreate[@]}" "$TARGET_SERVICE" 2>&1) || swap_ok=0
@@ -261,7 +277,8 @@ if [ "$post_swap_ok" = 1 ]; then
   config_quarantine_clear
   version=$(image_version_label "$DECLARED")
   log_info "production updated and verified: $DECLARED (unbound ${version:-unknown})"
-  notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check."
+  [ -n "$CACHE_DUMP" ] && cache_restore "$TARGET_CONTAINER" "$CACHE_DUMP"
+  notify updated "updated successfully" "Project $COMPOSE_PROJECT, service $TARGET_SERVICE now runs $DECLARED (unbound ${version:-unknown}) and passed every post-deployment check.${CACHE_NOTE}"
   if self_update; then hc_success; finish updated 0; fi
   hc_fail "sidecar self-update refused"
   finish blocked 1
@@ -312,6 +329,7 @@ if [ "$rollback_ok" = 1 ] && [ -n "$TARGET_CONTAINER" ] \
   else
     log_info "rollback successful — production restored on $RUNNING"
   fi
+  [ -n "$CACHE_DUMP" ] && cache_restore "$TARGET_CONTAINER" "$CACHE_DUMP"
   notify rollback "ROLLBACK performed" "The swap to $DECLARED failed its post-swap validation. Production was rolled back to $RUNNING and is healthy.${config_note}
 
 WARNING: the compose file still declares the failing image. Running 'docker compose up -d' by hand would redeploy it. The updater will not retry before RETRY_AFTER=${RETRY_AFTER:-24h}."

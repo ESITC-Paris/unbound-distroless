@@ -416,6 +416,81 @@ ANCHOR
   pass "anchor_to_prometheus: probe timestamps, failure counter, one info sample per key, silent on garbage"
 }
 
+t0_cache_split_unit() {
+  # A dump must come out as self-contained load_cache inputs of at most
+  # KEEP_CACHE_CHUNK entries, every record-set batch numbered before every
+  # message batch (a message only loads when its record sets are cached),
+  # with no entry lost or duplicated and multi-line entries kept whole.
+  local out
+  out=$(docker run --rm -i --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/cache.sh
+    KEEP_CACHE_CHUNK=2; d=$(mktemp -d); cat > "$d/dump"
+    _cache_split "$d/dump" "$d"
+    for f in "$d"/0*; do printf "== %s\n" "${f##*/}"; cat "$f"; done' <<'DUMP'
+START_RRSET_CACHE
+;rrset 100 1 1 5 4
+a.test.	100	IN	A	192.0.2.1
+a.test.	100	IN	RRSIG	A 13 2 100 20260926031529 20260919020529 1 test. AAAA
+;rrset 100 1 0 5 3
+b.test.	100	IN	A	192.0.2.2
+;rrset 100 1 0 5 3
+c.test.	100	IN	A	192.0.2.3
+END_RRSET_CACHE
+START_MSG_CACHE
+msg a.test. IN A 33152 1 100 4 1 0 0 -1
+a.test. IN A 0
+msg b.test. IN A 33152 1 100 3 1 0 0 -1
+b.test. IN A 0
+msg c.test. IN A 33152 1 100 3 1 0 0 -1
+c.test. IN A 0
+END_MSG_CACHE
+EOF
+DUMP
+)
+  local expect
+  expect='== 000001
+START_RRSET_CACHE
+;rrset 100 1 1 5 4
+a.test.	100	IN	A	192.0.2.1
+a.test.	100	IN	RRSIG	A 13 2 100 20260926031529 20260919020529 1 test. AAAA
+;rrset 100 1 0 5 3
+b.test.	100	IN	A	192.0.2.2
+END_RRSET_CACHE
+START_MSG_CACHE
+END_MSG_CACHE
+EOF
+== 000002
+START_RRSET_CACHE
+;rrset 100 1 0 5 3
+c.test.	100	IN	A	192.0.2.3
+END_RRSET_CACHE
+START_MSG_CACHE
+END_MSG_CACHE
+EOF
+== 000003
+START_RRSET_CACHE
+END_RRSET_CACHE
+START_MSG_CACHE
+msg a.test. IN A 33152 1 100 4 1 0 0 -1
+a.test. IN A 0
+msg b.test. IN A 33152 1 100 3 1 0 0 -1
+b.test. IN A 0
+END_MSG_CACHE
+EOF
+== 000004
+START_RRSET_CACHE
+END_RRSET_CACHE
+START_MSG_CACHE
+msg c.test. IN A 33152 1 100 3 1 0 0 -1
+c.test. IN A 0
+END_MSG_CACHE
+EOF'
+  [ "$out" = "$expect" ] || fail "_cache_split: unexpected batches:
+$out"
+  pass "cache split: bounded self-contained batches, record sets before messages, entries kept whole"
+}
+
 t0_cycle_metrics_unit() {
   local out="$TEST_TMPDIR/upd-cycle-$$.prom" res
   res=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
@@ -1433,6 +1508,45 @@ t3_config_change_triggers() {
   pass "T3: a configuration change is canaried and deployed"
 }
 
+t_cache_preserved_across_swap() {
+  # A swap recreates the resolver, which empties its cache. The cache of the
+  # outgoing container must be carried over into the new one — and must NOT
+  # be when KEEP_CACHE=0, which proves the entry below survives because of
+  # the transfer and not by accident.
+  local dir="$TEST_TMPDIR/upd-cache-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$MOVING_REF"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+
+  # An entry no resolution could produce: only the transfer can bring it back.
+  local seed='START_RRSET_CACHE
+;rrset 86000 1 0 5 3
+keep-cache.invalid.	86000	IN	A	192.0.2.55
+END_RRSET_CACHE
+START_MSG_CACHE
+msg keep-cache.invalid. IN A 33152 1 86000 3 1 0 0 -1
+keep-cache.invalid. IN A 0
+END_MSG_CACHE
+EOF'
+  local cid round keep dump
+  for round in 1 0; do
+    cid=$(fixture_service_cid "$dir" unbound)
+    [ "$(printf '%s\n' "$seed" | docker exec -i "$cid" /usr/local/sbin/unbound-control \
+          -c /etc/unbound/unbound.conf load_cache)" = ok ] || fail "could not seed the cache"
+    printf '\nserver:\n  cache-min-ttl: %s\n' "$((100 + round))" >> "$dir/unbound.conf"
+    updater_run "$dir" "KEEP_CACHE=$round" >/dev/null || fail "config-change cycle failed (KEEP_CACHE=$round)"
+    [ "$(fixture_service_cid "$dir" unbound)" != "$cid" ] || fail "the configuration change did not recreate the resolver"
+    # Captured first: grep -q stopping early would SIGPIPE the export, and
+    # pipefail would then read a present entry as absent.
+    dump=$(docker exec "$(fixture_service_cid "$dir" unbound)" /usr/local/sbin/unbound-control \
+      -c /etc/unbound/unbound.conf dump_cache)
+    keep=0
+    grep -q '^keep-cache\.invalid\.' <<<"$dump" && keep=1
+    [ "$keep" = "$round" ] || fail "KEEP_CACHE=$round: seeded entry present=$keep after the swap"
+  done
+  pass "cache carried over a swap (and not when KEEP_CACHE=0)"
+}
+
 t7a_failed_swap_is_loud() {
   local dir="$TEST_TMPDIR/upd-t7a-$$" blocker="upd-t7a-blocker-$$" port=15353
   # blocker_track (not just this trap) guarantees the port-holder dies even
@@ -1593,6 +1707,7 @@ ALL_TESTS="
   t0_config_fingerprint_exclude_unit
   t0_stats_to_prometheus_unit
   t0_anchor_to_prometheus_unit
+  t0_cache_split_unit
   t0_cycle_metrics_unit
   t0_helper_lock_unit
   t0_self_swap_identity_unit
@@ -1613,6 +1728,7 @@ ALL_TESTS="
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle
   t3_config_change_triggers
+  t_cache_preserved_across_swap
   t_verify_key_accepts_signed
   t6_unsigned_image_refused
   t8_major_bump_refused
