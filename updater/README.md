@@ -205,6 +205,7 @@ canary with a clone of production state; production was not touched.
 | `STATE_DIR` | `/var/lib/unbound-autoupdate` | Where `state.env` and `metrics.prom` live. Must be writable and survive container recreation — a named volume, or a bind mount. |
 | `CHECK_ONLY` | `0` | Validate but never swap. `check` mode sets it; you rarely set it by hand. |
 | `DISCOVER_WAIT` | `60` | Seconds a cycle waits for the resolver container when it is absent — the window where `docker compose up` has removed the old one and not yet started the new one. The metrics scrape leaves this at `0` and fails fast. |
+| `FINGERPRINT_EXCLUDE` | *(empty)* | Container paths (space-separated) removed from configuration CHANGE DETECTION — for data another tool manages and applies at runtime, typically a blocklist loaded with `unbound-control local_zones`. Without it every regeneration is a canary and a container swap, which restarts unbound and empties its cache. The mount is still given to the canary, so image updates are validated against the real data. The owning tool must validate the data itself. |
 
 ## Behaviour
 

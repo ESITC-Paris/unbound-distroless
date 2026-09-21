@@ -223,6 +223,44 @@ t0_config_fingerprint_directory_unit() {
   pass "config_fingerprint covers directory mounts including symlinked certificates, sees renames, and fails loudly on a missing path, an empty mount or a dangling symlink"
 }
 
+t0_config_fingerprint_exclude_unit() {
+  # FINGERPRINT_EXCLUDE removes a mount from change detection — a blocklist
+  # the generator applies at runtime must not trigger a canary + container
+  # swap (which empties the cache) — and removes NOTHING else: the other
+  # mounts still move the hash, and an unset variable changes nothing.
+  local out
+  out=$(docker run --rm --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -euo pipefail
+    export STATE_DIR=/tmp/st
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    mkdir -p /tmp/st /bl; echo conf1 > /u.conf; echo "local-zone: \"a.\" static" > /bl/blocklist.conf
+    DECLARED_BIND_MOUNTS=(-v /u.conf:/etc/unbound/unbound.conf:ro -v /bl:/etc/unbound/blocklists:ro)
+
+    unset FINGERPRINT_EXCLUDE
+    base=$(config_fingerprint)
+    echo "local-zone: \"b.\" static" >> /bl/blocklist.conf
+    [ "$(config_fingerprint)" != "$base" ] || { echo "without an exclusion a blocklist change was invisible"; exit 1; }
+
+    export FINGERPRINT_EXCLUDE="/etc/unbound/blocklists/"
+    h1=$(config_fingerprint)
+    echo "local-zone: \"c.\" static" >> /bl/blocklist.conf
+    [ "$(config_fingerprint)" = "$h1" ] || { echo "an excluded mount still moved the fingerprint"; exit 1; }
+
+    echo conf2 > /u.conf
+    [ "$(config_fingerprint)" != "$h1" ] || { echo "excluding the blocklist also hid unbound.conf"; exit 1; }
+
+    # A path that merely starts with the excluded one is NOT under it.
+    DECLARED_BIND_MOUNTS=(-v /u.conf:/etc/unbound/unbound.conf:ro -v /bl:/etc/unbound/blocklists-extra:ro)
+    h2=$(config_fingerprint)
+    echo "local-zone: \"d.\" static" >> /bl/blocklist.conf
+    [ "$(config_fingerprint)" != "$h2" ] || { echo "a sibling path sharing the prefix was excluded"; exit 1; }
+    echo OK') || fail "config_fingerprint exclude unit failed: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "config_fingerprint exclude unit did not print OK: $out"
+  pass "FINGERPRINT_EXCLUDE removes only the declared data mount from change detection"
+}
+
 t0_stats_to_prometheus_unit() {
   # A canned stats_noreset excerpt (the shapes unbound 1.26 actually prints)
   # must come out as valid exposition text: grouped families, HELP and TYPE
@@ -1552,6 +1590,7 @@ ALL_TESTS="
   t0_compose_file_args_unit
   t0_notify_host_unit
   t0_config_fingerprint_directory_unit
+  t0_config_fingerprint_exclude_unit
   t0_stats_to_prometheus_unit
   t0_anchor_to_prometheus_unit
   t0_cycle_metrics_unit

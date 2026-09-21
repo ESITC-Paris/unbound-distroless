@@ -339,11 +339,30 @@ declared_digest() {
 # configuration: a silently partial hash is precisely the kind of quiet
 # wrongness this project exists to remove.
 config_fingerprint() {
-  local src paths=()
+  local src dst spec rest paths=() ex skip
   local i
   for (( i = 0; i < ${#DECLARED_BIND_MOUNTS[@]}; i++ )); do
     [ "${DECLARED_BIND_MOUNTS[$i]}" = "-v" ] || continue
-    src="${DECLARED_BIND_MOUNTS[$((i+1))]%%:*}"
+    spec="${DECLARED_BIND_MOUNTS[$((i+1))]}"
+    src="${spec%%:*}"; rest="${spec#*:}"; dst="${rest%%:*}"
+    # FINGERPRINT_EXCLUDE: container paths (space-separated) whose content is
+    # DATA managed by another tool, not configuration. The canonical case is a
+    # blocklist regenerated nightly and applied to the running resolver at
+    # runtime (unbound-control local_zones): fingerprinting it made every
+    # regeneration a canary + container swap, which restarts unbound and
+    # empties its cache for a change that needed neither.
+    #
+    # Excluding a path removes it from CHANGE DETECTION only. The mount is
+    # still passed to the canary (DECLARED_BIND_MOUNTS is untouched), so an
+    # image update is still validated against the real data. The tool that
+    # owns the excluded data is responsible for validating it before use.
+    # An exclusion is the operator's explicit decision, never a default.
+    skip=0
+    for ex in ${FINGERPRINT_EXCLUDE:-}; do
+      ex="${ex%/}"
+      if [ "$dst" = "$ex" ] || [ "${dst#"$ex"/}" != "$dst" ]; then skip=1; break; fi
+    done
+    [ "$skip" = 1 ] && continue
     paths+=("$src")
   done
   if [ "${#paths[@]}" -eq 0 ]; then
