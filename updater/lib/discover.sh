@@ -96,25 +96,53 @@ discover_target_container() {
   # A sibling running the sidecar's OWN image (the metrics service, a second
   # updater) is never the resolver, whatever its repository name contains —
   # and "unbound-autoupdate" does contain "unbound".
-  local candidates=() cid img self_repo
+  # A resolver that is BEING RECREATED — the seconds between `docker compose
+  # up` removing the old container and starting the new one — is simply
+  # absent from `docker ps`. A cycle that happens to start in that window
+  # used to die, and the EXIT trap recorded it as a FAILED UPDATE: a false
+  # "update impossible" page for what is a normal restart. Observed in
+  # production on 2026-09-21, one host out of three, purely on timing.
+  #
+  # So discovery is patient: DISCOVER_WAIT seconds, polled every 2 s. The
+  # update cycle sets it; the metrics scrape leaves it at 0 and keeps the
+  # old fail-fast behaviour, because a scrape must never block. Two or more
+  # candidates is a configuration mistake, not a race — that one still dies
+  # immediately, waiting would not change the answer.
+  local candidates=() cid img self_repo deadline
   self_repo=$(_image_repo "$SELF_IMAGE")
-  while read -r cid; do
-    [ "$cid" = "$SELF_ID" ] && continue
-    img=$(docker inspect "$cid" --format '{{.Config.Image}}' 2>/dev/null) || continue
-    [ "$(_image_repo "$img")" = "$self_repo" ] && continue
-    case "$img" in
-      *unbound*) candidates+=("$cid") ;;
-    esac
-  done < <(docker ps --no-trunc --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.ID}}')
+  deadline=$(( $(date +%s) + ${DISCOVER_WAIT:-0} ))
+  TARGET_CONTAINER=""
+  while true; do
+    candidates=()
+    while read -r cid; do
+      [ "$cid" = "$SELF_ID" ] && continue
+      img=$(docker inspect "$cid" --format '{{.Config.Image}}' 2>/dev/null) || continue
+      [ "$(_image_repo "$img")" = "$self_repo" ] && continue
+      case "$img" in
+        *unbound*) candidates+=("$cid") ;;
+      esac
+    done < <(docker ps --no-trunc --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.ID}}')
 
-  if [ -n "${TARGET_SERVICE:-}" ]; then
-    TARGET_CONTAINER=$(docker ps --no-trunc \
-      --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
-      --filter "label=com.docker.compose.service=$TARGET_SERVICE" --format '{{.ID}}' | head -1)
-    [ -n "$TARGET_CONTAINER" ] || log_die "TARGET_SERVICE='$TARGET_SERVICE' not found in project '$COMPOSE_PROJECT'"
-  elif [ "${#candidates[@]}" -eq 1 ]; then
-    TARGET_CONTAINER="${candidates[0]}"
-  else
+    if [ -n "${TARGET_SERVICE:-}" ]; then
+      TARGET_CONTAINER=$(docker ps --no-trunc \
+        --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
+        --filter "label=com.docker.compose.service=$TARGET_SERVICE" --format '{{.ID}}' | head -1)
+    elif [ "${#candidates[@]}" -eq 1 ]; then
+      TARGET_CONTAINER="${candidates[0]}"
+    elif [ "${#candidates[@]}" -gt 1 ]; then
+      break
+    fi
+
+    [ -n "$TARGET_CONTAINER" ] && break
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    log_info "resolver not running yet — waiting for it to come back"
+    sleep 2
+  done
+
+  if [ -z "$TARGET_CONTAINER" ]; then
+    if [ -n "${TARGET_SERVICE:-}" ]; then
+      log_die "TARGET_SERVICE='$TARGET_SERVICE' not found in project '$COMPOSE_PROJECT'"
+    fi
     local names=""
     for cid in "${candidates[@]:-}"; do names="$names $(_label "$cid" com.docker.compose.service)"; done
     log_die "discovery found ${#candidates[@]} candidate services (${names:-none}) — set TARGET_SERVICE explicitly"

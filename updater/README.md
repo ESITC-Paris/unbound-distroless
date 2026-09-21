@@ -204,6 +204,7 @@ canary with a clone of production state; production was not touched.
 | `METRICS_PORT` | `9167` | Port `metrics` mode listens on. |
 | `STATE_DIR` | `/var/lib/unbound-autoupdate` | Where `state.env` and `metrics.prom` live. Must be writable and survive container recreation — a named volume, or a bind mount. |
 | `CHECK_ONLY` | `0` | Validate but never swap. `check` mode sets it; you rarely set it by hand. |
+| `DISCOVER_WAIT` | `60` | Seconds a cycle waits for the resolver container when it is absent — the window where `docker compose up` has removed the old one and not yet started the new one. The metrics scrape leaves this at `0` and fails fast. |
 
 ## Behaviour
 

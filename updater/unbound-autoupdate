@@ -63,6 +63,11 @@ _on_exit() {
 trap _on_exit EXIT
 
 hc_start
+# The resolver may be mid-recreation when this cycle starts (a configuration
+# change applied by hand or by a configuration-management run does exactly
+# that). Wait for it rather than record a failed update.
+: "${DISCOVER_WAIT:=60}"
+export DISCOVER_WAIT
 discover_target
 # Captured before anything else touches the service: whatever Compose does,
 # a genuine recreation always yields a brand new container ID. This is what

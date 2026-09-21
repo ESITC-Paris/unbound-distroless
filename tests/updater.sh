@@ -613,6 +613,51 @@ t_discover() {
   pass "discovery derives service, workdir, declared ref, volume, bind mounts, compose file args; a sibling on the sidecar's own image is never a candidate"
 }
 
+t_discover_waits_for_recreating_resolver() {
+  # The window where `docker compose up` has removed the resolver and not yet
+  # started the new one is a NORMAL restart, not a failed update. Discovery
+  # must wait it out (DISCOVER_WAIT) instead of dying — dying makes the EXIT
+  # trap record a failed cycle and pages the operator. Observed in production
+  # 2026-09-21: one host out of three, purely on timing.
+  local dir="$TEST_TMPDIR/upd-discwait-$$"
+  trap 'fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "esitcparis/unbound-distroless:1"
+
+  # Stop the resolver, then bring it back from the outside while a discovery
+  # with DISCOVER_WAIT is already running: it must succeed.
+  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" stop unbound >/dev/null 2>&1
+  ( sleep 6; docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" start unbound >/dev/null 2>&1 ) &
+  local bg=$!
+  local out rc=0
+  out=$(updater_exec "$dir" /bin/bash -c '
+    set -euo pipefail
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    . /usr/local/lib/unbound-autoupdate/discover.sh
+    DISCOVER_WAIT=45 discover_target_container
+    echo "service=$TARGET_SERVICE"') || rc=$?
+  wait "$bg" 2>/dev/null || true
+  [ "$rc" = 0 ] || fail "discovery gave up on a resolver that came back: $out"
+  grep -q '^service=unbound$' <<<"$out" || fail "discovery did not settle on the resolver: $out"
+
+  # Without the wait, the same absence must still fail fast — the metrics
+  # scrape depends on that (a scrape may never block).
+  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" stop unbound >/dev/null 2>&1
+  local t0 t1
+  t0=$(date +%s)
+  if updater_exec "$dir" /bin/bash -c '
+      . /usr/local/lib/unbound-autoupdate/log.sh
+      . /usr/local/lib/unbound-autoupdate/state.sh
+      . /usr/local/lib/unbound-autoupdate/discover.sh
+      discover_target_container' >/dev/null 2>&1; then
+    fail "discovery found a resolver that is stopped"
+  fi
+  t1=$(date +%s)
+  [ $(( t1 - t0 )) -lt 15 ] || fail "discovery without DISCOVER_WAIT took $(( t1 - t0 ))s — a scrape would block"
+  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" start unbound >/dev/null 2>&1
+  pass "discovery waits out a resolver being recreated, and still fails fast without DISCOVER_WAIT"
+}
+
 t_config_fingerprint_handles_spaces() {
   # A compose project can live anywhere on the host, including under a path
   # containing a space. config_fingerprint must hash the declared file
@@ -1513,6 +1558,7 @@ ALL_TESTS="
   t0_helper_lock_unit
   t0_self_swap_identity_unit
   t_discover
+  t_discover_waits_for_recreating_resolver
   t_config_fingerprint_handles_spaces
   t_validate
   t_validate_dnssec_optional
