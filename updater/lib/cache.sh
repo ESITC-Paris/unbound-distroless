@@ -25,6 +25,13 @@
 #   * KEEP_CACHE_TIMEOUT (120 s) bounds each side; whatever is loaded by then
 #     stays, the rest is left to prefetch and ordinary traffic.
 #
+# What travels: only entries still VALID at export time. dump_cache skips
+# every expired record set and message (daemon/cachedump.c: "if(d->ttl < now)
+# return"), and its text format cannot express one. With serve-expired, those
+# entries are kept and served stale — measured on 2026-09-22 they were ~80 %
+# of the cache and served ~21 % of answers — so they are lost at every swap.
+# A host-side warm-up that re-asks the popular names is the complement.
+#
 # The dump holds the names clients asked for. It lives in the sidecar's /tmp
 # only for the duration of the cycle and is removed on every exit path.
 
@@ -76,7 +83,9 @@ cache_save() {
     rm -f "$f"
     return 1
   fi
-  log_info "cache exported: $n record sets in $(( $(date +%s) - t0 ))s"
+  # $n counts every entry in the cache, expired ones included; the file holds
+  # only the valid ones. Report both, or the log overstates what travels.
+  log_info "cache exported: $(grep -c '^;rrset' "$f" || true) of $n record sets (expired entries are not exportable) in $(( $(date +%s) - t0 ))s"
 }
 
 # _cache_split <dump> <dir> — cuts a dump into self-contained load_cache
