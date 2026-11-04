@@ -15,8 +15,10 @@ name: unbound
 services:
   unbound:
     # MODE A — pinned, manual updates (this file's default).
-    #   An X.Y.Z-rN tag is immutable, so the sidecar will pull it forever and
-    #   forever find the same digest: it reports `up_to_date` and never swaps.
+    #   The automation never re-pushes an X.Y.Z-rN tag, so the sidecar pulls it
+    #   and finds the same digest every cycle: `up_to_date`, never a swap (a
+    #   human re-running that tag's release would republish it, though).
+    #   1.26.1-r0 was current when this file was written; take today's release.
     #   You move this line by hand when you decide to upgrade.
     # MODE B — tracking a major tag, automatic updates.
     #   Replace the reference below with `esitcparis/unbound-distroless:1`.
@@ -81,8 +83,9 @@ services:
         max-file: "5"
 
   # ── Automatic updates ───────────────────────────────────────────────────────
-  # Same content as updater/compose.snippet.yml. The Docker socket is root on
-  # the host: read updater/README.md before enabling this.
+  # Based on updater/compose.snippet.yml, plus SPLAY, NOTIFY_HOST,
+  # stop_grace_period, log rotation and HC_URL read from .env. The Docker
+  # socket is root on the host: read updater/README.md before enabling this.
   unbound-autoupdate:
     # The sidecar follows a major tag on purpose: it replaces itself (see
     # updater/lib/selfupdate.sh), so a moving tag is how it gets its own

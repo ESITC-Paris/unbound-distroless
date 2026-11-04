@@ -201,6 +201,7 @@ chronyc tracking            # or the equivalent for your NTP daemon
 | Destination | Why | How to test |
 |---|---|---|
 | Your container registry — for the references in this guide, Docker Hub: `index.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com` | `docker compose pull` every cycle; the canary and the preflight run the pulled image | `docker pull esitcparis/unbound-distroless:1.26.1-r0` |
+| Your `HC_URL` / `WEBHOOK_URL` hosts (`hc-ping.com` in the examples) | `/start`, success and `/fail` pings from every cycle and from the self-update helper | `curl -fsS "$HC_URL"` |
 | `tuf-repo-cdn.sigstore.dev:443` (the Sigstore TUF trust root) | `updater/lib/verify.sh` runs `cosign verify` fail-closed before any new image is deployed | the command below |
 | Root servers, TCP/53 and UDP/53, to the `auth-zone` primaries in `unbound.conf` | RFC 8806 hyperlocal root: Unbound keeps `/var/lib/unbound/root.zone` fresh by AXFR/IXFR from those 14 addresses | `unbound-control list_auth_zones` |
 | The public internet, UDP/53 and TCP/53 | full recursion: `module-config: "validator iterator"`, no forwarders | `dig @<resolver> example.com` |
@@ -215,8 +216,8 @@ checked offline, which is what the third line of the output below says.
 Signature verification, run exactly as `updater/lib/verify.sh` runs it — this
 is both the egress test and the manual check for runbook (d). Any image
 carrying the `cosign` binary, or a local `cosign`, does the same job; the
-upstream image is used here because it resolves today, whereas
-`esitcparis/unbound-autoupdate:1` does not yet (see the note further down).
+upstream image is used here so the check does not depend on the sidecar
+image being present on the host.
 The tag below is cosign **v3.1.3** — the version the sidecar image itself
 embeds, and which verifies the signatures the release workflows produce with
 cosign v2.6.5 (the transcript is from a real run against the published
@@ -290,6 +291,8 @@ services:
   unbound:
     # MODE A — pinned, manual updates (this file's default).
     # MODE B — tracking a major tag: esitcparis/unbound-distroless:1
+    # 1.26.1-r0 was the current release when this guide (and its transcripts)
+    # was written; take today's from the releases page.
     image: esitcparis/unbound-distroless:1.26.1-r0
     container_name: unbound
     restart: unless-stopped
@@ -381,7 +384,7 @@ stating plainly:
 | | Mode A — pinned | Mode B — tracking `:1` |
 |---|---|---|
 | `image:` | `esitcparis/unbound-distroless:1.26.1-r0` | `esitcparis/unbound-distroless:1` |
-| Resolver updates | never automatically: an `X.Y.Z-rN` tag is immutable, so the pull always yields the same digest and, as long as nothing else changed, the cycle ends `up_to_date` (a configuration change still ends `updated`, and a refused sidecar self-update still ends `blocked`) | automatically, whenever the tag moves |
+| Resolver updates | never automatically: the automation never re-pushes an `X.Y.Z-rN` tag, so the pull yields the same digest every cycle (a human re-running that tag's release would republish it, and the sidecar would then canary and deploy the new digest) and, as long as nothing else changed, the cycle ends `up_to_date` (a configuration change still ends `updated`, and a refused sidecar self-update still ends `blocked`) | automatically, whenever the tag moves |
 | What the sidecar still does | pulls, fingerprints your configuration, canaries and redeploys on **configuration** changes, exports metrics, self-updates | all of that, plus resolver image updates |
 | Upgrading | you edit the tag; the next cycle canaries and deploys it | the sidecar canaries and deploys it |
 | Verified here | `1.26.1-r0` exists on Docker Hub (`docker buildx imagetools inspect`), the cycle recorded a baseline and then `up to date` | the `1`, `1.26`, `1.26.1` and `latest` tags exist on Docker Hub |
@@ -397,13 +400,6 @@ it replaces itself (`updater/lib/selfupdate.sh`), and
 `_self_running_digest`/`declared` comparison needs the declared tag to move
 for anything to happen. Pin the sidecar immutably and you freeze the updater,
 not the resolver.
-
-> At the time this guide was written, `esitcparis/unbound-autoupdate` had **no
-> published tags** on Docker Hub (`docker buildx imagetools inspect
-> esitcparis/unbound-autoupdate:1` → `not found`; the Hub tag list is empty).
-> The smoke test below therefore ran against a locally built
-> `unbound-autoupdate:test`. Confirm the tag resolves before your first
-> bring-up.
 
 ### Why each hardening line is there
 
@@ -521,8 +517,9 @@ docker compose logs unbound-autoupdate
 #   ... msg="up to date (esitcparis/unbound-distroless@sha256:…)"
 #   ... msg="next cycle in 3671s"
 
-# Full dress rehearsal: pull, cosign, preflight, canary on a clone of
-# production state, DNS validation — and no swap.
+# Full dress rehearsal: pull, cosign (when the pulled digest differs from the
+# running one), preflight, canary on a clone of production state, DNS
+# validation — and no swap.
 docker compose run --rm unbound-autoupdate check
 echo $?        # 0 — see the exit codes below
 
@@ -532,8 +529,10 @@ curl -s http://127.0.0.1:9167/metrics | grep -c '^unbound_'      # > 0
 
 ### Reading `check`'s exit code
 
-Only 0 and 1 are verdicts on your change. 2 means the cycle never got as far
-as judging it:
+0 is a verdict on your change, and so is 1 unless the log says the cycle died
+before judging anything (discovery failure, unreadable compose file, locally
+built resolver image without a digest). 2 means the cycle never got as far as
+judging it:
 
 | Exit | Meaning | What to do |
 |---|---|---|
@@ -594,8 +593,9 @@ match (`updater/lib/metrics.sh` binds the port it is given).
 | `UnboundDown` (critical, 2m) | The scrape cannot reach `unbound-control` in the resolver container, or Prometheus cannot reach the endpoint at all. | Check clients first: `dig @<host> . SOA`. If DNS is dead, go to runbook (b). If DNS answers, the metrics sidecar or the socket is the problem, not the resolver. |
 | `UnboundServfailRatioHigh` (warning, 10m) | More than 5 % of answers are SERVFAIL over 5 minutes. | `docker compose logs unbound \| grep -i servfail` — `log-servfail: yes` prints the reason. Then check upstream reachability and the host clock (DNSSEC signatures expire). |
 | `UnboundNoDnssecValidation` (warning, 1h) | Queries are flowing but nothing validated in an hour. | Confirm with `dig @<host> . SOA +dnssec` (no `ad` = not validating). Check `/var/lib/unbound/root.key` is on the named volume and readable, and that the volume was not recreated empty. |
+| `UnboundTrustAnchorProbeStale` (warning, 1h after 3 days) | The RFC 5011 probe of the root DNSKEY has not succeeded for three days; a root KSK rollover would then break validation. | Check that `root.key` on the named volume is writable by UID 65532 and that the root servers are reachable from the resolver. |
 | `UnboundAutoupdateStale` (warning, 10m after 3h) | No cycle finished for over three hours; with `INTERVAL=1h` three should have. | `docker compose ps unbound-autoupdate` and its logs. A cycle that died mid-way records itself as `error` on the way out; a container that is gone records nothing at all. |
-| `UnboundAutoupdateFailed` (warning, 5m) | The last cycle ended `blocked` or `error`: pull failure, fingerprint failure, cosign refusal, preflight rejection, or a canary that could not start or did not validate — in all of those, production was not touched. One case is different: a cycle that updated production **successfully** and then had its own self-update refused (an unsigned sidecar image, or a helper that would not start) also ends `blocked`. | Read the sidecar log for the specific line. If it is a cosign refusal, go to runbook (d) — that one is a security event, not an operations event. If it is a sidecar self-update refusal, runbook (c): production is fine. |
+| `UnboundAutoupdateFailed` (warning, 5m) | The last cycle ended `blocked` or `error`: pull failure, fingerprint failure, cosign refusal, preflight rejection, or a canary that could not start or did not validate; `error` also covers a cycle that died in discovery (resolver absent for `DISCOVER_WAIT`, unreadable compose file). In all of those, production was not touched. A refused sidecar self-update (an unsigned sidecar image, or a helper that would not start) also ends `blocked`, at the end of an `up_to_date` cycle (production untouched) or of an `updated` one (production updated **successfully** first). | Read the sidecar log for the specific line. If it is a cosign refusal, go to runbook (d) — that one is a security event, not an operations event. If it is a sidecar self-update refusal, runbook (c): production is fine. |
 | `UnboundAutoupdateRolledBack` (warning) | A swap failed its post-swap gate in the last hour; production was restored and the change quarantined. | Runbook (a). |
 | `UnboundAutoupdateCritical` (critical) | The swap failed **and** the rollback did not restore a working resolver. | Runbook (b), now. Clients should already be on the other host. |
 | `UnboundAutoupdateQuarantined` (warning, 30m) | An image, a configuration or a sidecar image is being held back. The `axis` label says which. | Runbook (a), (c) or (e). Decide before `RETRY_AFTER` (24h) elapses, because the sidecar will retry on its own then. |
@@ -605,8 +605,8 @@ when `RETRY_AFTER` elapses, so — as the comment in `alerts.yml` puts it — a
 `for:` longer than `RETRY_AFTER` would never fire at all. Note also that
 `metrics.prom` is only rewritten by `record_cycle` at the end of a cycle (and
 by the self-update helper); the scrape just serves the file. So
-`unbound_autoupdate_quarantine_active` can stay at 1 for up to one whole
-`INTERVAL` after the window has actually expired.
+`unbound_autoupdate_quarantine_active` can stay at 1 for up to `INTERVAL`
+plus `SPLAY` (and one cycle's duration) after the window has actually expired.
 
 ## Runbooks
 
@@ -684,8 +684,9 @@ redeploys exactly what was just rolled back — with no canary in front of it.
 4. Reproduce without touching production:
    `docker compose run --rm unbound-autoupdate check`. **`check` honours the
    quarantine.** Only the "nothing changed, nothing to do" short-circuit looks
-   at `CHECK_ONLY`; the image and configuration quarantine gates run
-   unconditionally, before the canary. So while the quarantine is open and the
+   at `CHECK_ONLY`; the image and configuration quarantine gates do not look
+   at `CHECK_ONLY` either: each applies whenever its own axis changed, before
+   the canary. So while the quarantine is open and the
    declared image (or the configuration on disk) is the quarantined value,
    `check` logs `update skipped (quarantine)`, exits **2** and canaries
    nothing. To re-test the change, lift the quarantine first — runbook (e) —
@@ -865,9 +866,8 @@ quarantine timestamps and the cycle counters). Confirm the names with
 Back up (stop the service first for a consistent copy — the resolver rewrites
 `root.key` and `root.zone` on its own schedule). Any image with a shell, `tar`
 and `gzip` does this — the commands below name the sidecar image because it is
-already on the host, but **substitute one you have until
-`esitcparis/unbound-autoupdate:1` is published** (`alpine`, or the resolver's
-own image will not do: it is distroless and has no shell).
+already on the host; `alpine` would do as well (the resolver's own image will
+not: it is distroless and has no shell).
 
 While the resolver is stopped, the sidecar's next cycle finds no candidate
 service, dies in discovery and is recorded as `error`, and the metrics scrape
@@ -969,6 +969,9 @@ docker compose run --rm unbound-autoupdate check && echo OK
 # 3. Let the next cycle deploy it (it will: the fingerprint changed), or
 #    deploy now — this skips the canary, so only do it after step 2 passed:
 #    docker compose up -d --force-recreate --no-deps unbound
+#    (the sidecar does not learn the new fingerprint from a manual deploy: its
+#    next cycle canaries and recreates the resolver once more — a second
+#    brief restart)
 ```
 
 `--force-recreate` is what the sidecar itself uses on a config-only change:

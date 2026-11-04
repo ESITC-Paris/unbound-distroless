@@ -28,5 +28,5 @@ page for published issues.
 
 ## Verifying an image
 
-See "Verifying releases" in the README for cosign and attestation commands.
-Always pin deployments to an immutable `X.Y.Z-rN` tag or a digest.
+See [Verifying releases](docs/trust.md#verifying-releases) for cosign and
+attestation commands. Always pin deployments to an `X.Y.Z-rN` tag or a digest.

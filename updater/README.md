@@ -73,8 +73,10 @@ What this sidecar does with the socket:
   `docker volume` create/remove that the canary needs;
 - `docker compose up -d --no-deps` on the one resolver service — the swap,
   and the rollback;
-- `docker exec … unbound-control stats_noreset` in the resolver, in metrics
-  mode only;
+- `docker exec … unbound-control` in the resolver: `stats_noreset` on every
+  metrics scrape and, with `KEEP_CACHE=1`, `stats_noreset`/`dump_cache`/
+  `load_cache` around a swap; `docker cp` of `/var/lib/unbound/root.key` on
+  every scrape, for the trust-anchor metrics;
 - `docker run -d` of an ephemeral helper from the new sidecar image when it
   updates itself (see [Self-update](#self-update)).
 
@@ -128,8 +130,10 @@ docker compose up -d
 docker compose logs -f unbound-autoupdate
 ```
 
-The first cycle records a baseline instead of canarying a resolver that is
-already running fine:
+The first cycle records a baseline of the configuration (no configuration
+canary on first sight of a resolver that is already running fine); if the
+declared image already differs from the running one, that same cycle then
+canaries and deploys it:
 
 ```
 ts=2026-09-16T10:00:00Z level=info msg="unbound-autoupdate 1.0.0-r0 starting: interval=1h splay=10%"
@@ -167,8 +171,9 @@ compose file '/opt/unbound/docker-compose.yml' is not readable from inside the s
 
 ## Validate without deploying
 
-`check` mode runs the whole cycle — pull, compare, cosign, preflight, canary,
-DNS validation — and stops before the swap. Use it after editing
+`check` mode runs the whole cycle — pull, compare, cosign (when the pulled
+digest differs from the running one), preflight, canary, DNS validation — and
+stops before the swap. Use it after editing
 `unbound.conf`, or to see what the next cycle would do:
 
 ```bash
@@ -186,7 +191,7 @@ canary with a clone of production state; production was not touched.
 | `INTERVAL` | `1h` | Time between cycles in `loop` mode. `45s`, `30m`, `1h`, `2d` or bare seconds. |
 | `SPLAY` | `10%` | Random jitter added to `INTERVAL`, as a percentage of it or an absolute duration, so a fleet never updates in the same minute. |
 | `WATCH_CONFIG` | `1` | Also treat a change in the declared bind mounts as an update to canary and deploy. |
-| `TARGET_SERVICE` | auto | The resolver service. Discovery picks the one sibling service in the project whose image repository mentions `unbound`; set this when there are several. |
+| `TARGET_SERVICE` | auto | The resolver service. Discovery picks the one sibling service in the project whose image reference contains `unbound`, excluding services on the sidecar's own image repository; set this when there are several. |
 | `ALLOW_MAJOR` | `0` | Accept a major version bump (resolver **and** sidecar) instead of refusing it. |
 | `RETRY_AFTER` | `24h` | How long a failed image, configuration or sidecar image stays quarantined. |
 | `VALIDATE_DOMAIN` | `example.com` | Domain queried to decide a resolver is healthy. |
@@ -206,7 +211,7 @@ canary with a clone of production state; production was not touched.
 | `CHECK_ONLY` | `0` | Validate but never swap. `check` mode sets it; you rarely set it by hand. |
 | `DISCOVER_WAIT` | `60` | Seconds a cycle waits for the resolver container when it is absent — the window where `docker compose up` has removed the old one and not yet started the new one. The metrics scrape leaves this at `0` and fails fast. |
 | `FINGERPRINT_EXCLUDE` | *(empty)* | Container paths (space-separated) removed from configuration CHANGE DETECTION — for data another tool manages and applies at runtime, typically a blocklist loaded with `unbound-control local_zones`. Without it every regeneration is a canary and a container swap, which restarts unbound and empties its cache. The mount is still given to the canary, so image updates are validated against the real data. The owning tool must validate the data itself. |
-| `KEEP_CACHE` | `1` | Carry the resolver cache over a swap: exported from the outgoing container (`dump_cache`) just before it, imported into the new one (`load_cache`) only after the new one has passed its post-swap validation, and into the previous one after a rollback. Only entries still valid at export time travel: unbound's export skips expired ones, so entries kept for serve-expired are lost and must be re-learned (a host-side warm-up helps). Skipped when the unbound major.minor version changes. Best effort: a failure only means starting with an empty cache, never a failed update. `0` disables it. |
+| `KEEP_CACHE` | `1` | Carry the resolver cache over a swap: exported from the outgoing container (`dump_cache`) just before it, imported into the new one (`load_cache`) only after the new one has passed its post-swap validation, and into the previous one after a rollback. Only entries still valid at export time travel: unbound's export skips expired ones, so entries kept for serve-expired are lost and must be re-learned (a host-side warm-up helps). Skipped when the unbound major.minor version changes, or when either image carries no version label. Best effort: a failure only means starting with an empty cache, never a failed update. `0` disables it. |
 | `KEEP_CACHE_MAX_ENTRIES` | `500000` | Record sets above which the cache is not exported. The export holds one worker thread of the outgoing resolver (measured: 0.8 s per 100 000 entries). |
 | `KEEP_CACHE_CHUNK` | `2000` | Entries per `load_cache` batch. One 100 000-entry import held a worker thread for 4.7 s; batches of 5 000 kept every answer under 140 ms. |
 | `KEEP_CACHE_TIMEOUT` | `120` | Seconds allowed to the export, and to the import as a whole; what is loaded by then stays. |
@@ -319,7 +324,8 @@ Anything `unbound-control` reports that has no family of its own lands in
 exported rather than dropped.
 
 A scrape job and a set of alert rules — resolver down, SERVFAIL ratio, DNSSEC
-validation stopped, stale or failed cycles, rollbacks, quarantines — are in
+validation stopped, stale RFC 5011 probe, stale or failed cycles, rollbacks,
+critical failures, quarantines — are in
 [`../docs/observability/`](../docs/observability/). The rules are checked by
 `promtool check rules` in CI.
 
@@ -359,8 +365,9 @@ self-updates: there is nothing to compare against and nothing to roll back to.
 
 ## Verifying with your own key
 
-Keyless verification against this repository's release workflow is the
-default. For a private mirror that re-signs what it serves, mount the public
+Keyless verification against a GitHub Actions workflow of this repository is
+the default (`COSIGN_IDENTITY_REGEXP` covers both `release.yml` and
+`updater.yml`). For a private mirror that re-signs what it serves, mount the public
 key read-only and point `COSIGN_PUBLIC_KEY` at it:
 
 ```yaml
@@ -374,6 +381,10 @@ key read-only and point `COSIGN_PUBLIC_KEY` at it:
 The two modes are exclusive: with `COSIGN_PUBLIC_KEY` set, the identity and
 issuer settings are not used. A key path that cannot be read is a refusal to
 verify, not a fallback — the cycle stops.
+
+The same key verifies the sidecar's own image during self-update: a mirror
+that re-signs the resolver must re-sign `unbound-autoupdate` too, or set
+`SELF_UPDATE=0`.
 
 **Which cosign is inside.** The image embeds the **cosign v3.1.3** CLI, copied
 from `ghcr.io/sigstore/cosign/cosign` and pinned by digest in

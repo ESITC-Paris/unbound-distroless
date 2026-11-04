@@ -23,7 +23,7 @@ LABEL org.opencontainers.image.title="unbound-autoupdate" \
 # pinned base carried at pin time, which the Trivy OS gate refuses. Rebuilds
 # are still triggered by the monitor's digest tracking (upstream-check.yml),
 # so the pin keeps moving forward rather than drifting silently.
-# bash: arrays and `local -n` are used throughout. util-linux: flock.
+# bash: arrays are used throughout. util-linux: flock.
 # tini: loop mode must forward SIGTERM so `docker compose down` is prompt.
 # busybox-extras: httpd (the /metrics endpoint) and nc.
 RUN apk upgrade --no-cache \

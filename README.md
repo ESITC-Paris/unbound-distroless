@@ -69,8 +69,8 @@ rebuilt for base-image or library updates).
 
 | Tag pattern | Meaning |
 |---|---|
-| `X.Y.Z-rN` | Exact build — **immutable, pin this in production** |
-| `X.Y.Z`, `X.Y`, `X`, `latest` | Mutable, track the newest rebuild |
+| `X.Y.Z-rN` | Exact build — never re-pushed by the automation; **pin this (or a digest) in production** |
+| `X.Y.Z`, `X.Y`, `X`, `latest` | Mutable, point to the most recently released build |
 
 Current versions are listed on the
 [releases page](https://github.com/ESITC-Paris/unbound-distroless/releases).
@@ -98,6 +98,8 @@ it needs the Docker socket, which is root on the host, so read that first.
   lifecycle
 - **[updater/README.md](updater/README.md)** — the auto-update + metrics
   sidecar: install, variables, per-outcome behaviour, `/metrics`, self-update
+- **[Operations](docs/operations.md)** — how the hourly update check is
+  triggered (`deploy/unbound-upstream-check`), supervised, and run by hand
 - **[docs/observability/](docs/observability/)** — Prometheus scrape config and
   alert rules for the resolver and the sidecar
 - **[SECURITY.md](SECURITY.md)** — vulnerability reporting

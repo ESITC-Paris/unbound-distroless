@@ -1,4 +1,18 @@
-# Removed: the host-side updater that used to live here did not update anything
+# deploy/
+
+## `unbound-upstream-check` — the hourly trigger of the update monitor
+
+The update monitor (`.github/workflows/upstream-check.yml`) has no GitHub
+`schedule`: this script, run hourly from cron on an ESITC host, dispatches it
+through the GitHub API. It dispatches, **waits for the run to actually
+start**, reports to a Healthchecks.io check (so a host or cron that goes
+quiet raises an alert — the only way to notice that runs have *stopped*),
+and warns ahead of the token's expiry. Installation, cron line and
+supervision are in [docs/operations.md](../docs/operations.md); every
+setting is documented at the top of the script; `tests/trigger.sh` covers it
+without network.
+
+## Removed: the host-side updater that used to live here did not update anything
 
 The `unbound-autoupdate` script, its systemd timer and `install.sh` have been
 removed from this directory. Read against the code, the script could not

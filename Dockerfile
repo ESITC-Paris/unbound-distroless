@@ -2,7 +2,7 @@
 
 # Base images are parameterised so CI can pin them by digest (the digests live
 # in .build-state.json, which the upstream monitor keeps current). Local builds
-# get the floating tags, which is what the README documents.
+# get the floating tags, which is what docs/usage.md documents.
 ARG DEBIAN_BASE=debian:trixie
 ARG DISTROLESS_BASE=gcr.io/distroless/base-debian13:nonroot
 

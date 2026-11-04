@@ -11,15 +11,15 @@ the pipeline is the only path to the registries.
 
 | # | Gate | What it guarantees |
 |---|------|--------------------|
-| 1 | **GPG signature verification** | The Unbound source tarball is verified against NLnet Labs' release signing key (fingerprint pinned in the repo) *before* its checksum is ever recorded. A bad signature blocks everything. |
+| 1 | **GPG signature verification** | When the update monitor pins a new Unbound version, the source tarball is verified against NLnet Labs' release signing key (fingerprint pinned in the repo) *before* its checksum is ever recorded; the release build then enforces that checksum (gate 2). A bad signature blocks everything. |
 | 2 | **SHA-256 pinned source** | The build refuses any tarball whose checksum differs from the committed pin. |
-| 3 | **Digest-pinned bases** | `debian:trixie` (build) and `distroless/base-debian13` (runtime) are consumed by digest, so the image that was tested is bit-for-bit the image that is published. |
+| 3 | **Digest-pinned bases** | `debian:trixie` (build) and `distroless/base-debian13` (runtime) are consumed by digest, and the published image is rebuilt from the same inputs and the build cache of the tested one. |
 | 4 | **Native builds, both architectures** | amd64 and arm64 are each built **and fully tested on native runners** — no QEMU emulation anywhere. |
 | 5 | **Functional test suite (per arch)** | The container is started with the documented hardening flags and must: reach `healthy`, resolve real domains over UDP and TCP, prove DNSSEC validation (AD flag; a deliberately-broken domain must SERVFAIL), serve cache hits, load the hyperlocal root zone, expose the DoH/cachedb capabilities, and answer `unbound-control` over its Unix socket. |
-| 6 | **Structure test suite (per arch)** | Asserts the security invariants: runs as UID 65532, **no shell**, no package manager, no baked-in private keys, expected files only. |
+| 6 | **Structure test suite (per arch)** | Asserts the security invariants: runs as UID 65532, **no shell**, no package manager, no baked-in private keys, and the expected binaries, configuration, trust anchor, root zone and runtime libraries present. |
 | 7 | **CVE scan gate (per arch)** | Trivy blocks the release on any fixable CRITICAL/HIGH vulnerability. |
 | 8 | **Untagged until proven** | Platform images are pushed *by digest only*; the public tags appear in one final step after every gate above has passed on both architectures. |
-| 9 | **Signing & attestations** | The published multi-arch index is signed with **cosign keyless** (GitHub OIDC — the signing identity *is* this repository's workflow) and carries **SBOM + SLSA provenance** attestations. |
+| 9 | **Signing & attestations** | The published multi-arch index is signed with **cosign keyless** (GitHub OIDC — the signing identity is a GitHub Actions workflow of this repository) and carries **SBOM + SLSA provenance** attestations. |
 
 Additional supply-chain hygiene: every GitHub Action in the pipelines is
 pinned to a full commit SHA, workflow shells never interpolate untrusted
@@ -41,22 +41,30 @@ infrastructure — see [operations.md](operations.md)) and looks for:
    rebuild `updater-vX.Y.Z-rN`, independently of the resolver's releases
 
 Detection to publication is fully automatic; the gate table above is the
-safety net. A failed gate publishes nothing and leaves a red run in
-[Actions](https://github.com/ESITC-Paris/unbound-distroless/actions) for
-human eyes. To be notified of new releases: **Watch → Custom → Releases**
-on the repository.
+safety net. A failed test gate publishes nothing; any failure opens (or
+comments on) a "Release pipeline failed" issue assigned to the administrator
+and leaves a red run in
+[Actions](https://github.com/ESITC-Paris/unbound-distroless/actions). A
+failure *after* the tags are created (signing, attestation, GitHub Release)
+leaves the tags published, possibly unsigned, until the release is re-run.
+To be notified of new releases: **Watch → Custom → Releases** on the
+repository.
 
 **Version scheme:** image `X.Y.Z-rN` = Unbound version `X.Y.Z`, rebuild
 revision `N`. The revision increments when the same Unbound version is
-rebuilt (base/library updates or image improvements); `-rN` tags are
-immutable, `X.Y.Z`/`X.Y`/`X`/`latest` are mutable pointers to the newest
-build.
+rebuilt (base/library updates or image improvements). The automation never
+re-pushes an `-rN` tag (treat it as immutable, but only a digest is a hard
+guarantee: re-running a release for an existing tag republishes it);
+`X.Y.Z`/`X.Y`/`X`/`latest` are mutable pointers to the most recently
+released build.
 
 ## Verifying releases
 
 Images are signed with [cosign](https://docs.sigstore.dev/) keyless signing —
-the signing identity is this repository's release workflow, so a valid
-signature proves the image came out of the pipeline described above:
+the signing identity is a GitHub Actions workflow of this repository
+(`release.yml` for the resolver, `updater.yml` for the sidecar — the regexp
+below accepts both), so a valid signature proves the image was signed by this
+repository's CI:
 
 ```bash
 cosign verify esitcparis/unbound-distroless:latest \
@@ -74,8 +82,8 @@ docker buildx imagetools inspect esitcparis/unbound-distroless:latest \
 ```
 
 Every [GitHub Release](https://github.com/ESITC-Paris/unbound-distroless/releases)
-lists the exact digests. Pin production deployments to an immutable
-`X.Y.Z-rN` tag or a digest.
+lists the exact digests. Pin production deployments to an `X.Y.Z-rN` tag
+or, for a hard guarantee, a digest.
 
 ## The updater sidecar
 

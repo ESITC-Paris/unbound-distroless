@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# unbound-upstream-check — hourly trigger for the update monitor
+# (.github/workflows/upstream-check.yml). The monitor has no GitHub
+# `schedule:` on purpose (see docs/operations.md); this script is the
+# scheduler, run from cron on an ESITC host.
+#
+# It does three things and fails loudly if any of them does not happen:
+#   1. dispatches the workflow through the GitHub API;
+#   2. confirms a run actually started — a 204 only means "request accepted";
+#   3. reports to a Healthchecks.io check, so that this script NOT running
+#      (dead host, lost crontab, stopped cron daemon) raises an alert too.
+#      Without HC_URL, a silent host is a silent failure: that is exactly
+#      how 1.26.2 went unbuilt for six weeks in autumn 2026.
+#
+# Silent on success (cron therefore mails only on failure). Exit 1 on any
+# failure, with the reason on stderr and in the Healthchecks /fail body.
+#
+# Configuration: /etc/unbound-distroless/trigger.conf, plain KEY=VALUE lines
+# sourced by this script (override the path with UNBOUND_TRIGGER_CONF).
+#   TOKEN_FILE   fine-grained PAT with Actions: read & write on the repository
+#                (default /etc/unbound-distroless/github-token, mode 600, root)
+#   HC_URL       Healthchecks.io ping URL — configure the check with a period
+#                of 1 hour and a grace of 3 hours (strongly recommended)
+#   REPO         default ESITC-Paris/unbound-distroless
+#   WORKFLOW     default upstream-check.yml
+#   REF          default main
+#   STATE_DIR    default /var/lib/unbound-distroless (remembers the day the
+#                token-expiry warning was last sent, so it is mailed once a day)
+#   EXPIRY_WARN_DAYS  warn on stderr when the token expires within N days (14)
+#   EXPIRY_FAIL_DAYS  fail the run when the token expires within N days (3):
+#                the dispatch still happens first, the failure is the alarm
+set -euo pipefail
+
+CONF="${UNBOUND_TRIGGER_CONF:-/etc/unbound-distroless/trigger.conf}"
+if [ -r "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF"
+fi
+: "${TOKEN_FILE:=/etc/unbound-distroless/github-token}"
+: "${HC_URL:=}"
+: "${REPO:=ESITC-Paris/unbound-distroless}"
+: "${WORKFLOW:=upstream-check.yml}"
+: "${REF:=main}"
+: "${STATE_DIR:=/var/lib/unbound-distroless}"
+: "${EXPIRY_WARN_DAYS:=14}"
+: "${EXPIRY_FAIL_DAYS:=3}"
+# How long to wait for the dispatched run to appear (attempts × seconds).
+: "${POLL_ATTEMPTS:=9}"
+: "${POLL_INTERVAL:=10}"
+
+API="https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+hc() {  # hc <suffix> [body]
+  [ -n "$HC_URL" ] || return 0
+  curl -fsS -m 10 --retry 2 --data-raw "${2:-}" "${HC_URL}${1}" >/dev/null 2>&1 \
+    || echo "warning: Healthchecks ping ${1:-success} failed" >&2
+}
+die() {
+  echo "unbound-upstream-check: $*" >&2
+  hc /fail "$*"
+  exit 1
+}
+
+[ -r "$TOKEN_FILE" ] || die "token file $TOKEN_FILE is missing or unreadable"
+TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE")
+[ -n "$TOKEN" ] || die "token file $TOKEN_FILE is empty"
+
+# api <GET|POST> <url> [json-body]  → prints the HTTP status; body in
+# $TMP/body, response headers in $TMP/headers.
+api() {
+  local method="$1" url="$2" data="${3:-}"
+  local -a args=(-sS -m 30 --retry 3 --retry-delay 10 --retry-all-errors
+    -o "$TMP/body" -D "$TMP/headers" -w '%{http_code}'
+    -H "Authorization: Bearer $TOKEN"
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28")
+  [ "$method" = POST ] && args+=(-X POST -d "$data")
+  curl "${args[@]}" "$url" || echo 000
+}
+
+# Newest workflow_dispatch run of the monitor: the id is the first "id" key
+# of the first element of workflow_runs (an empty array gives an empty id).
+latest_run_id() {
+  local code
+  code=$(api GET "$API/runs?event=workflow_dispatch&per_page=1")
+  [ "$code" = 200 ] || die "listing runs failed (HTTP $code): $(head -c 300 "$TMP/body")"
+  grep -oE '"id": *[0-9]+' "$TMP/body" | head -1 | grep -oE '[0-9]+' || true
+}
+
+hc /start
+
+BEFORE=$(latest_run_id)
+# Fine-grained PATs announce their expiry on every response.
+EXPIRES=$( { grep -i '^github-authentication-token-expiration:' "$TMP/headers" || true; } \
+  | head -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')
+
+CODE=$(api POST "$API/dispatches" "{\"ref\":\"$REF\"}")
+[ "$CODE" = 204 ] || die "dispatch failed (HTTP $CODE): $(head -c 300 "$TMP/body")"
+
+# A 204 is an accepted request, not a started run. Wait for the run itself.
+RUN=""
+for _ in $(seq 1 "$POLL_ATTEMPTS"); do
+  sleep "$POLL_INTERVAL"
+  AFTER=$(latest_run_id)
+  if [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ]; then RUN=$AFTER; break; fi
+done
+[ -n "$RUN" ] || die "dispatch was accepted (HTTP 204) but no new run of $WORKFLOW appeared within $((POLL_ATTEMPTS * POLL_INTERVAL))s — is the workflow disabled? https://github.com/$REPO/actions/workflows/$WORKFLOW"
+
+NOTE="run $RUN started"
+if [ -n "$EXPIRES" ]; then
+  if EXP_TS=$(date -d "$EXPIRES" +%s 2>/dev/null); then
+    DAYS_LEFT=$(( (EXP_TS - $(date +%s)) / 86400 ))
+    if [ "$DAYS_LEFT" -le "$EXPIRY_FAIL_DAYS" ]; then
+      die "$NOTE, but the GitHub token expires in $DAYS_LEFT day(s) ($EXPIRES) — renew it now (docs/operations.md)"
+    elif [ "$DAYS_LEFT" -le "$EXPIRY_WARN_DAYS" ]; then
+      NOTE="$NOTE; token expires in $DAYS_LEFT day(s) ($EXPIRES)"
+      # Once a day on stderr (cron mails it), not every hour.
+      TODAY=$(date -u +%F); STAMP="$STATE_DIR/expiry-warned-on"
+      if [ "$(cat "$STAMP" 2>/dev/null || true)" != "$TODAY" ]; then
+        echo "unbound-upstream-check: the GitHub token expires in $DAYS_LEFT day(s) ($EXPIRES) — renew it before then (docs/operations.md)" >&2
+        { mkdir -p "$STATE_DIR" && printf '%s\n' "$TODAY" > "$STAMP"; } 2>/dev/null || true
+      fi
+    fi
+  else
+    NOTE="$NOTE; unparseable token expiry header: $EXPIRES"
+  fi
+fi
+
+hc "" "$NOTE"
+[ -z "${VERBOSE:-}" ] || echo "$NOTE"

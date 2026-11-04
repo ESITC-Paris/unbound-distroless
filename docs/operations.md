@@ -5,7 +5,8 @@ How the automatic update pipeline is scheduled and supervised.
 ## Scheduling model
 
 The update monitor (`.github/workflows/upstream-check.yml`) has **no GitHub
-`schedule` trigger**. It is invoked hourly from ESITC infrastructure through
+`schedule` trigger**. It is invoked hourly from ESITC infrastructure by
+[`deploy/unbound-upstream-check`](../deploy/unbound-upstream-check), through
 the `workflow_dispatch` API. Rationale:
 
 - external dispatch is exempt from GitHub's 60-day inactivity auto-disable
@@ -13,7 +14,30 @@ the `workflow_dispatch` API. Rationale:
 - it is not subject to GitHub scheduler congestion (cron triggers can be
   delayed or skipped under load);
 - the check logic, secrets, and publishing stay entirely inside the audited
-  repository — the external component is a dumb, replaceable trigger.
+  repository — the external component only says "run now".
+
+The price of that choice: **nothing on GitHub can notice the trigger going
+quiet.** A dead host, a lost crontab, a stopped cron daemon or an expired
+token simply means no more runs, and every GitHub-side alarm (failure
+issues, red runs) stays silent because nothing fails — nothing happens. This
+is not theoretical: the trigger stopped on 2026-09-18 and Unbound 1.26.2
+(released 2026-10-21) went unbuilt for six weeks before anyone looked at the
+Actions tab. The Healthchecks.io dead-man's switch below is therefore part of
+the setup, not an option.
+
+What the trigger script does on every run (covered by `tests/trigger.sh`):
+
+1. pings the Healthchecks check's `/start`;
+2. dispatches the workflow and requires HTTP 204;
+3. **waits for a new run to actually appear** (up to 90 s) — an accepted
+   request is not a started run; a workflow disabled on GitHub is the
+   typical gap;
+4. reads the token's expiry date from the API response: a warning on stderr
+   once a day when it is within 14 days (cron mails it), a failed run when
+   it is within 3 days;
+5. pings the check with the run id on success, or `/fail` with the reason.
+
+It is silent on success and exits 1 with the reason on stderr otherwise.
 
 ## One-time setup
 
@@ -23,69 +47,75 @@ GitHub → Settings → Developer settings → Fine-grained personal access toke
 
 - **Repository access:** only `ESITC-Paris/unbound-distroless`
 - **Permissions:** Actions → *Read and write* (nothing else)
-- Note the expiration date — token renewal is an operational duty (see
-  Supervision below for how expiry is detected).
+- Note the expiration date — token renewal is an operational duty (the
+  script warns 14 days ahead and fails 3 days ahead, see Supervision below).
 
-### 2. Install the trigger on a server
+### 2. Create the Healthchecks check
 
-`/usr/local/bin/unbound-upstream-check`:
+One check per trigger host, period **1 hour**, grace **3 hours** (one missed
+run is noise; three in a row is an outage). Note its ping URL.
 
-```bash
-#!/bin/sh
-# Triggers the unbound-distroless update monitor on GitHub.
-# The token file must contain the fine-grained PAT, mode 600, owner root.
-set -eu
-
-TOKEN_FILE=/etc/unbound-distroless/github-token
-API=https://api.github.com/repos/ESITC-Paris/unbound-distroless/actions/workflows/upstream-check.yml/dispatches
-
-HTTP_CODE=$(curl -sS -o /tmp/upstream-check-trigger.err -w '%{http_code}' \
-  --retry 3 --retry-delay 10 \
-  -X POST \
-  -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
-  -H "Accept: application/vnd.github+json" \
-  "$API" -d '{"ref":"main"}')
-
-if [ "$HTTP_CODE" != "204" ]; then
-  echo "upstream-check dispatch failed (HTTP $HTTP_CODE):" >&2
-  cat /tmp/upstream-check-trigger.err >&2
-  exit 1
-fi
-```
+### 3. Install the trigger on a server
 
 ```bash
-sudo install -m 755 unbound-upstream-check /usr/local/bin/
+sudo install -m 755 deploy/unbound-upstream-check /usr/local/bin/
 sudo install -d -m 700 /etc/unbound-distroless
 sudo sh -c 'umask 077; printf "%s\n" "github_pat_XXXX" > /etc/unbound-distroless/github-token'
+sudo sh -c 'printf "HC_URL=https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n" > /etc/unbound-distroless/trigger.conf'
+sudo VERBOSE=1 /usr/local/bin/unbound-upstream-check   # prints "run <id> started"
 ```
 
-### 3. Cron entry
+The script reads `/etc/unbound-distroless/trigger.conf` (plain `KEY=VALUE`
+lines); every setting and its default is documented at the top of the
+script.
+
+### 4. Cron entry
 
 ```cron
 MAILTO=admin@esitc-paris.fr
 17 * * * * /usr/local/bin/unbound-upstream-check
 ```
 
-The script is silent on success; cron therefore emails only on failure
-(bad token, expired token, network or API error).
+Cron mails whatever the script prints, and it prints only on failure or when
+the token is about to expire.
 
 ## Supervision
 
-Three independent layers:
+Three layers. Only the first one can detect the *absence* of runs; the other
+two react to runs that happen.
 
-1. **Trigger layer (this server):** any non-204 response — including an
-   expired token (HTTP 401) — makes the script fail, and cron `MAILTO`
-   reports it. Optionally add a dead-man's switch (e.g. a Healthchecks.io
-   ping appended to the cron line) to also detect the server itself going
-   quiet.
+1. **Trigger layer (Healthchecks + cron mail):** the check alerts when no
+   successful run has been reported for 3 hours, whatever the cause — dead
+   host, cron, token, GitHub API, disabled workflow, failed run. Cron's
+   `MAILTO` additionally mails the reason whenever the script fails or warns
+   (this needs a working MTA on the host; a dead host mails nothing, which
+   is what the Healthchecks layer is for).
 2. **Workflow layer (GitHub):** if a triggered check or a release pipeline
-   fails, the workflow opens an issue assigned to the administrator
-   (guaranteed e-mail / mobile notification), deduplicated per problem.
+   fails or is cancelled by its timeout, the workflow opens an issue assigned
+   to the administrator, deduplicated per problem; GitHub notifies the
+   assignee according to their notification settings. A failure before the
+   first step runs (startup failure) opens no issue.
 3. **Publication layer:** every published release (resolver `vX.Y.Z-rN` and
    sidecar `updater-vX.Y.Z-rN`) appears on the
    [releases page](https://github.com/ESITC-Paris/unbound-distroless/releases).
    Successful releases open no issue — subscribe via Watch → Custom →
    Releases to be notified; issues are reserved for failures.
+
+**Token renewal:** fine-grained tokens expire. Renewing means writing the
+new token into `/etc/unbound-distroless/github-token`; nothing else changes.
+
+## When runs stop
+
+If the Healthchecks alert fires, or the Actions tab shows no "Upstream check"
+run for hours:
+
+1. On the trigger host, `sudo VERBOSE=1 /usr/local/bin/unbound-upstream-check`
+   prints the reason: HTTP 401 is an expired or revoked token; "no new run
+   appeared" means the workflow is disabled on GitHub (re-enable it in the
+   Actions tab).
+2. Catch up: run the check by hand (below). One run detects everything that
+   was missed — the newest upstream version and any base-image change — and
+   publishes it.
 
 ## Manual operations
 
@@ -93,9 +123,13 @@ Three independent layers:
 # Run the update check immediately
 gh workflow run upstream-check.yml --repo ESITC-Paris/unbound-distroless
 
-# Re-run a release for an existing tag
+# Re-run a release for an existing tag. This republishes the tag with a new
+# digest (root data is re-downloaded at build time); a sidecar pinned to it
+# will canary and deploy that new digest.
 gh workflow run release.yml --repo ESITC-Paris/unbound-distroless \
   --ref vX.Y.Z-rN -f tag=vX.Y.Z-rN
+gh workflow run updater.yml --repo ESITC-Paris/unbound-distroless \
+  --ref updater-vX.Y.Z-rN -f tag=updater-vX.Y.Z-rN
 ```
 
 Only stable upstream versions are ever published: the version detector

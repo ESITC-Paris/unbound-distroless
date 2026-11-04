@@ -56,7 +56,7 @@ containers:
     securityContext:
       runAsUser: 65532
       runAsGroup: 65532
-      allowPrivilegeEscalation: false
+      allowPrivilegeEscalation: false   # add fsGroup: 65532 to the pod securityContext
       capabilities:
         drop: ["ALL"]
         add: ["NET_BIND_SERVICE"]
@@ -76,6 +76,18 @@ volumes:
     persistentVolumeClaim:
       claimName: unbound-data
 ```
+
+Kubernetes does not seed a PersistentVolume from the image the way Docker
+seeds an empty named volume. With an empty `/var/lib/unbound`, Unbound exits
+at startup with `error reading auto-trust-anchor-file:
+/var/lib/unbound/root.key`. Seed the claim before the first start — for
+instance an initContainer on the same image running
+`/usr/local/sbin/unbound-anchor -a /var/lib/unbound/root.key` (it exits 1 the
+first time, which is unbound-anchor's "anchor written" code; the retried init
+container then exits 0) — and set `fsGroup: 65532` on the pod so the volume
+is writable by the resolver. The hyperlocal root zone copy is not required
+on the volume: without `root.zone` Unbound starts and transfers the zone from
+the root servers.
 
 ## Configuration reference
 
@@ -176,5 +188,6 @@ docker build \
 bash tests/structure.sh && bash tests/functional.sh
 ```
 
-The same two test scripts are the pipeline's publish gate — what you run
-locally is what CI enforces.
+The same two test scripts are part of the pipeline's publish gate; CI
+additionally runs a Trivy scan and builds on the digest-pinned bases recorded
+in `.build-state.json` (this recipe uses the floating tags).

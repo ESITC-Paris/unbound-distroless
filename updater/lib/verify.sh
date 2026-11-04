@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Image signature verification, fail-closed, in one of two exclusive modes:
-#   keyless (default): the signing identity must be this repository's release
-#                      workflow, proven by the GitHub OIDC certificate;
+#   keyless (default): the signing identity must be a GitHub Actions workflow
+#                      of this repository (release.yml or updater.yml), proven
+#                      by the GitHub OIDC certificate;
 #   key:               COSIGN_PUBLIC_KEY names a PEM public key, for a private
 #                      mirror that re-signs what it serves.
 # cosign's own output is written to stderr whenever verification fails: an
