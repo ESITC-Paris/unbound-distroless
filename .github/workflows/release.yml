@@ -16,8 +16,13 @@ permissions:
   issues: write
   attestations: write
 
+# One `publish` group shared with updater.yml: the sidecar's integration tests pull
+# the resolver's live `:1` tag and verify its signature, and the resolver's
+# release moves that tag before signing it. Running both at once let a test
+# see an unsigned `:1` (updater-v1.0.5-r1, 2026-11-04). Queued, never
+# cancelled: a queued release is a late release, a cancelled one is a missed one.
 concurrency:
-  group: release
+  group: publish
   cancel-in-progress: false
 
 env:
