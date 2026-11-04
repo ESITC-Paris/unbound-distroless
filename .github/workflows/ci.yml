@@ -33,10 +33,13 @@ jobs:
             shellcheck -S warning \
               tests/structure.sh tests/functional.sh tests/updater.sh tests/updater/lib.sh tests/monitor.sh \
               updater/unbound-autoupdate updater/entrypoint.sh updater/lib/*.sh updater/www/cgi-bin/metrics \
-              .github/scripts/decide-updates.sh
+              .github/scripts/decide-updates.sh deploy/unbound-upstream-check tests/trigger.sh
 
       - name: Monitor decision logic
         run: bash tests/monitor.sh
+
+      - name: External trigger script
+        run: bash tests/trigger.sh
 
       - name: promtool (alert rules)
         run: |

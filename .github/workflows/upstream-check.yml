@@ -1,9 +1,12 @@
 name: Upstream check
 
-# Triggered hourly by an external scheduler (cron on ESITC infrastructure —
-# see docs/operations.md) via the workflow_dispatch API. No GitHub `schedule`
-# trigger on purpose: external dispatch is exempt from GitHub's 60-day
-# inactivity auto-disable and is not subject to scheduler congestion delays.
+# Triggered hourly by deploy/unbound-upstream-check, run from cron on ESITC
+# infrastructure (see docs/operations.md), via the workflow_dispatch API. No
+# GitHub `schedule` trigger on purpose: external dispatch is exempt from
+# GitHub's 60-day inactivity auto-disable and is not subject to scheduler
+# congestion delays. The flip side: nothing here can notice the trigger going
+# quiet — that is the Healthchecks dead-man's switch in the trigger script
+# (1.26.2 went unbuilt for six weeks in autumn 2026 when the cron stopped).
 on:
   workflow_dispatch:
 
@@ -213,9 +216,12 @@ jobs:
           fi
 
       - name: Notify admin on failure
-        if: failure()
+        # cancelled() too: a job that hits timeout-minutes is cancelled, not
+        # failed, and would otherwise open no issue.
+        if: failure() || cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # One open issue per problem, assigned to the admin (guaranteed email /
@@ -224,7 +230,7 @@ jobs:
           TITLE="Upstream check is failing"
           NUM=$(gh issue list --state open --json number,title \
             -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
-          BODY="The scheduled upstream check failed. Investigate: $RUN_URL"
+          BODY="The hourly upstream check (dispatched by deploy/unbound-upstream-check) failed. Investigate: $RUN_URL"
           if [ -n "$NUM" ]; then
             gh issue comment "$NUM" --body "Failed again: $RUN_URL"
           else
