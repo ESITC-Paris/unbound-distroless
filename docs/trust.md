@@ -13,7 +13,7 @@ the pipeline is the only path to the registries.
 |---|------|--------------------|
 | 1 | **GPG signature verification** | When the update monitor pins a new Unbound version, the source tarball is verified against NLnet Labs' release signing key (fingerprint pinned in the repo) *before* its checksum is ever recorded; the release build then enforces that checksum (gate 2). A bad signature blocks everything. |
 | 2 | **SHA-256 pinned source** | The build refuses any tarball whose checksum differs from the committed pin. |
-| 3 | **Digest-pinned bases** | `debian:trixie` (build) and `distroless/base-debian13` (runtime) are consumed by digest, and the published image is rebuilt from the same inputs and the build cache of the tested one. |
+| 3 | **Digest-pinned bases, current security updates** | `debian:trixie` (build) and `distroless/base-debian13` (runtime) are consumed by digest. The runtime libraries are harvested from the build stage, which applies Debian's security updates at build time, so a rebuild ships the fixes published since the pinned digest. The published image is rebuilt from the same inputs and the build cache of the tested one. |
 | 4 | **Native builds, both architectures** | amd64 and arm64 are each built **and fully tested on native runners** — no QEMU emulation anywhere. |
 | 5 | **Functional test suite (per arch)** | The container is started with the documented hardening flags and must: reach `healthy`, resolve real domains over UDP and TCP, prove DNSSEC validation (AD flag; a deliberately-broken domain must SERVFAIL), serve cache hits, load the hyperlocal root zone, expose the DoH/cachedb capabilities, and answer `unbound-control` over its Unix socket. |
 | 6 | **Structure test suite (per arch)** | Asserts the security invariants: runs as UID 65532, **no shell**, no package manager, no baked-in private keys, and the expected binaries, configuration, trust anchor, root zone and runtime libraries present. |
@@ -34,8 +34,11 @@ infrastructure — see [operations.md](operations.md)) and looks for:
 
 1. **New Unbound releases** (NLnet Labs) → new `X.Y.Z-r0` release
 2. **Updated base images** — the Debian build stage or the distroless runtime
-   base → revision rebuild `X.Y.Z-rN`, which picks up OpenSSL, glibc,
-   libevent, nghttp2, hiredis, and expat security fixes
+   base → revision rebuild `X.Y.Z-rN`, which picks up glibc, OpenSSL, zlib,
+   libevent, nghttp2, hiredis, and expat security fixes. The runtime
+   libraries come from the Debian build stage (not from the distroless base),
+   and that stage applies Debian's security updates at build time, so a
+   rebuild ships every fix published up to that moment
 3. **The sidecar's own bases** — the Alpine base and the cosign image that
    `updater/` builds on, tracked by digest on their own axis → revision
    rebuild `updater-vX.Y.Z-rN`, independently of the resolver's releases

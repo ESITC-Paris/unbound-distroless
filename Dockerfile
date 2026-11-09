@@ -25,9 +25,19 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # rebuilds; sharing=locked serialises the parallel amd64/arm64 builds.
 RUN rm -f /etc/apt/apt.conf.d/docker-clean \
  && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+# `apt-get upgrade` before anything else: the runtime image's shared libraries
+# (libc, zlib, zstd, OpenSSL, libevent, ...) are harvested from THIS stage
+# below, and the copies — with their dpkg metadata — replace the distroless
+# base's. The security state that ships is therefore this stage's, not the
+# runtime base's. The base is digest-pinned so the *base* is reproducible;
+# the upgrade then applies the Debian security updates published after that
+# digest was cut, which the Trivy gate otherwise refuses as soon as a fix
+# exists (v1.26.2-r2: zlib1g fixed in trixie-security, debian:trixie not yet
+# rebuilt, release blocked). Rebuilds are still triggered by the monitor's
+# digest tracking (upstream-check.yml), so the pin keeps moving forward.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
       build-essential curl ca-certificates \
       libevent-dev libssl-dev libexpat1-dev \
       libnghttp2-dev libhiredis-dev \
