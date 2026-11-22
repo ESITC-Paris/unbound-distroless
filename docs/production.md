@@ -43,9 +43,12 @@ to that much at each cycle. What keeps two hosts apart is starting them about
 
 ## Host prerequisites
 
-**Docker Engine with the Compose v2 plugin** (`docker compose`, not the old
-`docker-compose`): the sidecar runs `docker compose` itself. Older versions
-than the ones above were not tested.
+**Docker Engine with the Compose plugin, version 5 or later** (`docker
+compose`, not the old `docker-compose`; 5.5.0 or later on the containerd
+image store): the sidecar runs its own `docker compose`, and an older Compose
+on the host recreates the resolver at its next `up -d` after each update
+([why](../updater/README.md#what-a-cycle-does)). Older versions than the
+ones above were not tested.
 
 **Port 53.** The reference project publishes `53:53/udp` and `53:53/tcp` on
 every host address. See what already listens:
