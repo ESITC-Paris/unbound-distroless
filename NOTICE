@@ -1,0 +1,70 @@
+unbound-distroless
+Copyright (c) 2026 ESITC Paris
+
+The files of this repository are licensed under the MIT License (LICENSE).
+The resolver image ships this NOTICE and that LICENSE at
+/usr/share/doc/unbound-distroless/ (they cover unbound.conf, the image's
+configuration).
+
+Scope of the image's org.opencontainers.image.licenses label
+------------------------------------------------------------
+The label is "BSD-3-Clause AND MIT" and is deliberately scoped to the
+software this project builds and authors: Unbound (BSD-3-Clause) and this
+repository's files (MIT). It is NOT a complete statement of every licence in
+the image: the redistributed Debian packages listed below carry their own
+licences, several of which have no SPDX identifier, so no honest complete
+SPDX expression exists. This NOTICE is the per-component list; the
+authoritative texts are in the image:
+
+  /usr/share/doc/unbound/LICENSE        Unbound
+  /usr/share/doc/<package>/copyright    every Debian package recorded in
+                                        /var/lib/dpkg/status.d
+
+tests/structure.sh fails the release if any of these files is missing.
+
+Redistributed components (resolver image)
+-----------------------------------------
+Licences below are as stated in each Debian copyright file ("Files: *"
+stanza first). Those files describe the whole source package; stanzas for
+build scripts, tests and documentation do not apply to the shipped library,
+and some packages list further per-file licences — the file is authoritative.
+
+Built from source:
+  Unbound              BSD-3-Clause, Copyright (c) 2007, NLnet Labs
+                       (https://nlnetlabs.nl/projects/unbound/)
+
+Debian 13 shared libraries that Unbound links, copied from the build stage
+(the set is what `ldd` resolves at build time; at the time of writing):
+  libc6                LGPL-2.1+; parts under LGPL-2+, LGPL-2.1+ and GPL-2+
+                       with link exceptions, BSD-2/3-clause variants, ISC,
+                       Inner-Net, SunPro, Unicode-DFS-2016, public domain and
+                       others (39 stanzas in its copyright file)
+  libssl3t64           Apache-2.0 (OpenSSL 3)
+  libevent-2.1-7t64    BSD-3-clause; a few files BSD-2-clause / Expat
+  libexpat1            MIT
+  libhiredis1.1.0      BSD-3-Clause
+  libnghttp2-14        Expat (MIT)
+  libprotobuf-c1       BSD-2-Clause (used by dnstap)
+  zlib1g               Zlib
+  libzstd1             BSD-3-clause or GPL-2 (dual); bundled parts Expat, zlib
+
+From the distroless base image (gcr.io/distroless/base-debian13):
+  base-files           GPL-2+ (bundled licence texts: verbatim copying only)
+  ca-certificates      MPL-2.0 for the Mozilla CA data; GPL-2+ for Debian's
+                       packaging and scripts
+  media-types          "ad-hoc": public information, public domain
+  netbase              GPL-2
+  tzdata               public domain (IANA time zone database)
+  tzdata-legacy        public domain (IANA time zone database)
+  (plus the base's own copies of some libraries above, replaced at build by
+  the harvested ones together with their copyright files)
+
+DNS root data fetched at build time: the root hints and root zone published
+by InterNIC/IANA, and the DNSSEC root trust anchor obtained by unbound-anchor
+from IANA.
+
+Update sidecar image (updater/)
+-------------------------------
+Redistributes Alpine Linux packages (licences recorded per package in
+/lib/apk/db/installed) and the cosign binary from the Sigstore project
+(Apache-2.0).

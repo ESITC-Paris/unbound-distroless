@@ -52,15 +52,15 @@ _cache_count() {
     stats_noreset 2>/dev/null | awk -F= '$1 == "rrset.cache.count" { print $2 }' || true
 }
 
-# cache_compatible <running_ref> <declared_ref> — true when a dump from the
-# first can be loaded into the second: same reference (configuration-only
-# cycle), or both carry a version label with the same major.minor.
+# cache_compatible <running_version> <declared_version> <image_changed> —
+# true when a dump from the running resolver can be loaded into the declared
+# one: the same image (configuration-only cycle), or both carry a version
+# label with the same major.minor. The running version is read from the
+# running container, whose image record may have no name left to inspect.
 cache_compatible() {
-  [ "$1" = "$2" ] && return 0
-  local a b
-  a=$(image_version_label "$1"); b=$(image_version_label "$2")
-  [ -n "$a" ] && [ -n "$b" ] || return 1
-  [ "$(printf '%s' "$a" | cut -d. -f1,2)" = "$(printf '%s' "$b" | cut -d. -f1,2)" ]
+  [ "$3" = 0 ] && return 0
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$(printf '%s' "$1" | cut -d. -f1,2)" = "$(printf '%s' "$2" | cut -d. -f1,2)" ]
 }
 
 # cache_save <container> <file> — exports the cache; false (and no file) when

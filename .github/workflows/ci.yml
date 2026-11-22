@@ -3,9 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/superpowers/**']
+    paths-ignore: ['**.md']
+  # No paths-ignore on pull requests: `lint`, `build-and-test` and `updater`
+  # are required checks of the `main` ruleset (.github/settings/), and a
+  # required check that never runs blocks a documentation-only PR forever.
   pull_request:
-    paths-ignore: ['**.md', 'docs/superpowers/**']
   workflow_dispatch:
 
 permissions:
@@ -31,28 +33,40 @@ jobs:
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck-alpine@sha256:c82fe42504fbc9fc68f15d36638e5ee2324ebb8b94e96a3c4e395bf361c49183 \
             shellcheck -S warning \
-              tests/structure.sh tests/functional.sh tests/updater.sh tests/updater/lib.sh tests/monitor.sh \
+              tests/structure.sh tests/functional.sh tests/port53.sh tests/quickstart.sh tests/docs.sh tests/sidecar-docs.sh tests/observability.sh scripts/build.sh tests/updater.sh tests/updater/lib.sh tests/monitor.sh \
               updater/unbound-autoupdate updater/entrypoint.sh updater/lib/*.sh updater/www/cgi-bin/metrics \
-              .github/scripts/decide-updates.sh deploy/unbound-upstream-check tests/trigger.sh
+              .github/scripts/*.sh .github/settings/apply.sh deploy/unbound-upstream-check tests/trigger.sh
 
       - name: Monitor decision logic
         run: bash tests/monitor.sh
 
+      - name: Markdown links and anchors
+        run: bash tests/docs.sh
+
       - name: External trigger script
         run: bash tests/trigger.sh
 
-      - name: promtool (alert rules)
-        run: |
-          docker run --rm -v "$PWD/docs/observability:/obs:ro" --entrypoint promtool \
-            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
-            check rules /obs/alerts.yml
+      # updater/README.md's install recipe and variables table, the reference
+      # production project, against Compose and the sidecar's code.
+      - name: Sidecar documentation
+        run: bash tests/sidecar-docs.sh
 
+      # actionlint 1.7.12 (the newest) predates GitHub's `concurrency.queue`
+      # (release.yml, updater.yml): that one message, and only it, is ignored.
       - name: actionlint (workflows)
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color \
+            -ignore 'unexpected key "queue" for "concurrency" section'
 
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      # SARIF upload on pushes to main. On pull requests from forks and
+      # Dependabot the token is read-only whatever this says; the upload is
+      # skipped there.
+      security-events: write
     steps:
       # Every action is pinned to a full commit SHA (the trailing comment records
       # the tag that SHA was resolved from). A moving tag is a mutable dependency
@@ -84,8 +98,13 @@ jobs:
             UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
             DEBIAN_BASE=${{ env.DEBIAN_BASE }}
             DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+            IMAGE_REVISION=${{ env.UNBOUND_VERSION }}-r${{ env.REVISION }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Written on pushes to main only. Pull-request tokens (Dependabot's,
+          # forks') cannot write the Actions cache — "cache write denied:
+          # token has no writable scopes" failed the build — and a PR's cache
+          # entries would only be visible to that PR anyway.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
       - name: Structure tests
         run: bash tests/structure.sh unbound-distroless:test
@@ -96,6 +115,32 @@ jobs:
       - name: Functional tests
         run: bash tests/functional.sh unbound-distroless:test
 
+      # The README's two quick starts, extracted from README.md and run as
+      # written against the image just built (host port 53 is not used).
+      - name: Quick-start tests
+        run: bash tests/quickstart.sh unbound-distroless:test
+
+      # Code scanning gets the same CRITICAL/HIGH-with-a-fix set the gate
+      # judges, before the gate so a failing main still uploads. main only:
+      # alerts track the default branch; PRs are judged by the gate alone.
+      - name: 'Trivy: SARIF for code scanning'
+        if: github.event_name == 'push'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-distroless:test
+          format: sarif
+          output: trivy-resolver.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+
+      - name: 'Code scanning: upload'
+        if: github.event_name == 'push'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-resolver.sarif
+          category: ci-resolver
+
       - name: Trivy vulnerability scan (gate)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -105,11 +150,47 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
+  # The sidecar's image handling differs between the two Docker image stores
+  # (on containerd an image ID is the pulled digest, and removing a digest
+  # reference removes the tags of that image too): the suite runs on both.
+  # Check names: "updater (classic)" and "updater (containerd)".
   updater:
+    name: updater (${{ matrix.image-store }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image-store: [classic, containerd]
+    env:
+      IMAGE_STORE: ${{ matrix.image-store }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select the Docker image store
+        run: |
+          case "$IMAGE_STORE" in
+            classic) want=false ;;
+            containerd) want=true ;;
+            *) echo "unknown image store: $IMAGE_STORE" >&2; exit 1 ;;
+          esac
+          sudo mkdir -p /etc/docker
+          [ -s /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo cat /etc/docker/daemon.json \
+            | jq --argjson v "$want" '.features["containerd-snapshotter"] = $v' \
+            | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          if docker info --format '{{json .DriverStatus}}' | grep -q 'io.containerd.snapshotter'; then
+            actual=containerd
+          else
+            actual=classic
+          fi
+          echo "image store in use: $actual"
+          [ "$actual" = "$IMAGE_STORE" ] || { echo "expected the $IMAGE_STORE image store, the daemon uses $actual" >&2; exit 1; }
 
       - name: Load pinned versions
         run: cat versions.env >> "$GITHUB_ENV"
@@ -129,6 +210,7 @@ jobs:
             --build-arg "ALPINE_BASE=$ALPINE_BASE" \
             --build-arg "COSIGN_IMAGE=$COSIGN_IMAGE" \
             --build-arg "UPDATER_VERSION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
+            --build-arg "IMAGE_REVISION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
             updater/
 
       # The suite drives real containers, real DNS, real cosign verification
@@ -137,6 +219,11 @@ jobs:
       # host-side updater.
       - name: Integration tests
         run: bash tests/updater.sh unbound-autoupdate:test
+
+      # docs/observability/: promtool check config, and every metric and label
+      # value the alerts use is emitted by this image from a real resolver.
+      - name: Observability rules
+        run: bash tests/observability.sh unbound-autoupdate:test
 
       # Trivy policy for the sidecar, split by package origin because the two
       # halves of this image have different remediation paths:
@@ -151,7 +238,29 @@ jobs:
       #     or a blanket ignore file; instead it is gated at CRITICAL and
       #     tracked to the newest upstream release (.build-state.json +
       #     upstream-check.yml).
+      # Code scanning shows every fixable CRITICAL/HIGH finding, including
+      # the vendored cosign's HIGH ones the gate below lets through:
+      # visibility is not the gate.
+      - name: 'Trivy: SARIF for code scanning'
+        if: github.event_name == 'push' && matrix.image-store == 'classic'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-autoupdate:test
+          format: sarif
+          output: trivy-updater.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+
+      - name: 'Code scanning: upload'
+        if: github.event_name == 'push' && matrix.image-store == 'classic'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-updater.sarif
+          category: ci-updater
+
       - name: 'Trivy: OS packages (gate)'
+        if: matrix.image-store == 'classic'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: unbound-autoupdate:test
@@ -162,6 +271,7 @@ jobs:
           skip-files: usr/local/bin/cosign
 
       - name: 'Trivy: whole image incl. vendored cosign (gate)'
+        if: matrix.image-store == 'classic'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: unbound-autoupdate:test

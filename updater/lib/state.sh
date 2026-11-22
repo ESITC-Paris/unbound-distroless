@@ -64,9 +64,14 @@ _quarantine_window_open() {
   now=$(date -u +%s)
   [ $(( now - ts )) -lt "$(to_seconds "${RETRY_AFTER:-24h}")" ]
 }
+# A quarantined IMAGE is matched by its digest alone: the same image may be
+# written "docker.io/esitcparis/…", "esitcparis/…" or "index.docker.io/…"
+# depending on the compose file and the sidecar version that recorded it, and
+# a sha256 names it unambiguously. Values without "@" (configuration
+# fingerprints) compare whole.
 _quarantine_active() {  # <valuekey> <tskey> <value>
   local v; v=$(state_get "$1")
-  [ -n "$v" ] && [ "$v" = "$3" ] || return 1
+  [ -n "$v" ] && [ "${v##*@}" = "${3##*@}" ] || return 1
   _quarantine_window_open "$2"
 }
 

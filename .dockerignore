@@ -12,3 +12,4 @@ docker-compose.yml
 unbound.conf.local
 .build-state.json
 versions.env
+scripts

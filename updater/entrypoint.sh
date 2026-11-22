@@ -70,10 +70,22 @@ case "$MODE" in
     # now, not after the first cycle has run.
     _delay >/dev/null
     log_info "unbound-autoupdate $VERSION starting: interval=$INTERVAL splay=$SPLAY"
+    # SIGTERM (docker stop) is forwarded to a running cycle, which ends at a
+    # consistent point — at once outside a swap, after it inside one — and
+    # the loop then exits. Without this the cycle never saw the signal and
+    # was simply killed at the end of the grace period, mid-swap or not.
+    CYCLE_PID=""
+    _forward_term() {
+      if [ -n "$CYCLE_PID" ]; then kill -TERM "$CYCLE_PID" 2>/dev/null || true; wait "$CYCLE_PID" 2>/dev/null || true; fi
+      exit 143
+    }
+    trap _forward_term TERM INT
     while true; do
       # A failing cycle must not kill the loop: it has already notified, and
       # the next tick retries. Only a human decision stops the sidecar.
-      /usr/local/bin/unbound-autoupdate || log_warn "cycle exited $? — continuing"
+      /usr/local/bin/unbound-autoupdate & CYCLE_PID=$!
+      wait "$CYCLE_PID" || log_warn "cycle exited $? — continuing"
+      CYCLE_PID=""
       d=$(_delay)
       log_info "next cycle in ${d}s"
       sleep "$d" &

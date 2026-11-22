@@ -48,14 +48,18 @@ notify() {
   local payload
   payload=$(jq -nc --arg e "$event" --arg h "$(_notify_host)" --arg s "$subject" --arg b "$body" \
     '{event:$e, host:$h, subject:$s, body:$b, text:("[unbound-autoupdate] " + $h + " — " + $s + "\n" + $b)}')
-  curl -fsS -m 15 --retry 2 -H 'Content-Type: application/json' \
-    -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 \
+  # --proto: these URLs are configuration, but curl would otherwise also read
+  # or write file://, smb://, … for whatever ends up in them. Redirects are
+  # not followed (no -L), and curl's own messages — which carry the URL, and
+  # with it the webhook or check secret — never reach the log.
+  curl -fsS -m 15 --retry 2 --proto '=http,https' -H 'Content-Type: application/json' \
+    --data-raw "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 \
     || log_warn "webhook delivery failed"
 }
 
 _hc() {  # _hc <suffix> [body]
   [ -n "${HC_URL:-}" ] || return 0
-  curl -fsS -m 10 --retry 2 --data-raw "${2:-}" "${HC_URL}${1}" >/dev/null 2>&1 \
+  curl -fsS -m 10 --retry 2 --proto '=http,https' --data-raw "${2:-}" "${HC_URL}${1}" >/dev/null 2>&1 \
     || log_warn "healthchecks ping failed"
 }
 hc_start()   { _hc /start; }

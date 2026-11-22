@@ -69,22 +69,29 @@ canary_down() {
   docker network rm "$CANARY_NET"  >/dev/null 2>&1 || true
 }
 
-# canary_up <image_ref> — sets CANARY_IP.
-canary_up() {
-  local ref="$1"
-  _canary_names
-
-  # The canary is reached by joining its isolated bridge network, and the
-  # daemon refuses to connect a host-networked container to any other
-  # network. A sidecar declared with network_mode: host (which
-  # target_probe_ip requires whenever the resolver itself runs in host mode)
-  # therefore cannot run the canary at all. Say so here, precisely and
-  # before creating anything, rather than after a network, a volume, a
-  # cloned state and a container have been built only to fail at the join.
+# canary_supported — 0 when this sidecar can run a canary at all.
+#
+# The canary is reached by joining its isolated bridge network, and the
+# daemon refuses to connect a host-networked container to any other network.
+# A sidecar declared with network_mode: host (which target_probe_ip requires
+# whenever the resolver itself runs in host mode) therefore cannot run the
+# canary at all. The cycle asks this as soon as it knows it has something to
+# deploy — before cosign, preflight or any container — and canary_up asks it
+# again so that it never builds a network, a volume, a cloned state and a
+# container only to fail at the join.
+canary_supported() {
   if [ "$(docker inspect "$SELF_ID" --format '{{.HostConfig.NetworkMode}}')" = host ]; then
     log_error "canary: this sidecar runs with network_mode: host and cannot join the canary's isolated network — the canary is not supported for host-networked deployments"
     return 1
   fi
+  return 0
+}
+
+# canary_up <image_ref> — sets CANARY_IP.
+canary_up() {
+  local ref="$1" self_ref
+  _canary_names
+  canary_supported || return 1
 
   canary_down   # clear leftovers from an interrupted run
 
@@ -92,10 +99,14 @@ canary_up() {
   docker volume create "$CANARY_VOL"  >/dev/null || { log_error "canary: cannot create volume"; return 1; }
 
   # Clone production state with our OWN image rather than pulling busybox:
-  # every image in this chain is signed by the same pipeline.
+  # every image in this chain is signed by the same pipeline. "Our own image"
+  # is the image ID this container runs (kept alive by keep_running) — never
+  # the sidecar's tag, which names whatever was last pulled or tagged under it.
+  self_ref="$SELF_IMAGE_ID"
+  [ -n "$(image_id_of "$self_ref")" ] || { log_error "canary: my own image $self_ref has no local record — refusing to clone state with a mutable reference"; return 1; }
   docker run --rm --entrypoint /bin/sh \
     -v "$TARGET_STATE_VOLUME":/src:ro -v "$CANARY_VOL":/dst \
-    "$SELF_IMAGE" -c 'cp -a /src/. /dst/' \
+    "$self_ref" -c 'cp -a /src/. /dst/' \
     || { log_error "canary: cloning production state failed"; return 1; }
 
   # Same runtime settings as the declared service (read_only, tmpfs,

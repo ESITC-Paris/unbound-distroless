@@ -1,81 +1,89 @@
-# Trust & automation
+# Trust and verification
 
-How this image is built, tested, published, and kept current — and how you
-can verify all of it yourself.
+How an image gets from the Unbound source release to a registry, what has to
+pass on the way, how to check a published image yourself, and how
+vulnerabilities and DNS root data are handled afterwards. Each statement names
+the workflow or test that enforces it.
 
-## Why you can trust this image
+## From source to registry
 
-Every release — including the fully automatic ones — must pass this pipeline
-before a single tag is published. There are no manual builds and no shortcuts:
-the pipeline is the only path to the registries.
+Releases are produced only by two GitHub Actions workflows, started by an
+explicit dispatch on a release tag: [`release.yml`](../.github/workflows/release.yml)
+for the resolver (tags `vX.Y.Z-rN`) and
+[`updater.yml`](../.github/workflows/updater.yml) for the update sidecar
+(tags `updater-vX.Y.Z-rN`). The release tags are created by the update monitor,
+[`upstream-check.yml`](../.github/workflows/upstream-check.yml); how it is
+started and supervised is in [operations.md](operations.md).
 
-| # | Gate | What it guarantees |
-|---|------|--------------------|
-| 1 | **GPG signature verification** | When the update monitor pins a new Unbound version, the source tarball is verified against NLnet Labs' release signing key (fingerprint pinned in the repo) *before* its checksum is ever recorded; the release build then enforces that checksum (gate 2). A bad signature blocks everything. |
-| 2 | **SHA-256 pinned source** | The build refuses any tarball whose checksum differs from the committed pin. |
-| 3 | **Digest-pinned bases, current security updates** | `debian:trixie` (build) and `distroless/base-debian13` (runtime) are consumed by digest. The runtime libraries are harvested from the build stage, which applies Debian's security updates at build time, so a rebuild ships the fixes published since the pinned digest. The published image is rebuilt from the same inputs and the build cache of the tested one. |
-| 4 | **Native builds, both architectures** | amd64 and arm64 are each built **and fully tested on native runners** — no QEMU emulation anywhere. |
-| 5 | **Functional test suite (per arch)** | The container is started with the documented hardening flags and must: reach `healthy`, resolve real domains over UDP and TCP, prove DNSSEC validation (AD flag; a deliberately-broken domain must SERVFAIL), serve cache hits, load the hyperlocal root zone, expose the DoH/cachedb capabilities, and answer `unbound-control` over its Unix socket. |
-| 6 | **Structure test suite (per arch)** | Asserts the security invariants: runs as UID 65532, **no shell**, no package manager, no baked-in private keys, and the expected binaries, configuration, trust anchor, root zone and runtime libraries present. |
-| 7 | **CVE scan gate (per arch)** | Trivy blocks the release on any fixable CRITICAL/HIGH vulnerability. |
-| 8 | **Untagged until proven** | Platform images are pushed *by digest only*; the public tags appear in one final step after every gate above has passed on both architectures. |
-| 9 | **Signing & attestations** | The published multi-arch index is signed with **cosign keyless** (GitHub OIDC — the signing identity is a GitHub Actions workflow of this repository) and carries **SBOM + SLSA provenance** attestations. |
+| # | Step | What it guarantees |
+|---|---|---|
+| 1 | **OpenPGP-verified source** | When the monitor pins a new Unbound version, it downloads the tarball and its `.asc`, imports the NLnet Labs signing key vendored at [`.github/keys/`](../.github/keys/), refuses it unless its fingerprint is the one pinned in the workflow, runs `gpg --verify`, and checks NLnet Labs' published `.sha256`. Only then does it record the tarball's SHA-256 in `versions.env`. The steps to redo this by hand are in the [`Dockerfile`](../Dockerfile), above the download. |
+| 2 | **Hash-pinned source** | The build refuses any tarball whose SHA-256 differs from `versions.env`. |
+| 3 | **Digest-pinned bases, current packages** | `debian:trixie` (build stage) and `gcr.io/distroless/base-debian13` (runtime) are used by the digests recorded in `.build-state.json`. The build stage runs `apt-get upgrade`, and the runtime libraries are copied from that stage with their dpkg metadata, so an image carries the Debian security updates published up to its build. The package-upgrade layer depends on the image revision, so each new revision re-runs it instead of reusing a cached layer. |
+| 4 | **Release matches the tree** | The workflow must run on the tag it publishes, and the tag must match the version and revision in `versions.env` at that tag. |
+| 5 | **Published once** | A release never pushes an `X.Y.Z-rN` image tag that already exists on Docker Hub or GHCR, and stops when a registry cannot answer. A run dispatched again on a published tag only finishes the remaining publication steps, and only for an image already signed by that tag's run and for the revision `main` holds now ([`release-mode.sh`](../.github/scripts/release-mode.sh), [`refuse-published.sh`](../.github/scripts/refuse-published.sh)). |
+| 6 | **Native builds and tests, both architectures** | amd64 and arm64 are each built and tested on a runner of that architecture, without emulation. |
+| 7 | **Functional suite** ([`tests/functional.sh`](../tests/functional.sh)) | The container, started with `--cap-drop=ALL --cap-add=NET_BIND_SERVICE --security-opt no-new-privileges`, must become `healthy`; resolve over UDP and TCP; return the `ad` flag on the root SOA; SERVFAIL on `dnssec-failed.org` and answer it with `+cd`; answer a repeated query from cache in under 100 ms; answer `unbound-control` on its socket; load the local root zone; be built with nghttp2, cachedb, hiredis, subnet and dnstap, and without the Python and dynamic-library modules; keep the subnet and dnstap features off with the shipped configuration and start them when configured; log no unexpected error; and pass the [port 53 cases](usage.md#port-53-and-capabilities) ([`tests/port53.sh`](../tests/port53.sh)). |
+| 8 | **Structure suite** ([`tests/structure.sh`](../tests/structure.sh)) | The image's user resolves to UID and GID 65532 in its own `/etc/passwd` and owns the two writable directories; the only executables on any `bin` or `sbin` directory are Unbound's five binaries, each an ELF file that runs in the image; no shell or package manager by name anywhere in the file system; no private key in any file; every Debian package recorded in `/var/lib/dpkg/status.d` has its copyright file; Unbound's LICENSE and this repository's LICENSE and NOTICE are present. |
+| 9 | **Vulnerability gate** | Trivy fails the release on any CRITICAL or HIGH vulnerability that has a fix, on each architecture. |
+| 10 | **Untagged until signed** | Each architecture pushes its image by digest only. The multi-arch index is then created under the immutable `X.Y.Z-rN` tag only, must have the same digest on both registries, is signed with cosign (keyless, GitHub OIDC), verified with the commands published below and in the release notes, and attested. Only then do `latest`, `X`, `X.Y` and `X.Y.Z` move to that digest, after a check that the index the move would push (`imagetools create --dry-run`) has exactly the signed digest; each tag is then read back from both registries. |
+| 11 | **Attestations** | The image index carries an SPDX SBOM and BuildKit SLSA provenance (`mode=max`) on both registries. A GitHub build-provenance attestation for the index digest is stored in GitHub's attestation store, for both image names; it is not pushed to the registries. |
 
-Additional supply-chain hygiene: every GitHub Action in the pipelines is
-pinned to a full commit SHA, workflow shells never interpolate untrusted
-input, release tags are format-validated before anything runs, and each
+Every action in the workflows is pinned to a full commit SHA, workflow
+`run:` steps never expand `${{ }}` expressions inline, and each
 [GitHub Release](https://github.com/ESITC-Paris/unbound-distroless/releases)
-records the exact image digests with a ready-to-run verification command.
+lists the index digest and a verify command for that exact build.
 
-## Automatic updates
+**The sidecar's gates differ.** `updater.yml` has the same shape (native
+builds, push by digest, sign, verify, attest, then move the mutable tags),
+but its test gate is the sidecar's integration suite
+([`tests/updater.sh`](../tests/updater.sh)), and its vulnerability gate is
+split: Alpine packages fail at HIGH and CRITICAL, while the vendored `cosign`
+binary fails only at CRITICAL. Its HIGH findings sit in cosign's own Go
+dependencies, which only a new upstream cosign build can fix; the reason is
+recorded in the workflow. Those findings stay visible in code scanning (see
+below). What the sidecar does at run time: [updater/README.md](../updater/README.md).
 
-An update check runs **every hour** (triggered from ESITC-operated
-infrastructure — see [operations.md](operations.md)) and looks for:
-
-1. **New Unbound releases** (NLnet Labs) → new `X.Y.Z-r0` release
-2. **Updated base images** — the Debian build stage or the distroless runtime
-   base → revision rebuild `X.Y.Z-rN`, which picks up glibc, OpenSSL, zlib,
-   libevent, nghttp2, hiredis, and expat security fixes. The runtime
-   libraries come from the Debian build stage (not from the distroless base),
-   and that stage applies Debian's security updates at build time, so a
-   rebuild ships every fix published up to that moment
-3. **The sidecar's own bases** — the Alpine base and the cosign image that
-   `updater/` builds on, tracked by digest on their own axis → revision
-   rebuild `updater-vX.Y.Z-rN`, independently of the resolver's releases
-
-Detection to publication is fully automatic; the gate table above is the
-safety net. A failed test gate publishes nothing; any failure opens (or
-comments on) a "Release pipeline failed" issue assigned to the administrator
-and leaves a red run in
-[Actions](https://github.com/ESITC-Paris/unbound-distroless/actions). A
-failure *after* the tags are created (signing, attestation, GitHub Release)
-leaves the tags published, possibly unsigned, until the release is re-run.
-To be notified of new releases: **Watch → Custom → Releases** on the
-repository.
-
-**Version scheme:** image `X.Y.Z-rN` = Unbound version `X.Y.Z`, rebuild
-revision `N`. The revision increments when the same Unbound version is
-rebuilt (base/library updates or image improvements). The automation never
-re-pushes an `-rN` tag (treat it as immutable, but only a digest is a hard
-guarantee: re-running a release for an existing tag republishes it);
-`X.Y.Z`/`X.Y`/`X`/`latest` are mutable pointers to the most recently
-released build.
+**When a release fails**, the workflow opens an issue assigned to the
+maintainer — `Release pipeline failed for <tag>` or
+`Updater release pipeline failed for <tag>` — on failure, cancellation or
+timeout, or comments on the open one. A failure before the mutable tags move
+leaves them on the previous, signed release. Recovery:
+[operations.md](operations.md#release-recovery).
 
 ## Verifying releases
 
-Images are signed with [cosign](https://docs.sigstore.dev/) keyless signing —
-the signing identity is a GitHub Actions workflow of this repository
-(`release.yml` for the resolver, `updater.yml` for the sidecar — the regexp
-below accepts both), so a valid signature proves the image was signed by this
-repository's CI:
+The images are signed by the release workflow of this repository, running on
+a release tag. The certificate identity is
+`https://github.com/ESITC-Paris/unbound-distroless/.github/workflows/release.yml@refs/tags/vX.Y.Z-rN`
+for the resolver and `…/updater.yml@refs/tags/updater-vX.Y.Z-rN` for the
+sidecar. The release workflows check, before moving any mutable tag, that
+these exact commands verify:
 
 ```bash
+# Resolver
 cosign verify esitcparis/unbound-distroless:latest \
-  --certificate-identity-regexp 'https://github.com/ESITC-Paris/unbound-distroless/.*' \
+  --certificate-identity-regexp '^https://github\.com/ESITC-Paris/unbound-distroless/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Update sidecar
+cosign verify esitcparis/unbound-autoupdate:latest \
+  --certificate-identity-regexp '^https://github\.com/ESITC-Paris/unbound-distroless/\.github/workflows/updater\.yml@refs/tags/updater-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Inspect the SBOM and SLSA provenance attestations:
+Verify a digest rather than a tag when the result must hold for what you
+deploy: `esitcparis/unbound-distroless@sha256:<digest>`. The same commands
+work for `ghcr.io/esitc-paris/unbound-distroless` and
+`ghcr.io/esitc-paris/unbound-autoupdate`. The release notes of each version
+give the exact identity of that build (`--certificate-identity` instead of
+the regular expression).
+
+The broader regular expression documented before,
+`'https://github.com/ESITC-Paris/unbound-distroless/.*'`, still verifies: it
+accepts any workflow of this repository on any ref. Prefer the ones above.
+
+SBOM and BuildKit provenance, from the registry:
 
 ```bash
 docker buildx imagetools inspect esitcparis/unbound-distroless:latest \
@@ -84,82 +92,79 @@ docker buildx imagetools inspect esitcparis/unbound-distroless:latest \
   --format '{{ json .Provenance }}'
 ```
 
-Every [GitHub Release](https://github.com/ESITC-Paris/unbound-distroless/releases)
-lists the exact digests. Pin production deployments to an `X.Y.Z-rN` tag
-or, for a hard guarantee, a digest.
-
-## The updater sidecar
-
-The companion sidecar — `esitcparis/unbound-autoupdate` (Docker Hub) ·
-`ghcr.io/esitc-paris/unbound-autoupdate` — is built and published by
-[its own workflow](https://github.com/ESITC-Paris/unbound-distroless/blob/main/.github/workflows/updater.yml),
-with the same shape and the same guarantees as the resolver's:
-
-- native builds on `linux/amd64` **and** `linux/arm64` runners, no emulation;
-- the **full integration suite** (`tests/updater.sh`) run per architecture, on
-  that architecture's own runner, before anything is pushed;
-- Trivy CVE gate per architecture;
-- platform images pushed **by digest only**, tags created in one final step
-  from the two digests;
-- the multi-arch index signed with **cosign keyless** (GitHub OIDC), and the
-  published index then **verified with the documented identity** — the release
-  fails if what was just signed does not verify;
-- SBOM and SLSA provenance attestations, plus a GitHub provenance attestation
-  on both registries.
-
-Tags follow `X.Y.Z-rN`, where `rN` is the sidecar's own revision: it is
-incremented when its Alpine base or the cosign image it copies moves, which
-the upstream monitor tracks by digest independently of the resolver's bases.
-`latest`, `X`, `X.Y` and `X.Y.Z` are mutable pointers to the newest build.
-
-Verify it exactly as you verify the resolver:
+GitHub's build-provenance attestation, from GitHub:
 
 ```bash
-cosign verify esitcparis/unbound-autoupdate:latest \
-  --certificate-identity-regexp 'https://github.com/ESITC-Paris/unbound-distroless/.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://index.docker.io/esitcparis/unbound-distroless:latest \
+  --repo ESITC-Paris/unbound-distroless
 ```
 
-The sidecar applies that same check itself, fail-closed, before it runs
-anything: every resolver image it is about to canary, and every sidecar image
-it is about to replace itself with, must pass `cosign verify` against this
-identity (or against your own key — see
-[updater/README.md](../updater/README.md)). It runs with the **cosign v3.1.3**
-CLI the sidecar image embeds, which verifies the signatures the release
-workflows produce with cosign v2.6.5. An image that does not verify is never
-started, and the cycle reports it as a supply-chain incident.
+## Vulnerabilities after release
 
-## DNSSEC trust anchor and root data lifecycle
+A published image can become vulnerable without any change here: Debian or
+Alpine publish a fix, the base image is not rebuilt. Three mechanisms cover
+this, all in [`upstream-check.yml`](../.github/workflows/upstream-check.yml)
+and its scripts, exercised by [`tests/monitor.sh`](../tests/monitor.sh):
 
-All three data files are managed automatically; the volume
-(`/var/lib/unbound`) is what makes the runtime state survive restarts.
+- **Base updates.** Every run of the monitor resolves the digests of the
+  build and runtime bases (and of the sidecar's Alpine and cosign bases); a
+  changed digest publishes a new revision of the image concerned.
+- **Rescan of what is published.** Every run also scans the images behind
+  `latest` — resolver and sidecar, amd64 and arm64, by digest — with the
+  release gates' own Trivy policy
+  ([`rescan-decide.sh`](../.github/scripts/rescan-decide.sh)). A finding the
+  gate would refuse, and that a rebuild can fix, publishes a new revision,
+  whose build re-runs the package upgrade. Findings a rebuild cannot change —
+  in the distroless base's own layers, or a CRITICAL in the vendored cosign
+  binary — wait for the next base digest, which the monitor already tracks,
+  and open the issue `Published <image> image has findings a rebuild cannot
+  fix`. Loop guard: one rebuild per published digest and finding set; if the
+  rebuilt image still has the same findings, or the rebuild is not
+  published within 6 hours, the monitor opens `Published <image> image still fails the release
+  gate after a rebuild` and stops rebuilding for that set. A scanner or
+  registry outage fails the run visibly and triggers no rescan-driven
+  rebuild (version and base updates found by the same run still go through).
+- **Visibility.** The rescan results, and the scans of every CI build on
+  `main`, are uploaded to the repository's code scanning, including the
+  sidecar's cosign findings that do not block. OpenSSF Scorecard
+  ([`scorecard.yml`](../.github/workflows/scorecard.yml)) assesses the
+  repository's practices weekly and on every push to `main`.
 
-**Trust anchor (`/var/lib/unbound/root.key`)**
-- Generated **fresh at every image build** by `unbound-anchor` (never a stale
-  checked-in file).
-- At runtime, Unbound performs **RFC 5011 automatic trust-anchor tracking**:
-  it probes the root key and rewrites the file itself (verified behavior —
-  the file is rewritten with a new probe timestamp at startup and on the
-  RFC 5011 schedule thereafter).
-- With the volume, the tracked anchor **persists across restarts, upgrades,
-  and container recreation** — this is what keeps you safe across a root KSK
-  rollover. Docker seeds a named volume from the image only when the volume
-  is empty; afterwards the RFC 5011 updates keep it current.
+The monitor runs when it is dispatched, hourly by design
+([operations.md](operations.md)). A failed run opens or comments on the issue
+`Upstream check is failing`. CI on pull requests and pushes opens no issue.
 
-**Hyperlocal root zone (`/var/lib/unbound/root.zone`) — [RFC 8806](https://www.rfc-editor.org/rfc/rfc8806)**
-- The full root zone is **baked at every image build**, so the resolver
-  starts warm: lookups skip the round-trip to root servers and non-existent
-  TLDs get an instant local NXDOMAIN.
-- At runtime, **Unbound keeps the copy fresh itself** via AXFR/IXFR from the
-  root servers, following the zone's SOA timers, and persists it in the
-  volume alongside the trust anchor.
-- Fail-safe by construction: every answer still passes DNSSEC validation,
-  and `fallback-enabled: yes` means normal recursion transparently takes
-  over if the local copy is stale or a transfer fails.
-- Verify live: `unbound-control list_auth_zones` shows the zone and serial.
+Only the current line is rescanned and rebuilt: the images behind `latest`.
+When Unbound moves to a new version, the tags of the previous one stop
+receiving fixes ([support policy](../SECURITY.md#supported-versions)).
 
-**Root hints (`/etc/unbound/root.hints`)**
-- Downloaded from InterNIC **at every image build** — and images are rebuilt
-  automatically on every upstream or base update, so hints stay current
-  without runtime writes. Unbound only needs them to find *one* root server;
-  priming self-corrects stale entries.
+**Tags.** An `X.Y.Z-rN` image tag is published once (step 5 above). The
+registries themselves do not enforce this: it rests on the release workflows
+and on who holds the registry credentials. A digest is the only reference
+that cannot change; the release notes list it.
+
+## DNSSEC trust anchor and root data
+
+Three files, all fetched during the build, in a layer that is redone for
+every new revision (it depends on the image revision, step 3). A local build
+reuses its own cache.
+
+**Trust anchor** (`/var/lib/unbound/root.key`). Written by `unbound-anchor`
+during the build. At run time Unbound tracks the root key itself (RFC 5011,
+`auto-trust-anchor-file`) and rewrites the file. The volume on
+`/var/lib/unbound` is what carries that state across restarts, upgrades and
+container re-creation, and through a root key rollover. Docker copies the
+image's files into a named volume only when the volume is empty; after that,
+the volume's own copy is the one Unbound keeps current.
+
+**Root zone copy** (`/var/lib/unbound/root.zone`, [RFC 8806](https://www.rfc-editor.org/rfc/rfc8806)).
+Downloaded from InterNIC during the build, so the resolver starts with it.
+At run time Unbound keeps it current by zone transfer from the root servers
+listed in `unbound.conf`, checks its ZONEMD record (`zonemd-check: yes`),
+and stores it on the volume. Answers built from it are still DNSSEC-validated,
+and with `fallback-enabled: yes` normal recursion takes over if the copy is
+unusable. `unbound-control list_auth_zones` shows its serial.
+
+**Root hints** (`/etc/unbound/root.hints`). Downloaded from InterNIC during
+the build, not updated at run time. Unbound needs them only to reach one root
+server, then learns the current list from the root itself (priming).

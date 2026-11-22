@@ -9,26 +9,295 @@ name: Upstream check
 # (1.26.2 went unbuilt for six weeks in autumn 2026 when the cron stopped).
 on:
   workflow_dispatch:
+    inputs:
+      # Recovery only. The hourly trigger sends no inputs (→ none). A release
+      # that failed after pushing its immutable X.Y.Z-rN tag cannot be
+      # re-dispatched (release.yml refuses published tags); this publishes the
+      # next revision of the current tree instead — never an older one.
+      rebuild:
+        description: 'Force a new revision (recovery): none, resolver, sidecar or both'
+        type: choice
+        options: [none, resolver, sidecar, both]
+        default: none
 
-permissions:
-  contents: write
-  actions: write
-  issues: write
+# Nothing at workflow level: each job states what it needs.
+permissions: {}
 
 concurrency:
   group: upstream-check
   cancel-in-progress: false
 
+env:
+  RESOLVER_IMAGE: ghcr.io/esitc-paris/unbound-distroless
+  UPDATER_IMAGE: ghcr.io/esitc-paris/unbound-autoupdate
+
 jobs:
+  # The monitor below reacts to a new Unbound version or a moved base digest.
+  # Neither happens when a fix lands in trixie-security or Alpine without a
+  # base rebuild, so the published images are rescanned here with the release
+  # gates' own Trivy policy (.github/scripts/rescan-decide.sh). Only the
+  # images behind `latest` are rescanned: the pipeline builds one line
+  # (versions.env), older X.Y tags are frozen.
+  #
+  # A separate job so that a scanner or registry outage fails the run (and
+  # opens the usual issue, see the end of `check`) without holding back a
+  # version or base update: `check` runs regardless and ignores the outputs
+  # of a rescan that did not succeed.
+  rescan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      security-events: write
+    # `verdict` is set right after both decisions; `check` uses the statuses
+    # only when it is there.
+    outputs:
+      verdict: ${{ steps.verdict.outputs.ok }}
+      resolver: ${{ steps.resolver.outputs.status }}
+      resolver_digest: ${{ steps.published.outputs.resolver }}
+      resolver_vulns: ${{ steps.resolver.outputs.vulns }}
+      updater: ${{ steps.updater.outputs.status }}
+      updater_digest: ${{ steps.published.outputs.updater }}
+      updater_vulns: ${{ steps.updater.outputs.vulns }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the published digests
+        id: published
+        run: |
+          # By digest from here on: a release moving `latest` mid-scan must
+          # not mix two images in one verdict.
+          RESOLVER=$(bash .github/scripts/registry.sh digest "$RESOLVER_IMAGE" latest)
+          UPDATER=$(bash .github/scripts/registry.sh digest "$UPDATER_IMAGE" latest)
+          {
+            echo "resolver=$RESOLVER"
+            echo "updater=$UPDATER"
+          } >> "$GITHUB_OUTPUT"
+
+      # One JSON report per image and platform, both platforms because the
+      # release gate scans each natively. --severity/--ignore-unfixed as in
+      # the gates; no skip-files: the sidecar's cosign exemption is applied
+      # by rescan-decide.sh so one scan serves both of its gate levels.
+      # exit-code 0: the verdict is the script's, a Trivy crash is caught by
+      # the script refusing a missing or malformed report.
+      - name: 'Trivy: published resolver (amd64)'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ env.RESOLVER_IMAGE }}@${{ steps.published.outputs.resolver }}
+          format: json
+          output: resolver-amd64.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: 'Trivy: published resolver (arm64)'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ env.RESOLVER_IMAGE }}@${{ steps.published.outputs.resolver }}
+          format: json
+          output: resolver-arm64.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: 'Trivy: published sidecar (amd64)'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ env.UPDATER_IMAGE }}@${{ steps.published.outputs.updater }}
+          format: json
+          output: updater-amd64.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: 'Trivy: published sidecar (arm64)'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ env.UPDATER_IMAGE }}@${{ steps.published.outputs.updater }}
+          format: json
+          output: updater-arm64.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      # The resolver's distroless base layers: a finding in one of them is
+      # fixed by a new base digest, not by a rebuild (rescan-decide.sh).
+      - name: List the resolver's base layers
+        run: |
+          DISTROLESS=$(python3 -c 'import json; print(json.load(open(".build-state.json"))["distroless"])')
+          docker buildx imagetools inspect "gcr.io/distroless/base-debian13:nonroot@$DISTROLESS" --format '{{json .Image}}' \
+            | python3 -c 'import json,sys; [print(d) for c in json.load(sys.stdin).values() for d in c["rootfs"]["diff_ids"]]' \
+            | sort -u > base-diffids.txt
+          [ -s base-diffids.txt ] || { echo "::error::no base layers resolved"; exit 1; }
+
+      - name: Decide (resolver)
+        id: resolver
+        env:
+          POLICY: resolver
+          STATE_KEY: rescan_resolver
+          DIGEST: ${{ steps.published.outputs.resolver }}
+          BASE_DIFFIDS_FILE: base-diffids.txt
+        run: |
+          set -o pipefail
+          bash .github/scripts/rescan-decide.sh resolver-amd64.json resolver-arm64.json | tee -a "$GITHUB_OUTPUT"
+
+      - name: Decide (sidecar)
+        id: updater
+        env:
+          POLICY: updater
+          STATE_KEY: rescan_updater
+          DIGEST: ${{ steps.published.outputs.updater }}
+        run: |
+          set -o pipefail
+          bash .github/scripts/rescan-decide.sh updater-amd64.json updater-arm64.json | tee -a "$GITHUB_OUTPUT"
+
+      - name: Record that both verdicts exist
+        id: verdict
+        run: echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue when a rebuild cannot or did not fix the findings
+        # stuck: one rebuild was published for exactly these findings and
+        #   they are still there, or the rebuild it asked for was never
+        #   published; blocked: only findings a rebuild cannot change. No
+        #   rebuild is tried for them; a human decides. One issue per image
+        #   and kind, never a comment per hourly run.
+        if: contains(fromJSON('["stuck","blocked"]'), steps.resolver.outputs.status) || contains(fromJSON('["stuck","blocked"]'), steps.updater.outputs.status)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESOLVER_STATUS: ${{ steps.resolver.outputs.status }}
+          RESOLVER_DIGEST: ${{ steps.published.outputs.resolver }}
+          RESOLVER_SUMMARY: ${{ steps.resolver.outputs.summary }}
+          RESOLVER_REASON: ${{ steps.resolver.outputs.reason }}
+          UPDATER_STATUS: ${{ steps.updater.outputs.status }}
+          UPDATER_DIGEST: ${{ steps.published.outputs.updater }}
+          UPDATER_SUMMARY: ${{ steps.updater.outputs.summary }}
+          UPDATER_REASON: ${{ steps.updater.outputs.reason }}
+        run: |
+          open_once() {  # open_once <image> <status> <digest> <summary> <reason>
+            if [ "$2" = stuck ]; then
+              TITLE="Published $1 image still fails the release gate after a rebuild"
+            else
+              TITLE="Published $1 image has findings a rebuild cannot fix"
+            fi
+            NUM=$(gh issue list --state open --json number,title \
+              -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
+            [ -z "$NUM" ] || { echo "already tracked in #$NUM"; return 0; }
+            gh issue create --title "$TITLE" --assignee euca01 --body "$(printf \
+              'Rescan of the published %s image (%s).\n\n%s\n\nFindings the release gate refuses:\n%s\n\nNo automatic rebuild is attempted for these. Run: %s' \
+              "$1" "$3" "$5" "$4" "$RUN_URL")"
+          }
+          case "$RESOLVER_STATUS" in stuck|blocked) open_once resolver "$RESOLVER_STATUS" "$RESOLVER_DIGEST" "$RESOLVER_SUMMARY" "$RESOLVER_REASON" ;; esac
+          case "$UPDATER_STATUS" in stuck|blocked) open_once sidecar "$UPDATER_STATUS" "$UPDATER_DIGEST" "$UPDATER_SUMMARY" "$UPDATER_REASON" ;; esac
+
+      # The SARIF upload happens in its own job (`code-scanning`): a
+      # code-scanning outage must not cost this job its verdict or the issue
+      # above. continue-on-error: a missing artifact fails that job instead.
+      - name: Convert the reports to SARIF
+        continue-on-error: true
+        run: |
+          for f in resolver-amd64 resolver-arm64 updater-amd64 updater-arm64; do
+            trivy convert --format sarif --output "$f.sarif" "$f.json"
+          done
+
+      - name: Keep the SARIF reports for code scanning
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rescan-sarif
+          path: '*.sarif'
+          if-no-files-found: error
+          retention-days: 1
+
+  # Code scanning shows every fixable CRITICAL/HIGH finding in what is
+  # published, including the vendored cosign's HIGH ones the sidecar gate
+  # deliberately lets through: visibility is not the gate. One category per
+  # image and platform, so an alert closes when a later scan of the same image
+  # no longer reports it. A failure here fails the run (see the end of
+  # `check`) without touching the rescan's verdict.
+  code-scanning:
+    needs: rescan
+    if: ${{ !cancelled() && needs.rescan.outputs.verdict == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+    steps:
+      - name: Fetch the SARIF reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rescan-sarif
+
+      - name: 'Code scanning: resolver (amd64)'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: resolver-amd64.sarif
+          category: published-resolver-amd64
+
+      - name: 'Code scanning: resolver (arm64)'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: resolver-arm64.sarif
+          category: published-resolver-arm64
+
+      - name: 'Code scanning: sidecar (amd64)'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: updater-amd64.sarif
+          category: published-updater-amd64
+
+      - name: 'Code scanning: sidecar (arm64)'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: updater-arm64.sarif
+          category: published-updater-arm64
+
   check:
+    needs: [rescan, code-scanning]
+    # Runs whatever the rescan's outcome (see above), but not when the run
+    # itself was cancelled.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # A hung network call must not hold the concurrency group for the default
     # 6 hours: everything this job does normally completes in under a minute.
     timeout-minutes: 15
+    # The `monitor` environment holds MONITOR_DEPLOY_KEY and is restricted to
+    # `main` (.github/settings/apply.sh). Until that environment exists GitHub
+    # creates it on first use, unrestricted, and repository secrets stay
+    # readable — so this line is safe to land before the settings change.
+    environment: monitor
+    permissions:
+      contents: write
+      actions: write
+      issues: write
     steps:
       # Pinned to a full commit SHA (trailing comment records the tag it came
       # from): this job pushes to main, tags, and dispatches the release.
+      #
+      # Pushes go through a write deploy key — a credential the `main` and
+      # release-tag rulesets can name as their only bypass actor, which
+      # GITHUB_TOKEN cannot be without exempting every workflow. With the
+      # secret absent (empty ssh-key), checkout falls back to GITHUB_TOKEN
+      # exactly as before, so the hourly automation keeps working while the
+      # key and rulesets are being set up. A tag pushed with the deploy key
+      # WOULD trigger `on: push: tags`; release.yml and updater.yml therefore
+      # have no such trigger, and the explicit dispatch below stays the one
+      # path that starts a release.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ssh-key: ${{ secrets.MONITOR_DEPLOY_KEY }}
 
       - name: Load current pins
         run: cat versions.env >> "$GITHUB_ENV"
@@ -84,6 +353,11 @@ jobs:
           NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
           NEW_ALPINE: ${{ steps.digests.outputs.alpine }}
           NEW_COSIGN: ${{ steps.digests.outputs.cosign }}
+          # Empty unless both rescan verdicts exist: a partial rescan must not
+          # publish anything (decide-updates.sh reads empty as "no verdict").
+          RESCAN_RESOLVER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.resolver || '' }}
+          RESCAN_UPDATER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.updater || '' }}
+          FORCE_REBUILD: ${{ inputs.rebuild || 'none' }}
         run: |
           # The logic lives in a script so tests/monitor.sh can exercise it.
           # pipefail: without it the pipeline's status is tee's, so a crashed
@@ -166,11 +440,24 @@ jobs:
           NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
           NEW_ALPINE: ${{ steps.digests.outputs.alpine }}
           NEW_COSIGN: ${{ steps.digests.outputs.cosign }}
+          RESCAN_RESOLVER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.resolver || '' }}
+          RESCAN_RESOLVER_DIGEST: ${{ needs.rescan.outputs.resolver_digest }}
+          RESCAN_RESOLVER_VULNS: ${{ needs.rescan.outputs.resolver_vulns }}
+          RESCAN_UPDATER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.updater || '' }}
+          RESCAN_UPDATER_DIGEST: ${{ needs.rescan.outputs.updater_digest }}
+          RESCAN_UPDATER_VULNS: ${{ needs.rescan.outputs.updater_vulns }}
         run: |
+          NOW=$(date +%s); export NOW
           # shellcheck disable=SC1091
           . ./versions.env
-          printf '{\n  "debian": "%s",\n  "distroless": "%s",\n  "alpine": "%s",\n  "cosign": "%s"\n}\n' \
-            "$NEW_DEBIAN" "$NEW_DISTROLESS" "$NEW_ALPINE" "$NEW_COSIGN" > .build-state.json
+          # Base digests, plus the rescan loop-guard record when this commit
+          # publishes a rescan-requested rebuild (logic and tests:
+          # write-state.sh, tests/monitor.sh).
+          bash .github/scripts/write-state.sh
+          # The commit message says when the rescan asked for the rebuild.
+          R_LABEL=$ACTION; U_LABEL=$UPDATER_ACTION
+          if [ "$RESCAN_RESOLVER" = new ] && [ "$ACTION" != none ]; then R_LABEL="$ACTION+rescan"; fi
+          if [ "$RESCAN_UPDATER" = new ] && [ "$UPDATER_ACTION" != none ]; then U_LABEL="$UPDATER_ACTION+rescan"; fi
           # Explicit `if`, not `[ … ] && TAGS+=(…)`: an &&-list whose left half
           # fails is exempt from `set -e` only by a subtlety no reader should
           # have to recall. Only the two decisions that mean "publish" add a tag.
@@ -187,18 +474,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add versions.env .build-state.json
-          git commit -m "chore: ${TAGS[*]} (resolver: ${ACTION}, sidecar: ${UPDATER_ACTION}) [skip ci]"
+          git commit -m "chore: ${TAGS[*]} (resolver: ${R_LABEL}, sidecar: ${U_LABEL}) [skip ci]"
           for t in "${TAGS[@]}"; do git tag "$t"; done
           # --atomic so a rejected main (someone else pushed first) cannot leave
           # a tag behind on the remote: a stranded tag would make every later
           # run fail with "already exists" until a human deletes it. Push only
           # these tags, never --tags.
           git push --atomic origin main "${TAGS[@]}"
-          # A tag pushed with GITHUB_TOKEN does not trigger workflows, so each
-          # release has to be dispatched explicitly against its tag. The push
-          # already happened, so a failed dispatch would otherwise mean a silent,
-          # permanent missed release (the next run sees none/none). Retry, then
-          # fail the job so the miss is visible in the Actions UI.
+          # The release workflows start only from this explicit dispatch: a
+          # tag pushed with GITHUB_TOKEN triggers nothing, and the push
+          # trigger that a deploy-key push would fire was removed so a tag
+          # never gets two runs. The push already happened, so a failed
+          # dispatch would otherwise mean a silent, permanent missed release
+          # (the next run sees none/none). Retry, then fail the job so the
+          # miss is visible in the Actions UI.
           failed=""
           for t in "${TAGS[@]}"; do
             case "$t" in updater-v*) wf=updater.yml ;; *) wf=release.yml ;; esac
@@ -215,6 +504,75 @@ jobs:
             exit 1
           fi
 
+      # A release can be lost after its tag was pushed: a run cancelled in
+      # the queue, a dispatch that never arrived, a timeout, a registry blip
+      # in its last steps. Each hour, for an image this run is not already
+      # re-releasing, check that the revision versions.env holds is really
+      # out (immutable tag, `latest` on it, GitHub Release); if not and no run
+      # is queued or running, dispatch it again — at most 3 runs in all
+      # (release-health.sh) — then open an issue. A re-dispatch builds what
+      # is absent or resumes what is published but unfinished (release-mode.sh).
+      - name: Check that the current releases are really out
+        if: steps.decide.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          UPDATER_ACTION: ${{ steps.decide.outputs.updater_action }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          health() {  # health <workflow> <tag-prefix> <version> <revision> <hub-image> <ghcr-image>
+            local wf=$1 tag="$2$3-r$4" full=$3 hub=$5 ghcr=$6 rc=0 in_git=no complete=no facts rel runs out h reason
+            git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || rc=$?
+            case "$rc" in 0) in_git=yes ;; 2) ;; *) echo "::error::git ls-remote failed ($rc)"; return 1 ;; esac
+            if [ "$in_git" = yes ]; then
+              facts=$(bash .github/scripts/release-facts.sh "$full-r$4" "$hub" "$ghcr" latest "${full%%.*}" "${full%.*}" "$full")
+              rel=no
+              if gh api "repos/$GH_REPO/releases/tags/$tag" --silent 2>/tmp/rel.err; then rel=yes
+              elif ! grep -q 'HTTP 404' /tmp/rel.err; then cat /tmp/rel.err; return 1; fi
+              if grep -qx 'mutable_ok=yes' <<<"$facts" && [ "$rel" = yes ]; then complete=yes; fi
+            fi
+            runs=$(gh run list --workflow "$wf" --branch "$tag" --limit 50 --json status,conclusion -q '.[] | "\(.status) \(.conclusion)"')
+            out=$(TAG_IN_GIT=$in_git COMPLETE=$complete RUNS=$runs bash .github/scripts/release-health.sh)
+            h=$(sed -n 's/^health=//p' <<<"$out"); reason=$(sed -n 's/^reason=//p' <<<"$out")
+            echo "$tag: $h — $reason"
+            case "$h" in
+              redispatch)
+                echo "::warning::$tag is not fully published ($reason) — dispatching $wf again"
+                gh workflow run "$wf" --ref "$tag" -f tag="$tag" ;;
+              give-up)
+                local title="Release $tag is incomplete"
+                if [ -z "$(gh issue list --state open --json number,title -q ".[] | select(.title==\"$title\") | .number")" ]; then
+                  gh issue create --title "$title" --assignee euca01 --body "$(printf \
+                    '%s: %s. No further automatic dispatch. Check the %s runs for this tag; a tag that cannot be finished is replaced by a new revision: gh workflow run upstream-check.yml -f rebuild=<resolver|sidecar>.\n\nRun: %s' \
+                    "$tag" "$reason" "$wf" "$RUN_URL")"
+                fi ;;
+            esac
+          }
+          # The pins as checked out: an image being re-released by this run
+          # (action != none) is skipped — its new tag supersedes the old one.
+          # shellcheck disable=SC1091
+          . ./versions.env
+          if [ "$ACTION" = none ]; then
+            health release.yml v "$UNBOUND_VERSION" "$REVISION" esitcparis/unbound-distroless ghcr.io/esitc-paris/unbound-distroless
+          fi
+          if [ "$UPDATER_ACTION" = none ]; then
+            health updater.yml updater-v "$UPDATER_VERSION" "$UPDATER_REVISION" esitcparis/unbound-autoupdate ghcr.io/esitc-paris/unbound-autoupdate
+          fi
+
+      - name: Fail the run if the rescan or its code-scanning upload did not complete
+        # After the commit step on purpose: a version or base update has been
+        # published by now; only the rescan's verdict or its upload is
+        # missing, and the failure (and the issue below) is how that becomes
+        # visible.
+        if: needs.rescan.result != 'success' || needs.code-scanning.result != 'success'
+        env:
+          RESCAN_RESULT: ${{ needs.rescan.result }}
+          UPLOAD_RESULT: ${{ needs.code-scanning.result }}
+        run: |
+          echo "::error::published-image rescan: '$RESCAN_RESULT', code-scanning upload: '$UPLOAD_RESULT' — see those jobs"
+          exit 1
+
       - name: Notify admin on failure
         # cancelled() too: a job that hits timeout-minutes is cancelled, not
         # failed, and would otherwise open no issue.
@@ -230,7 +588,7 @@ jobs:
           TITLE="Upstream check is failing"
           NUM=$(gh issue list --state open --json number,title \
             -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
-          BODY="The hourly upstream check (dispatched by deploy/unbound-upstream-check) failed. Investigate: $RUN_URL"
+          BODY="The hourly upstream check (dispatched by deploy/unbound-upstream-check) failed, or its published-image rescan did. Investigate: $RUN_URL"
           if [ -n "$NUM" ]; then
             gh issue comment "$NUM" --body "Failed again: $RUN_URL"
           else

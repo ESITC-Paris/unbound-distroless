@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ESITC-Paris/unbound-distroless/security/advisories/new
+    about: Report privately. Do not open a public issue (SECURITY.md).
+  - name: Bug in Unbound itself
+    url: https://github.com/NLnetLabs/unbound/issues
+    about: Behaviour that a plain Unbound build shows too belongs to NLnet Labs.

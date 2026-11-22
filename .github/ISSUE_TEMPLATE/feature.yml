@@ -1,0 +1,17 @@
+name: Feature request
+description: Something the image or the sidecar should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need, and why
+      description: The problem first. A proposed solution is welcome but optional.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead
+    validations:
+      required: false

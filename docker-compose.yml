@@ -1,56 +1,38 @@
-# Production example for unbound-distroless.
-# The image healthcheck (unbound-control over a unix socket) is built in.
+# unbound-distroless — the Compose file the README's "Run it" section fetches.
+# tests/quickstart.sh starts it as written (only the image, the container name
+# and the published host port are overridden) and checks resolution and DNSSEC.
+#
+# Production: replace the tag below with an X.Y.Z-rN tag or an @sha256:
+# digest taken from https://github.com/ESITC-Paris/unbound-distroless/releases
+# (or keep `:1` and add the update sidecar: updater/README.md).
 services:
   unbound:
-    image: esitcparis/unbound-distroless:latest
+    image: esitcparis/unbound-distroless:1
     container_name: unbound
     restart: unless-stopped
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]   # binding :53 as UID 65532 (docs/usage.md#port-53-and-capabilities)
+    security_opt: ["no-new-privileges:true"]
+    # The image writes only to /var/lib/unbound (volume below) and
+    # /run/unbound (control socket, PID file).
+    read_only: true
+    tmpfs:
+      - "/run/unbound:uid=65532,gid=65532"
     ports:
       - "53:53/udp"
       - "53:53/tcp"
     volumes:
-      # Persist the DNSSEC root trust anchor across restarts (RFC 5011).
-      - unbound-rootkey:/var/lib/unbound
-      # Optional: your own configuration.
+      # DNSSEC trust anchor (RFC 5011 updates) and the hyperlocal root zone copy.
+      # Named unbound-rootkey in versions of this file before 2026-11: keep that
+      # name here if you replace an old file, or the anchor state starts over.
+      - unbound-data:/var/lib/unbound
+      # Your own configuration, once you have one (README, "Configuration"):
       # - ./unbound.conf:/etc/unbound/unbound.conf:ro
-
-  # ── Automatic updates + Prometheus metrics (optional) ──────────────────────
-  # Uncomment both services below AND the autoupdate-state volume at the end of
-  # this file, then replace /opt/unbound with this project's absolute
-  # directory — the same path must appear on both sides of that bind mount.
-  # Read updater/README.md first: the Docker socket is root on the host.
-  # (Everything commented with a "#" in the first column below is the block to
-  # uncomment; see updater/compose.snippet.yml for the same thing unindented.)
-#  unbound-autoupdate:
-#    image: esitcparis/unbound-autoupdate:1
-#    restart: unless-stopped
-#    environment:
-#      INTERVAL: 1h
-#      # One Healthchecks.io check per host. The updater pings /start, success
-#      # and /fail, so every failure alerts immediately.
-#      HC_URL: https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-#      # NOTIFY_HOST: resolver-1.example   # defaults to the Docker daemon's host name
-#    volumes:
-#      - /var/run/docker.sock:/var/run/docker.sock
-#      - /opt/unbound:/opt/unbound:ro
-#      - autoupdate-state:/var/lib/unbound-autoupdate
-#
-#  unbound-metrics:
-#    image: esitcparis/unbound-autoupdate:1
-#    command: ["metrics"]
-#    restart: unless-stopped
-#    ports:
-#      - "127.0.0.1:9167:9167"
-#    volumes:
-#      - /var/run/docker.sock:/var/run/docker.sock
-#      - autoupdate-state:/var/lib/unbound-autoupdate:ro
+    ulimits:
+      # outgoing-range 4096 x num-threads 2 in the shipped unbound.conf.
+      nofile:
+        soft: 16384
+        hard: 16384
 
 volumes:
-  unbound-rootkey:
-#  autoupdate-state:
+  unbound-data:

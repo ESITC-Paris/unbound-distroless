@@ -26,7 +26,14 @@ LABEL org.opencontainers.image.title="unbound-autoupdate" \
 # bash: arrays are used throughout. util-linux: flock.
 # tini: loop mode must forward SIGTERM so `docker compose down` is prompt.
 # busybox-extras: httpd (the /metrics endpoint) and nc.
-RUN apk upgrade --no-cache \
+# IMAGE_REVISION is consumed by this RUN so that a new sidecar revision always
+# re-runs it: with the Alpine digest unchanged the layer would otherwise come
+# back from the build cache with the packages of the last build, and a
+# revision cut to pick up Alpine security fixes would ship without them. The
+# workflows pass it; a plain `docker build` without it still works.
+ARG IMAGE_REVISION=unset
+RUN echo "sidecar revision: ${IMAGE_REVISION}" \
+ && apk upgrade --no-cache \
  && apk add --no-cache \
       bash docker-cli docker-cli-compose bind-tools curl ca-certificates \
       coreutils util-linux tini jq busybox-extras
