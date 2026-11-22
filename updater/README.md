@@ -125,6 +125,15 @@ After every cycle, the operator's tags name the images that run, so a plain
 `pull_policy: always`) followed by `up -d` would deploy what the registry
 serves under the tag, without the sidecar's checks.
 
+On the containerd image store (the default of a fresh Docker Engine 29
+install), this needs Docker Compose 5.5.0 or later on the host
+(`docker compose version`). The sidecar recreates containers with the Compose
+it ships, which is newer than 5.5.0, and Compose 5.5.0 changed the image
+identity it records on each container: an older Compose sees a container
+created by a newer one as out of date, and its next `up -d` recreates it on
+the same image. Nothing unverified is deployed, but the resolver restarts.
+The classic image store is not affected.
+
 ## The Docker socket is root on the host
 
 The sidecar mounts `/var/run/docker.sock`. Whoever can use that socket can

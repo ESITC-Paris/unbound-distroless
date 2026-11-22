@@ -852,7 +852,7 @@ t_validate_dnssec_optional() {
   sed -i.bak 's/^  module-config: "validator iterator"$/  module-config: "iterator"/' "$dir/unbound.conf"
   rm -f "$dir/unbound.conf.bak"
   grep -q '^  module-config: "iterator"$' "$dir/unbound.conf" || fail "test setup: could not disable the validator"
-  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d --force-recreate unbound ) >/dev/null 2>&1
+  operator_compose "$dir" up -d --force-recreate unbound >/dev/null 2>&1
 
   local out
   out=$(updater_exec "$dir" /bin/bash -c '
@@ -1081,7 +1081,7 @@ LABEL test.keyed=\"0\"" "unbound-unkeyed:1")
   docker push -q "$twin" >/dev/null
   docker image rm "$signed" "$twin" >/dev/null 2>&1 || true
   fixture_set_image_raw "$dir" 'unbound-distroless' "$twin"
-  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d unbound ) >/dev/null 2>&1 \
+  operator_compose "$dir" up -d unbound >/dev/null 2>&1 \
     || fail "could not redeploy the resolver on the twin-tagged image"
   local dd
   dd=$(updater_exec "$dir" /bin/bash -c '
@@ -2583,8 +2583,7 @@ LABEL test.selftrust=\"2-unsigned\"" "unbound-autoupdate:1")
   # tells an operator to. The pin must win.
   registry_sign "$dir" "$d2"
   printf 'services:\n  updater:\n    image: %s\n  metrics:\n    image: %s\n' "$d1" "$d1" > "$dir/pin.yml"
-  docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" \
-    -f "$dir/docker-compose.yml" -f "$dir/pin.yml" up -d --no-deps updater metrics >/dev/null 2>&1 \
+  operator_compose "$dir" -f "$dir/docker-compose.yml" -f "$dir/pin.yml" up -d --no-deps updater metrics >/dev/null 2>&1 \
     || fail "setup: could not pin the sidecar services"
   registry_forward "$dir"
   local cid_pinned; cid_pinned=$(fixture_service_cid "$dir" updater)

@@ -84,6 +84,48 @@ local_names_intact() {
   done
 }
 
+# operator_compose <dir> <compose args…> — `docker compose -p <project> …`
+# run in the project directory, as the operator runs it: creating the
+# fixture, the operator's own `up -d`, an override applied by hand.
+#
+# With a Compose the sidecar supports as the operator's (updater/README.md):
+# on the containerd image store, Compose 5.5.0 changed the image identity it
+# stamps on every container (com.docker.compose.image: the platform manifest
+# digest, where earlier releases stamp the image index digest), so a Compose
+# on one side of 5.5.0 recreates — on the same image — every container one on
+# the other side created. The sidecar ships a Compose >= 5.5. The host's
+# Compose is used whenever it qualifies (always on the classic store, where
+# both generations stamp the same ID); otherwise the sidecar image's own
+# Compose stands in for a supported one, and the run says so once. CI's
+# runners ship an older Compose than the sidecar: asserting with it would
+# test that documented incompatibility, not the sidecar.
+_OPERATOR_COMPOSE=""
+_operator_compose_pick() {
+  [ -z "$_OPERATOR_COMPOSE" ] || return 0
+  local v
+  v=$(docker compose version --short 2>/dev/null); v="${v#v}"
+  if ! docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter' \
+     || printf '%s\n%s\n' 5.5.0 "$v" | sort -V -C; then
+    _OPERATOR_COMPOSE=host
+  else
+    _OPERATOR_COMPOSE=sidecar
+    info "host Compose $v predates 5.5.0 on the containerd image store: the operator's 'docker compose' runs with the sidecar image's Compose ($(docker run --rm --entrypoint docker "$UPDATER_IMAGE" compose version --short))"
+  fi
+}
+operator_compose() {
+  local dir="$1" proj; shift
+  proj=$(fixture_project "$dir")
+  # Picked by the caller's shell, not here: in a command substitution the
+  # choice (and its one-time notice) would be lost with the subshell.
+  [ -n "$_OPERATOR_COMPOSE" ] || _operator_compose_pick >&2
+  if [ "$_OPERATOR_COMPOSE" = host ]; then
+    ( cd "$dir" && docker compose -p "$proj" "$@" )
+  else
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$dir:$dir:ro" -w "$dir" \
+      --entrypoint docker "$UPDATER_IMAGE" compose -p "$proj" "$@"
+  fi
+}
+
 # compose_up_is_noop <dir> — 0 when the operator's own `docker compose up -d`,
 # run in the project directory right now, recreates nothing. After a deploy
 # by the sidecar that must hold: a different configuration hash would make
@@ -91,8 +133,9 @@ local_names_intact() {
 compose_up_is_noop() {
   local dir="$1" before after proj out
   proj=$(fixture_project "$dir")
+  _operator_compose_pick
   before=$(docker compose -p "$proj" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
-  out=$( cd "$dir" && docker compose -p "$proj" up -d 2>&1 ) || { printf '%s\n' "$out" >&2; return 1; }
+  out=$(operator_compose "$dir" up -d 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
   after=$(docker compose -p "$proj" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
   [ -n "$before" ] && [ "$before" = "$after" ] && return 0
   # Say what Compose did and what it compared: a bare "recreated" is not
@@ -111,6 +154,7 @@ compose_up_is_noop() {
     done
     docker version --format 'docker client {{.Client.Version}} server {{.Server.Version}}'
     docker compose version
+    echo "operator's 'up -d' ran with the $_OPERATOR_COMPOSE Compose"
   } >&2
   return 1
 }
@@ -173,7 +217,8 @@ volumes:
   state:
   ustate:
 YML
-  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d ) >/dev/null
+  _operator_compose_pick
+  operator_compose "$dir" up -d >/dev/null
 }
 
 fixture_project() { basename "$1" | tr -cd 'a-z0-9'; }
