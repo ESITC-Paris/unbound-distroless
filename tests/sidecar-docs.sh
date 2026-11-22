@@ -8,6 +8,11 @@
 #      file (the URL is checked to be that file on main); the following
 #      `docker compose` lines are not run (they would bind port 53). The
 #      merged project is then checked with `docker compose config`.
+#   1b. The complete file the root README prints for "Resolver with automatic
+#      updates" (the block after `<!-- quickstart:compose-sidecar`) is the
+#      same project as docker-compose.yml merged with
+#      updater/compose.snippet.yml, once `docker compose config` has parsed
+#      both in /opt/unbound.
 #   2. docs/production/docker-compose.yml: `docker compose config` refuses it
 #      without HC_URL and accepts it with one, and the result is checked.
 #   3. Both projects are checked for what the sidecar requires at run time:
@@ -120,6 +125,27 @@ if cfg=$(cd "$proj" && docker compose config --format json 2>"$WORK/err"); then
   pass "updater/README.md install recipe: docker-compose.yml + docker-compose.override.yml validate and meet the sidecar's requirements"
 else
   fail "install recipe: docker compose config failed: $(cat "$WORK/err")"
+fi
+
+# ── 1b. The root README's complete file ───────────────────────────────────────
+mkdir -p "$WORK/readme"
+awk -v m="<!-- quickstart:compose-sidecar" '
+  index($0, m) == 1 { found = 1; next }
+  found && !inside && /^```/ { inside = 1; next }
+  inside && /^```/ { exit }
+  inside { print }
+' "$ROOT/README.md" > "$WORK/readme/docker-compose.yml"
+if [ ! -s "$WORK/readme/docker-compose.yml" ]; then
+  fail "README.md: no <!-- quickstart:compose-sidecar block"
+elif ! got=$(docker compose -f "$WORK/readme/docker-compose.yml" --project-directory /opt/unbound config --format json 2>"$WORK/err"); then
+  fail "README.md sidecar file: docker compose config failed: $(cat "$WORK/err")"
+elif ! want=$(docker compose -f "$ROOT/docker-compose.yml" -f "$ROOT/updater/compose.snippet.yml" --project-directory /opt/unbound config --format json 2>"$WORK/err"); then
+  fail "docker-compose.yml + compose.snippet.yml: docker compose config failed: $(cat "$WORK/err")"
+elif ! diff <(jq -S . <<<"$got") <(jq -S . <<<"$want") >&2; then
+  fail "README.md sidecar file differs from docker-compose.yml + updater/compose.snippet.yml"
+else
+  check_project "README.md sidecar file" /opt/unbound "$got"
+  pass "README.md sidecar file: same project as docker-compose.yml + updater/compose.snippet.yml"
 fi
 
 # ── 2. The reference production project ───────────────────────────────────────

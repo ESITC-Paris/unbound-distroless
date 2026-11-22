@@ -1,6 +1,7 @@
-# unbound-distroless — the Compose file the README's "Run it" section fetches.
-# tests/quickstart.sh starts it as written (only the image, the container name
-# and the published host port are overridden) and checks resolution and DNSSEC.
+# unbound-distroless — the Compose file of the README's "Run it" section, with
+# its comments. tests/quickstart.sh checks that the README prints this same
+# project, starts it (only the image, the container name and the published
+# host port are overridden) and checks resolution and DNSSEC.
 #
 # Production: replace the tag below with an X.Y.Z-rN tag or an @sha256:
 # digest taken from https://github.com/ESITC-Paris/unbound-distroless/releases

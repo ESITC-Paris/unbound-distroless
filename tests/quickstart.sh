@@ -10,8 +10,10 @@
 #   try  the published image reference -> the image under test ($1);
 #        the container name unbound-try  -> a unique name;
 #        host port 5053                  -> a free ephemeral port.
-#   run  the `curl` of docker-compose.yml -> a copy of this checkout's file
-#        (the URL is checked to be that file on main);
+#   run  the Compose file the README prints (the block after
+#        `<!-- quickstart:compose`) is saved as docker-compose.yml, after
+#        `docker compose config` has shown it to be the same project as this
+#        checkout's docker-compose.yml;
 #        `docker compose …` runs with COMPOSE_PROJECT_NAME (unique) and
 #        COMPOSE_FILE adding an override that sets only the image, the
 #        container name and the published ports;
@@ -37,7 +39,6 @@ IMG="${1:?usage: tests/quickstart.sh <image>}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 README="$ROOT/README.md"
 PUBLISHED=esitcparis/unbound-distroless
-RAW_URL=https://raw.githubusercontent.com/ESITC-Paris/unbound-distroless/main/docker-compose.yml
 
 ID="qs-$$-$RANDOM"
 TRY_NAME="unbound-$ID-try"
@@ -51,13 +52,14 @@ pass() { echo "PASS: $*"; }
 cleanup() {
   docker rm -f "$TRY_NAME" >/dev/null 2>&1 || true
   if [ -n "${COMPOSE_FILE:-}" ]; then
-    (cd "$WORK/run/unbound" 2>/dev/null && docker compose down -v --remove-orphans >/dev/null 2>&1) || true
+    (cd "$WORK/run" 2>/dev/null && docker compose down -v --remove-orphans >/dev/null 2>&1) || true
   fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+command -v jq >/dev/null || fail "jq not found"
 command -v dig >/dev/null || fail "dig not found (install bind9-dnsutils / dnsutils)"
 docker compose version >/dev/null 2>&1 || fail "docker compose not found"
 docker image inspect "$IMG" >/dev/null 2>&1 || fail "image $IMG not found — build it first"
@@ -149,10 +151,24 @@ pass "try: docker run on 127.0.0.1, NOERROR with ad, bogus signature SERVFAIL, s
 RUN=$(block run)
 [ -n "$RUN" ] || fail "no quickstart:run block in README.md"
 RUN_PORT=$(free_port)
-grep -qxF "curl -fsSLO $RAW_URL" <<<"$RUN" || fail "run: no 'curl -fsSLO $RAW_URL' line"
+
+# The file the README prints is the shipped one: same project once Compose
+# has parsed both (comments and YAML layout aside).
+F="$ROOT/docker-compose.yml"
+mkdir -p "$WORK/cmp/readme/unbound" "$WORK/cmp/shipped/unbound" "$WORK/run"
+block compose > "$WORK/cmp/readme/unbound/docker-compose.yml"
+[ -s "$WORK/cmp/readme/unbound/docker-compose.yml" ] || fail "no quickstart:compose block in README.md"
+cp "$F" "$WORK/cmp/shipped/unbound/docker-compose.yml"
+for side in readme shipped; do
+  (cd "$WORK/cmp/$side/unbound" && env -u COMPOSE_PROJECT_NAME docker compose config --format json) \
+    > "$WORK/cmp/$side.json" 2>"$WORK/cmp/$side.err" \
+    || fail "run: docker compose config refused the $side file: $(cat "$WORK/cmp/$side.err")"
+done
+diff <(jq -S . "$WORK/cmp/readme.json") <(jq -S . "$WORK/cmp/shipped.json") >&2 \
+  || fail "run: the Compose file in README.md differs from docker-compose.yml"
+pass "run: the Compose file in README.md is the shipped docker-compose.yml"
 
 # The shipped file, before any override: the README says port 53, hardened.
-F="$ROOT/docker-compose.yml"
 grep -qE "^[[:space:]]*image: $PUBLISHED:" "$F" || fail "docker-compose.yml: image is not $PUBLISHED:<tag>"
 grep -qF -- '- "53:53/udp"' "$F" || fail "docker-compose.yml: does not publish 53:53/udp"
 grep -qF -- '- "53:53/tcp"' "$F" || fail "docker-compose.yml: does not publish 53:53/tcp"
@@ -168,20 +184,18 @@ services:
       - "127.0.0.1:$RUN_PORT:53/tcp"
 EOF
 
-mkdir -p "$WORK/run"
 cd "$WORK/run"
+cp "$WORK/cmp/readme/unbound/docker-compose.yml" docker-compose.yml
 while IFS= read -r line; do
   [ -n "${line// /}" ] || continue
   case "$line" in
-    "curl -fsSLO $RAW_URL")
-      cp "$F" docker-compose.yml ;;
     "docker compose "*)
       # Set here, after the README's own `cd`: relative to the project dir.
       export COMPOSE_FILE="docker-compose.yml:$OVERRIDE"
       eval "$line" >/dev/null 2>&1 || { docker compose logs 2>&1 | tail -20; fail "run: '$line' failed"; } ;;
     dig\ *)
       check_dig "$(subst "$line" "@127.0.0.1 " "@127.0.0.1 -p $RUN_PORT ")" ;;
-    *) eval "$line" >/dev/null ;;
+    *) fail "run: unexpected line (extend tests/quickstart.sh): $line" ;;
   esac
 done <<<"$RUN"
 [ -n "${COMPOSE_FILE:-}" ] || fail "run: no 'docker compose' line"
@@ -197,6 +211,6 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$RUN_NAME")" = healthy ] || fail "run: container never became healthy"
-pass "run: docker compose up from the shipped file (read-only, cap_drop ALL + NET_BIND_SERVICE, no-new-privileges, healthy), NOERROR with ad, bogus signature SERVFAIL"
+pass "run: docker compose up from the README's file (read-only, cap_drop ALL + NET_BIND_SERVICE, no-new-privileges, healthy), NOERROR with ad, bogus signature SERVFAIL"
 
 echo "ALL QUICKSTART TESTS PASSED"
