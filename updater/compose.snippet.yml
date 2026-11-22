@@ -1,21 +1,25 @@
-# Drop these two services into the same docker-compose.yml as your resolver,
-# and the autoupdate-state volume into its top-level `volumes:` section.
-# Replace /opt/unbound with YOUR project directory: the same absolute path
-# must appear on both sides of the bind mount, because Compose resolves
-# relative bind mounts against the project directory and the Docker daemon
-# then applies them on the host.
+# The update sidecar, as a Compose override file for the project of the
+# README's "Run it" section. Installed next to docker-compose.yml as
+# docker-compose.override.yml, which `docker compose` reads automatically
+# (updater/README.md, "Install"; tests/sidecar-docs.sh runs that recipe).
 #
-# The Docker socket is root on the host. No container updater can do
-# without it; see updater/README.md before enabling this.
+# /opt/unbound stands for the project directory. The install command replaces
+# it with the real path: it must be the same on both sides of the bind mount
+# (updater/README.md, "The same-absolute-path rule").
+#
+# The Docker socket is root on the host: read updater/README.md first.
+services:
   unbound-autoupdate:
     image: esitcparis/unbound-autoupdate:1
     restart: unless-stopped
+    # A stop during a swap lets the swap finish first (updater/README.md,
+    # "Signals"); Docker's default 10 s would cut it short.
+    stop_grace_period: 2m
     environment:
       INTERVAL: 1h
-      # One Healthchecks.io check per host. The updater pings /start, success
-      # and /fail, so every failure alerts immediately.
-      HC_URL: https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-      # NOTIFY_HOST: resolver-1.example   # defaults to the Docker daemon's host name
+      # Healthchecks.io check URL: /start, success and /fail pings per cycle.
+      # HC_URL: https://hc-ping.com/<uuid>
+      # NOTIFY_HOST: resolver-1.example   # default: the Docker daemon's host name
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/unbound:/opt/unbound:ro

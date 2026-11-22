@@ -6,7 +6,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 UPDATER_IMAGE="${UPDATER_IMAGE:-unbound-autoupdate:test}"
 TEST_TMPDIR="${TEST_TMPDIR:-/tmp}"
 
-REGISTRY_NAME="upd-test-registry"
+# Per run: the daemon is shared, and registry_up removes any container of this
+# name before starting its own — a fixed name would kill a concurrent run's.
+REGISTRY_NAME="upd-test-registry-$$"
 REGISTRY_HOST="127.0.0.1:5000"
 
 # Every fixture directory ever created, so a leftover one can be reaped at
@@ -36,6 +38,126 @@ retag_track() { _MOVED_TAGS+=("$1"); }
 # later run that needs that port, not just the fixture that created it.
 declare -a _BLOCKER_CONTAINERS=()
 blocker_track() { _BLOCKER_CONTAINERS+=("$1"); }
+
+# Every image this suite built under a name of its own (hooks_image), removed
+# at exit for the same reason as the rest: fail()'s `exit` skips RETURN traps.
+declare -a _BUILT_IMAGES=()
+_TRACK_FILE="$TEST_TMPDIR/upd-built-images-$$"
+
+# hooks_image — the test image with the suite's one test hook added, built
+# once per run and named in HOOKS_IMAGE (a variable, not output: called in a
+# command substitution, the cleanup registration would be lost with the
+# subshell). The shipped script reads no test variable at all; this derived
+# copy inserts, at the top of post_swap_validated, a check of
+# _TEST_FORCE_POSTSWAP_FAIL that forces the post-swap verdict to FAIL, so the
+# rollback can be exercised deterministically. Same repository as
+# UPDATER_IMAGE, so discovery treats it as the sidecar's own image.
+hooks_image() {
+  local ref="${UPDATER_IMAGE%:*}:hooks-$$"
+  if ! docker image inspect "$ref" >/dev/null 2>&1; then
+    printf '%s\n' "FROM $UPDATER_IMAGE" \
+      "RUN sed -i '/^post_swap_validated() {\$/a\\  [ \"\${_TEST_FORCE_POSTSWAP_FAIL:-0}\" = 1 ] \&\& { log_warn \"test hook: post-swap verdict forced to FAIL\"; return 1; }' /usr/local/bin/unbound-autoupdate \\" \
+      " && grep -q '_TEST_FORCE_POSTSWAP_FAIL' /usr/local/bin/unbound-autoupdate" \
+      | docker build -q -t "$ref" - >/dev/null || fail "could not build the test-hooks image (the post_swap_validated seam moved?)"
+    _BUILT_IMAGES+=("$ref")
+  fi
+  # shellcheck disable=SC2034  # read by tests/updater.sh, which sources this file
+  HOOKS_IMAGE="$ref"
+}
+
+# keep_names_of <repo> — the sidecar-owned keep names (<repo>:autoupdate-…)
+# that exist for <repo>.
+keep_names_of() {
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -F "$1:autoupdate-" || true
+}
+
+# local_names_intact <tag…> — 0 when every tag, and a keep name for its
+# repository, still exist on the daemon. An idle cycle
+# must never lose either: without the operator's tag a plain `docker compose
+# up -d` pulls whatever the registry serves, unverified; without the keep
+# name a rollback has nothing to go back to.
+local_names_intact() {
+  local t
+  for t in "$@"; do
+    docker image inspect "$t" >/dev/null 2>&1 || { echo "missing local tag: $t" >&2; return 1; }
+    [ -n "$(keep_names_of "${t%:*}")" ] || { echo "missing keep name for ${t%:*}" >&2; return 1; }
+  done
+}
+
+# operator_compose <dir> <compose args…> — `docker compose -p <project> …`
+# run in the project directory, as the operator runs it: creating the
+# fixture, the operator's own `up -d`, an override applied by hand.
+#
+# With a Compose the sidecar supports as the operator's (updater/README.md):
+# on the containerd image store, Compose 5.5.0 changed the image identity it
+# stamps on every container (com.docker.compose.image: the platform manifest
+# digest, where earlier releases stamp the image index digest), so a Compose
+# on one side of 5.5.0 recreates — on the same image — every container one on
+# the other side created. The sidecar ships a Compose >= 5.5. The host's
+# Compose is used whenever it qualifies (always on the classic store, where
+# both generations stamp the same ID); otherwise the sidecar image's own
+# Compose stands in for a supported one, and the run says so once. CI's
+# runners ship an older Compose than the sidecar: asserting with it would
+# test that documented incompatibility, not the sidecar.
+_OPERATOR_COMPOSE=""
+_operator_compose_pick() {
+  [ -z "$_OPERATOR_COMPOSE" ] || return 0
+  local v
+  v=$(docker compose version --short 2>/dev/null); v="${v#v}"
+  if ! docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter' \
+     || printf '%s\n%s\n' 5.5.0 "$v" | sort -V -C; then
+    _OPERATOR_COMPOSE=host
+  else
+    _OPERATOR_COMPOSE=sidecar
+    info "host Compose $v predates 5.5.0 on the containerd image store: the operator's 'docker compose' runs with the sidecar image's Compose ($(docker run --rm --entrypoint docker "$UPDATER_IMAGE" compose version --short))"
+  fi
+}
+operator_compose() {
+  local dir="$1" proj; shift
+  proj=$(fixture_project "$dir")
+  # Picked by the caller's shell, not here: in a command substitution the
+  # choice (and its one-time notice) would be lost with the subshell.
+  [ -n "$_OPERATOR_COMPOSE" ] || _operator_compose_pick >&2
+  if [ "$_OPERATOR_COMPOSE" = host ]; then
+    ( cd "$dir" && docker compose -p "$proj" "$@" )
+  else
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$dir:$dir:ro" -w "$dir" \
+      --entrypoint docker "$UPDATER_IMAGE" compose -p "$proj" "$@"
+  fi
+}
+
+# compose_up_is_noop <dir> — 0 when the operator's own `docker compose up -d`,
+# run in the project directory right now, recreates nothing. After a deploy
+# by the sidecar that must hold: a different configuration hash would make
+# that routine command (or a configuration-management run) restart DNS.
+compose_up_is_noop() {
+  local dir="$1" before after proj out
+  proj=$(fixture_project "$dir")
+  _operator_compose_pick
+  before=$(docker compose -p "$proj" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
+  out=$(operator_compose "$dir" up -d 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+  after=$(docker compose -p "$proj" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
+  [ -n "$before" ] && [ "$before" = "$after" ] && return 0
+  # Say what Compose did and what it compared: a bare "recreated" is not
+  # enough to tell an image-identity mismatch from a configuration one.
+  {
+    echo "--- compose up -d:"; printf '%s\n' "$out"
+    echo "--- containers before: $(tr '\n' ' ' <<<"$before")"
+    echo "--- containers after:"
+    local c img
+    for c in $after; do
+      img=$(docker inspect "$c" --format '{{.Config.Image}}')
+      echo "$c service=$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.service"}}')" \
+        "declared=$img container.Image=$(docker inspect "$c" --format '{{.Image}}')" \
+        "label.image=$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.image"}}')" \
+        "tag.Id=$(docker image inspect "$img" --format '{{.Id}}' 2>&1)"
+    done
+    docker version --format 'docker client {{.Client.Version}} server {{.Server.Version}}'
+    docker compose version
+    echo "operator's 'up -d' ran with the $_OPERATOR_COMPOSE Compose"
+  } >&2
+  return 1
+}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
@@ -95,14 +217,93 @@ volumes:
   state:
   ustate:
 YML
-  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d ) >/dev/null
+  _operator_compose_pick
+  operator_compose "$dir" up -d >/dev/null
+  _fixture_fresh_root_zone "$dir"
+}
+
+# _root_zone_expiry <volume> — expiration (YYYYMMDDHHMMSS) of the root DNSKEY
+# signature in the zone file a resolver state volume holds; empty when there
+# is no zone file.
+_root_zone_expiry() {
+  docker run --rm -v "$1:/v:ro" --entrypoint awk "$UPDATER_IMAGE" \
+    '$4 == "RRSIG" && $5 == "DNSKEY" { print $9; exit }' /v/root.zone 2>/dev/null || true
+}
+
+# _fixture_fresh_root_zone <dir> — give the fixture resolver's state volume
+# what a production volume holds: a root zone (RFC 8806 copy, unbound.conf's
+# auth-zone) that is still validly signed.
+#
+# A resolver image bakes the root zone of its build day, and a new named
+# volume is seeded with it. OLD_REF is a pinned release from months ago: its
+# zone's signatures have long expired. unbound loads such a file, fails its
+# ZONEMD check, falls back to plain recursion — and does not replace the file
+# (observed: still the baked serial minutes later), whereas with NO file it
+# transfers the current zone at once and writes it. Every canary cloned from
+# that volume, and every container recreated on it, then starts on the
+# expired zone, and depending on how its first queries race with the
+# fallback it can SERVFAIL ("No DNSKEY record … while building chain of
+# trust", then the key "marked as invalid") for longer than any gate waits:
+# on CI that failed a canary after 90 s and a post-swap gate after 45 s,
+# while the very same image passed in the next container. A production
+# volume holds the zone its running resolver keeps transferring; so the
+# expired file is removed here, once, and the fixture resolver fetches a
+# current one. Not fetching one (no zone transfer possible from this
+# network) is reported, not fatal: unbound then simply recurses without it.
+_fixture_fresh_root_zone() {
+  local dir="$1" vol cid now exp _i
+  vol="$(fixture_project "$dir")_state"
+  now=$(date -u +%Y%m%d%H%M%S)
+  exp=$(_root_zone_expiry "$vol")
+  [ -n "$exp" ] || return 0
+  [[ "$exp" > "$now" ]] && return 0
+  cid=$(fixture_service_cid "$dir" unbound)
+  [ -n "$cid" ] || return 0
+  docker stop -t 5 "$cid" >/dev/null
+  docker run --rm -v "$vol:/v" --entrypoint rm "$UPDATER_IMAGE" -f /v/root.zone
+  docker start "$cid" >/dev/null
+  for _i in $(seq 1 30); do
+    exp=$(_root_zone_expiry "$vol")
+    [ -n "$exp" ] && [[ "$exp" > "$now" ]] && return 0
+    sleep 2
+  done
+  info "the fixture resolver did not fetch a current root zone within 60 s; it runs without one"
 }
 
 fixture_project() { basename "$1" | tr -cd 'a-z0-9'; }
 
+# fixture_destroy <dir> — removes EVERYTHING a fixture may have left on the
+# shared daemon, whatever state the test died in. `compose down` alone is not
+# enough: registry_forward attaches the throwaway registry to the project
+# network, and Docker refuses to remove a network that still has an endpoint,
+# so every registry test used to leak its `<project>_default` network. A
+# cycle interrupted mid-way also leaves the sidecar's canary objects and
+# possibly a self-update helper behind.
 fixture_destroy() {
-  local dir="$1"
-  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" down -v --remove-orphans ) >/dev/null 2>&1 || true
+  local dir="$1" p net c
+  p=$(fixture_project "$dir")
+  net="${p}_default"
+  for c in $(docker ps -aq --filter label=unbound-autoupdate.helper=1 --filter "volume=$dir" 2>/dev/null); do
+    docker rm -f "$c" >/dev/null 2>&1 || true
+  done
+  docker rm -f "unbound-canary-$p" >/dev/null 2>&1 || true
+  for c in $(docker network inspect "$net" --format '{{range $id, $e := .Containers}}{{$id}} {{end}}' 2>/dev/null); do
+    case "$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)" in
+      "$p") : ;;
+      *) docker network disconnect -f "$net" "$c" >/dev/null 2>&1 || true ;;
+    esac
+  done
+  if [ -f "$dir/docker-compose.yml" ]; then
+    docker compose -p "$p" --project-directory "$dir" -f "$dir/docker-compose.yml" \
+      down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+  # Belt and braces for anything `down` could not reach (no compose file left,
+  # or a container it could not stop): by project label and by name.
+  for c in $(docker ps -aq --filter "label=com.docker.compose.project=$p" 2>/dev/null); do
+    docker rm -f "$c" >/dev/null 2>&1 || true
+  done
+  docker network rm "$net" "unbound-canary-net-$p" >/dev/null 2>&1 || true
+  docker volume rm "${p}_state" "${p}_ustate" "unbound-canary-vol-$p" >/dev/null 2>&1 || true
   rm -rf "$dir"
 }
 
@@ -126,27 +327,70 @@ fixture_set_image_raw() {
 # Without it `compose pull` fails first and the guard under test is never
 # reached (see T6/T8 below).
 registry_up() {
-  docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$REGISTRY_NAME" >/dev/null 2>&1 || true
+  # A new registry is a new world: local images named after the previous one
+  # (an earlier test's tags, moved by its own cycles) would otherwise stand
+  # in for what this test publishes.
+  _registry_local_images_rm
   docker run -d --name "$REGISTRY_NAME" -p 127.0.0.1:5000:5000 \
     registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 >/dev/null
+  # Probed from INSIDE the registry container: the suite may drive a remote
+  # daemon (DOCKER_HOST, e.g. a docker:dind used to test the classic image
+  # store), where this host's loopback is not the daemon's.
   local _i
   for _i in $(seq 1 30); do
-    curl -fsS "http://$REGISTRY_HOST/v2/" >/dev/null 2>&1 && return 0
+    docker exec "$REGISTRY_NAME" wget -q -O /dev/null "http://127.0.0.1:5000/v2/" >/dev/null 2>&1 && return 0
     sleep 1
   done
   fail "local registry never became ready"
 }
 
-registry_down() { docker rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true; }
+# _registry_local_images_rm — every local image named after the throwaway
+# registry. REGISTRY_HOST is this suite's own loopback registry, so nothing
+# else lives under that name.
+_registry_local_images_rm() {
+  docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
+    | awk -v h="$REGISTRY_HOST/" 'index($1, h) == 1 { print $2 }' | sort -u \
+    | while IFS= read -r ref; do docker image rm -f "$ref" >/dev/null 2>&1 || true; done
+}
+
+registry_down() { docker rm -fv "$REGISTRY_NAME" >/dev/null 2>&1 || true; }
 
 # registry_publish <dockerfile-text> <repo:tag> — builds and pushes, echoes
 # the ref. The repo name must contain "unbound", which discovery requires to
 # recognise the target service.
+#
+# The local build tag is REMOVED after the push. A production host holds an
+# image only under the tag it was pulled by, and on the containerd image
+# store an image whose only tag moves away can lose its record entirely;
+# keeping an extra local tag on every test image hid exactly that class of
+# defect. Assertions identify images by their test LABEL (service_label), or
+# by registry digest (registry_digest), never by a local tag.
+#
+# Publishing must not disturb the LOCAL tag either: a fixture may already run
+# an image pulled under that very tag, and on a production host the tag is
+# not moved by a release happening in the registry. Whatever the tag named
+# before is held under a temporary name across the build and push, and put
+# back afterwards (on the containerd store, an image whose only name moves
+# away can lose its record — the hold is what keeps it).
 registry_publish() {
-  local ref="$REGISTRY_HOST/$2"
+  local ref="$REGISTRY_HOST/$2" hold="$REGISTRY_HOST/upd-hold:$$" had=0
+  printf '%s\n' "$ref" >> "$_TRACK_FILE"
+  if docker image inspect "$ref" >/dev/null 2>&1; then docker tag "$ref" "$hold" && had=1; fi
   printf '%s\n' "$1" | docker build -q -t "$ref" - >/dev/null
   docker push -q "$ref" >/dev/null
+  docker image rm "$ref" >/dev/null 2>&1 || true
+  if [ "$had" = 1 ]; then docker tag "$hold" "$ref"; docker image rm "$hold" >/dev/null 2>&1 || true; fi
   printf '%s\n' "$ref"
+}
+
+# service_label <dir> <service> <label> — the label as the service's running
+# CONTAINER carries it: which image runs, without any image record.
+service_label() {
+  local cid
+  cid=$(fixture_service_cid "$1" "$2")
+  [ -n "$cid" ] || { echo ""; return 0; }
+  docker inspect "$cid" --format "{{index .Config.Labels \"$3\"}}" 2>/dev/null || echo ""
 }
 
 # registry_forward <dir> — make 127.0.0.1:5000 INSIDE the fixture's sidecar
@@ -203,6 +447,36 @@ registry_sign() {
   updater_exec "$1" /bin/sh -c \
     "COSIGN_PASSWORD='' cosign sign --key /var/lib/unbound-autoupdate/testkey.key --use-signing-config=false --tlog-upload=false --yes '$2' >/dev/null 2>&1" \
     || fail "could not sign $2 with the test key"
+}
+
+# signed_resolver_fixture <dir> <repo:tag> — a fixture whose RESOLVER image
+# lives in the throwaway registry and is signed with the test key. Every image
+# a cycle canaries or recreates is now verified — the one already running
+# included — so a test that runs cycles in key mode needs a resolver signed
+# with that key: the published images are signed keyless, by the release
+# pipeline. Sets SIGNED_RESOLVER. FIXTURE_* variables pass through. Needs
+# registry_up first.
+signed_resolver_fixture() {
+  local dir="$1"
+  SIGNED_RESOLVER=$(registry_publish "FROM $MOVING_REF
+LABEL test.signed_resolver=\"$2\"" "$2")
+  fixture_create "$dir" "$SIGNED_RESOLVER"
+  registry_forward "$dir"
+  cosign_test_keys "$dir"
+  registry_sign "$dir" "$SIGNED_RESOLVER"
+}
+
+# registry_digest <ref> — repo@sha256 of <ref> as the throwaway registry
+# serves it NOW, asked of the registry itself (from inside its container, so
+# that it works whichever daemon the suite drives).
+registry_digest() {
+  local ref="$1" path repo tag d
+  path="${ref#"$REGISTRY_HOST"/}"; repo="${path%:*}"; tag="${path##*:}"
+  d=$(docker exec "$REGISTRY_NAME" wget -q -S --spider \
+        --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+        "http://127.0.0.1:5000/v2/$repo/manifests/$tag" 2>&1 \
+      | awk 'tolower($1) == "docker-content-digest:" { print $2 }' | tr -d '\r' | head -1)
+  [ -n "$d" ] && printf '%s@%s\n' "$REGISTRY_HOST/$repo" "$d"
 }
 
 # promtool_check <file> — the Prometheus text exposition format has a
@@ -287,7 +561,40 @@ _fixture_reap_leftovers() {
   for ref in "${_BLOCKER_CONTAINERS[@]:-}"; do
     [ -n "$ref" ] && docker rm -f "$ref" >/dev/null 2>&1 || true
   done
+  for ref in "${_BUILT_IMAGES[@]:-}"; do
+    [ -n "$ref" ] && docker image rm "$ref" >/dev/null 2>&1 || true
+  done
+  if [ -f "$_TRACK_FILE" ]; then
+    sort -u "$_TRACK_FILE" | while IFS= read -r ref; do
+      docker image rm "$ref" >/dev/null 2>&1 || true
+    done
+    rm -f "$_TRACK_FILE"
+  fi
+  # And every record pulled from the throwaway registry.
+  _registry_local_images_rm
+  # And what the cycles under test left on the daemon by design: the
+  # sidecar-owned <repo>:autoupdate-… keep names and images pulled by
+  # digest. Only images that did not exist when the suite started, and only
+  # in the repositories this suite deploys, are removed.
+  docker images --no-trunc --format '{{.ID}} {{.Repository}} {{.Tag}}' 2>/dev/null \
+    | while read -r ref d tag; do
+        case "$d" in esitcparis/unbound-*|"$REGISTRY_HOST"/*|"${UPDATER_IMAGE%:*}") : ;; *) continue ;; esac
+        if [[ "$tag" == autoupdate-* ]]; then
+          case " $_PRE_IMAGE_NAMES " in *" $d:$tag "*) : ;; *) docker image rm "$d:$tag" >/dev/null 2>&1 || true ;; esac
+        elif [ "$tag" = "<none>" ]; then
+          case " $_PRE_IMAGE_IDS " in *" $ref "*) : ;; *) docker image rm -f "$ref" >/dev/null 2>&1 || true ;; esac
+        fi
+      done
   registry_down
   exit "$status"
 }
+# Image IDs present before the suite ran: never touched by the reaper.
+_PRE_IMAGE_IDS=$(docker images -q --no-trunc 2>/dev/null | sort -u | tr '\n' ' ')
+_PRE_IMAGE_NAMES=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | sort -u | tr '\n' ' ')
 trap _fixture_reap_leftovers EXIT
+# An interrupted run (Ctrl-C, a CI cancellation, a kill) must clean up too:
+# turning each signal into an ordinary exit is what makes bash run the EXIT
+# trap above instead of dying with the fixtures still up.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP

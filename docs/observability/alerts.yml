@@ -1,7 +1,8 @@
 # Alert rules for the unbound-distroless resolver and its update sidecar.
-# Metric names are the ones updater/lib/metrics.sh and updater/www/cgi-bin/metrics
-# actually emit. Check them with:
-#   promtool check rules docs/observability/alerts.yml
+# Every metric and label value used below is emitted by the sidecar's metrics
+# service; tests/observability.sh checks that against a real resolver, and
+# runs `promtool check config` on prometheus.yml, which loads this file.
+# What to do when one fires: docs/production.md, "Alerts".
 groups:
   - name: unbound
     rules:
@@ -10,8 +11,8 @@ groups:
         for: 2m
         labels: {severity: critical}
         annotations:
-          summary: "Unbound on {{ $labels.instance }} is not answering unbound-control"
-          description: "The metrics sidecar cannot collect statistics from the resolver container for 2 minutes."
+          summary: "Unbound on {{ $labels.instance }} cannot be scraped"
+          description: "For 2 minutes, either Prometheus could not reach /metrics or the metrics service could not run unbound-control in the resolver container."
 
       - alert: UnboundServfailRatioHigh
         expr: |
@@ -21,7 +22,7 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "More than 5% SERVFAIL on {{ $labels.instance }}"
-          description: "Upstream reachability or DNSSEC failures; check `log-servfail` lines in the resolver logs."
+          description: "Upstream reachability or DNSSEC failures; the resolver logs the reason of each SERVFAIL (log-servfail in the shipped unbound.conf)."
 
       - alert: UnboundNoDnssecValidation
         expr: |
@@ -31,56 +32,61 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "No DNSSEC-secure answers in the last hour on {{ $labels.instance }}"
-          description: "Queries are flowing but nothing validates: the validator may be disabled or the trust anchor broken."
+          description: "Queries are flowing but none validated: the validator may be disabled or the trust anchor broken."
 
-  - name: unbound-autoupdate
-    rules:
       - alert: UnboundTrustAnchorProbeStale
         expr: time() - unbound_trust_anchor_last_success_timestamp_seconds > 3 * 86400
         for: 1h
-        labels: { severity: warning }
+        labels: {severity: warning}
         annotations:
           summary: "RFC 5011 root DNSKEY probe has not succeeded for 3 days on {{ $labels.instance }}"
-          description: "The trust anchor is not being refreshed; a root KSK rollover would then break validation. Check root.key writability and connectivity to the root servers."
+          description: "The trust anchor is not being refreshed; a root KSK rollover would then break validation. Check that /var/lib/unbound is writable by UID 65532 and that the root servers are reachable."
+
+  - name: unbound-autoupdate
+    rules:
+      # The unbound_autoupdate_* series come from a file the sidecar rewrites
+      # at the end of each cycle (and the self-update helper when it
+      # finishes); a scrape only serves that file. They change at those
+      # moments only.
       - alert: UnboundAutoupdateStale
         expr: time() - unbound_autoupdate_last_cycle_timestamp_seconds > 3 * 3600
         for: 10m
         labels: {severity: warning}
         annotations:
           summary: "No update cycle for over 3 hours on {{ $labels.instance }}"
-          description: "With INTERVAL=1h the sidecar should have run three cycles. Is the unbound-autoupdate container running?"
+          description: "With INTERVAL=1h the sidecar should have finished three cycles. Is the unbound-autoupdate container running?"
 
       - alert: UnboundAutoupdateFailed
         expr: unbound_autoupdate_last_cycle_status{status=~"blocked|error"} == 1
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "Last update cycle failed ({{ $labels.status }}) on {{ $labels.instance }}"
-          description: "Signature, preflight, canary or an unexpected error stopped the last cycle. Production was not touched, except when a successful update was followed by a refused sidecar self-update (status blocked, see runbook (c)). See the sidecar logs."
+          summary: "Last update cycle ended {{ $labels.status }} on {{ $labels.instance }}"
+          description: "The sidecar's log names the reason; docs/production.md maps each reason to a runbook."
 
       - alert: UnboundAutoupdateRolledBack
         expr: increase(unbound_autoupdate_cycles_total{status="rollback"}[1h]) > 0
         labels: {severity: warning}
         annotations:
           summary: "An update was rolled back on {{ $labels.instance }}"
-          description: "The new image or configuration failed post-swap validation; production was restored and the change quarantined."
+          description: "A swap failed its post-swap checks; the previous image is serving again and the change is quarantined."
 
       - alert: UnboundAutoupdateCritical
         expr: unbound_autoupdate_last_cycle_status{status="critical"} == 1
         labels: {severity: critical}
         annotations:
-          summary: "Rollback FAILED on {{ $labels.instance }} — DNS may be down"
-          description: "The swap failed and the rollback did not restore a working resolver. Manual intervention required."
+          summary: "Rollback FAILED on {{ $labels.instance }}, DNS may be down"
+          description: "A swap failed and the rollback did not bring back a working resolver. Manual intervention required."
 
-      # The quarantine series returns to 0 by itself the moment RETRY_AFTER
-      # elapses (metrics.sh reads _quarantine_window_open), so this alert must
-      # fire WHILE the window is open — a `for:` longer than RETRY_AFTER would
-      # never fire at all. 30m is long enough to ignore the quarantine written
-      # by a cycle whose very next run clears it.
+      # 1 from the end of the cycle (or helper run) that quarantined something.
+      # Back to 0 when a later successful update (or, on the self axis, a
+      # successful self-update) clears it, or at the end of the first cycle
+      # after RETRY_AFTER (default 24h) has elapsed, not at the moment it
+      # elapses. `for:` must stay well below RETRY_AFTER or it never fires.
       - alert: UnboundAutoupdateQuarantined
         expr: unbound_autoupdate_quarantine_active == 1
         for: 30m
         labels: {severity: warning}
         annotations:
           summary: "A {{ $labels.axis }} change is quarantined on {{ $labels.instance }}"
-          description: "A failed deployment was rolled back and its image, configuration or sidecar image is held back. The sidecar retries it once RETRY_AFTER (default 24h) has elapsed — decide before then whether it should be retried."
+          description: "A failed deployment was rolled back; that image, configuration or sidecar image is not retried before RETRY_AFTER (default 24h) has elapsed."

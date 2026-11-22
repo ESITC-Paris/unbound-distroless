@@ -1,0 +1,4 @@
+# One maintainer owns everything. Review is not required by the `main`
+# ruleset (.github/settings/ruleset-main.json); this file routes review
+# requests and notifications.
+* @euca01

@@ -1,29 +1,33 @@
 name: Release
 
+# Started only by an explicit dispatch against the tag, by upstream-check.yml
+# (or a maintainer): `gh workflow run release.yml --ref vX.Y.Z-rN -f tag=vX.Y.Z-rN`.
+# There is deliberately no `on: push: tags` trigger: the monitor pushes its
+# tags with a deploy key, and a deploy-key push does trigger workflows — with
+# both triggers every tag would be released twice.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.26.0-r0)'
+        description: 'Release tag (e.g. v1.26.0-r0); dispatch with --ref set to the same tag'
         required: true
 
-permissions:
-  contents: write
-  packages: write
-  id-token: write
-  issues: write
-  attestations: write
+# Nothing at workflow level: each job states what it needs.
+permissions: {}
 
-# One `publish` group shared with updater.yml: the sidecar's integration tests pull
-# the resolver's live `:1` tag and verify its signature, and the resolver's
-# release moves that tag before signing it. Running both at once let a test
-# see an unsigned `:1` (updater-v1.0.5-r1, 2026-11-04). Queued, never
-# cancelled: a queued release is a late release, a cancelled one is a missed one.
+# Each release workflow is serialised against itself, so `latest` cannot be
+# moved by two runs at once, and never cancelled. `queue: max` keeps every
+# pending run (default concurrency keeps one and silently cancels the older
+# pending run, before any job — and so before notify-failure — can start).
+# It used to be one `publish` group shared with updater.yml, because the
+# resolver moved `:1` before signing it and the sidecar's tests verify the
+# live `:1`; mutable tags now move only after signing, so the two can run
+# side by side. A release lost anyway (timeout, a dispatch that never
+# arrived) is caught by upstream-check.yml's release-health check.
 concurrency:
-  group: publish
+  group: publish-resolver
   cancel-in-progress: false
+  queue: max
 
 env:
   DOCKERHUB_IMAGE: esitcparis/unbound-distroless
@@ -43,17 +47,22 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       full: ${{ steps.tag.outputs.full }}
       rev: ${{ steps.tag.outputs.rev }}
       minor: ${{ steps.tag.outputs.minor }}
       major: ${{ steps.tag.outputs.major }}
+      mode: ${{ steps.mode.outputs.mode }}
+      digest: ${{ steps.mode.outputs.digest }}
     steps:
       - name: Resolve tag
         id: tag
         env:
-          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RAW_TAG: ${{ inputs.tag }}
+          RUN_REF: ${{ github.ref }}
         run: |
           TAG="$RAW_TAG"
           # Reject anything that is not exactly vX.Y.Z-rN before it can reach a registry.
@@ -61,6 +70,13 @@ jobs:
             echo "bad tag format: $TAG (expected vX.Y.Z-rN)"
             exit 1
           fi
+          # The run must execute the workflow file AT that tag: the signing
+          # identity (the certificate names release.yml@<ref>), the `release`
+          # environment's tag-only policy and the verify command published
+          # with every release all rest on it. Dispatched from a branch with
+          # tag=… it would sign a tag's tree under a branch identity.
+          [ "$RUN_REF" = "refs/tags/$TAG" ] \
+            || { echo "::error::dispatched on $RUN_REF; dispatch with --ref $TAG -f tag=$TAG"; exit 1; }
           # v1.26.0-r2 -> full=1.26.0 rev=2 minor=1.26 major=1
           FULL="${TAG#v}"; FULL="${FULL%-r*}"
           REV="${TAG##*-r}"
@@ -77,6 +93,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
 
       - name: Cross-check tag against versions.env
         env:
@@ -94,8 +111,87 @@ jobs:
           [ "$REVISION" = "$TAG_REV" ] \
             || { echo "tag $TAG_NAME revision r$TAG_REV does not match versions.env (REVISION=$REVISION)"; exit 1; }
 
+      # An X.Y.Z-rN image tag is published once. Without this, re-dispatching
+      # an existing tag rebuilt its tree (which passes the cross-check above),
+      # re-pointed X.Y.Z-rN at a new digest and moved `latest` back to an old
+      # revision — validly signed. What is allowed (release-mode.sh):
+      #   nothing published                         → full release
+      #   immutable tag published AND signed by this
+      #   tag's run, tail incomplete, tag is main's
+      #   current revision                          → resume the tail only
+      #   fully published                           → nothing (duplicate)
+      #   anything else                             → refused, with the fix
+      - name: What is already published
+        id: facts
+        env:
+          TAG_MAJOR: ${{ steps.tag.outputs.major }}
+          TAG_MINOR: ${{ steps.tag.outputs.minor }}
+          TAG_FULL: ${{ steps.tag.outputs.full }}
+          TAG_REV: ${{ steps.tag.outputs.rev }}
+        run: |
+          set -o pipefail
+          bash .github/scripts/release-facts.sh "$TAG_FULL-r$TAG_REV" "$DOCKERHUB_IMAGE" "$GHCR_IMAGE" \
+            latest "$TAG_MAJOR" "$TAG_MINOR" "$TAG_FULL" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: steps.facts.outputs.hub_digest != 'absent' || steps.facts.outputs.ghcr_digest != 'absent'
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v2.6.5
+
+      - name: Signed, current on main, released?
+        id: more
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TAG_FULL: ${{ steps.tag.outputs.full }}
+          TAG_REV: ${{ steps.tag.outputs.rev }}
+          HUB_DIGEST: ${{ steps.facts.outputs.hub_digest }}
+          GHCR_DIGEST: ${{ steps.facts.outputs.ghcr_digest }}
+        run: |
+          SIGNED=no
+          if [ "$HUB_DIGEST" != absent ] && [ "$HUB_DIGEST" = "$GHCR_DIGEST" ]; then
+            SIGNED=yes
+            for ref in "$DOCKERHUB_IMAGE@$HUB_DIGEST" "$GHCR_IMAGE@$GHCR_DIGEST"; do
+              cosign verify "$ref" \
+                --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG" \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null || SIGNED=no
+            done
+          fi
+          # The revision main holds now (public repository: anonymous fetch).
+          git fetch -q --depth=1 origin main
+          MAIN_VERSION=$(git show FETCH_HEAD:versions.env | sed -n 's/^UNBOUND_VERSION=//p')
+          MAIN_REV=$(git show FETCH_HEAD:versions.env | sed -n 's/^REVISION=//p')
+          CURRENT=no
+          if [ "$MAIN_VERSION" = "$TAG_FULL" ] && [ "$MAIN_REV" = "$TAG_REV" ]; then CURRENT=yes; fi
+          # 404 is "no release"; any other error stops the run.
+          if gh api "repos/$REPO/releases/tags/$TAG" --silent 2>/tmp/release.err; then
+            RELEASE_EXISTS=yes
+          elif grep -q 'HTTP 404' /tmp/release.err; then
+            RELEASE_EXISTS=no
+          else
+            cat /tmp/release.err; exit 1
+          fi
+          printf 'signed=%s\ncurrent=%s\nrelease_exists=%s\n' "$SIGNED" "$CURRENT" "$RELEASE_EXISTS" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Decide (full, resume, nothing, or refuse)
+        id: mode
+        env:
+          HUB_DIGEST: ${{ steps.facts.outputs.hub_digest }}
+          GHCR_DIGEST: ${{ steps.facts.outputs.ghcr_digest }}
+          MUTABLE_OK: ${{ steps.facts.outputs.mutable_ok }}
+          SIGNED: ${{ steps.more.outputs.signed }}
+          CURRENT: ${{ steps.more.outputs.current }}
+          RELEASE_EXISTS: ${{ steps.more.outputs.release_exists }}
+          REBUILD_TARGET: resolver
+        run: |
+          set -o pipefail
+          bash .github/scripts/release-mode.sh | tee -a "$GITHUB_OUTPUT"
+
   build:
     needs: prepare
+    if: needs.prepare.outputs.mode == 'full'
     strategy:
       fail-fast: true
       matrix:
@@ -106,10 +202,17 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    # Docker Hub credentials live in the `release` environment, which only
+    # release tags may use (.github/settings/apply.sh).
+    environment: release
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
 
       - name: Load pinned versions
         run: cat versions.env >> "$GITHUB_ENV"
@@ -128,8 +231,25 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
 
+      # Logged in before the build and the tests, not just before the push:
+      # the base image and the test helpers (tests/port53.sh's digest-pinned
+      # debian:trixie, the sidecar suite's published images) come from Docker
+      # Hub, and an anonymous pull limit hit on the release path would fail
+      # an unattended release.
+      - name: Login to Docker Hub
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # IMAGE_REVISION is consumed by the Dockerfile's package-upgrade layer:
+      # a revision bump (base update, rescan finding) must re-run
+      # `apt-get upgrade` instead of reusing that layer from the GHA cache,
+      # or the "rebuild" ships the same libraries. The test build and the
+      # push build below get the same value, so the pushed image is the
+      # tested one (the push build reuses the tested layers).
       - name: Build image for testing (native)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -142,6 +262,7 @@ jobs:
             UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
             DEBIAN_BASE=${{ env.DEBIAN_BASE }}
             DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+            IMAGE_REVISION=${{ env.UNBOUND_VERSION }}-r${{ env.REVISION }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
 
@@ -163,12 +284,6 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Login to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -189,6 +304,7 @@ jobs:
             UNBOUND_SHA256=${{ env.UNBOUND_SHA256 }}
             DEBIAN_BASE=${{ env.DEBIAN_BASE }}
             DISTROLESS_BASE=${{ env.DISTROLESS_BASE }}
+            IMAGE_REVISION=${{ env.UNBOUND_VERSION }}-r${{ env.REVISION }}
           outputs: type=image,"name=${{ env.DOCKERHUB_IMAGE }},${{ env.GHCR_IMAGE }}",push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
 
@@ -209,10 +325,28 @@ jobs:
 
   merge:
     needs: [prepare, build]
+    # full: after the build; resume: the build is skipped and only the
+    # tail below runs; done: nothing.
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' &&
+          ((needs.prepare.outputs.mode == 'full' && needs.build.result == 'success') ||
+           (needs.prepare.outputs.mode == 'resume' && needs.build.result == 'skipped')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
       - name: Download digests
+        if: needs.prepare.outputs.mode == 'full'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/digests
@@ -234,10 +368,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create multi-arch manifest lists
+      - name: Refuse an already-published image tag (last check before writing)
+        if: needs.prepare.outputs.mode == 'full'
         env:
-          TAG_MAJOR: ${{ needs.prepare.outputs.major }}
-          TAG_MINOR: ${{ needs.prepare.outputs.minor }}
+          TAG_FULL: ${{ needs.prepare.outputs.full }}
+          TAG_REV: ${{ needs.prepare.outputs.rev }}
+          REBUILD_TARGET: resolver
+        run: bash .github/scripts/refuse-published.sh "$TAG_FULL-r$TAG_REV" "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"
+
+      # Sign before anything mutable moves. The index is created under the
+      # immutable X.Y.Z-rN tag ONLY; it is signed, verified and attested by
+      # digest; only then do latest/X/X.Y/X.Y.Z move to that same digest. A
+      # failure in between leaves X.Y.Z-rN unsigned but announced nowhere:
+      # every mutable tag still points at the previous, signed release.
+      - name: Create the multi-arch index under the immutable tag only
+        if: needs.prepare.outputs.mode == 'full'
+        env:
           TAG_FULL: ${{ needs.prepare.outputs.full }}
           TAG_REV: ${{ needs.prepare.outputs.rev }}
         run: |
@@ -250,35 +396,30 @@ jobs:
             REFS_GHCR="$REFS_GHCR $GHCR_IMAGE@sha256:$f"
           done
           # shellcheck disable=SC2086
-          docker buildx imagetools create \
-            -t "$DOCKERHUB_IMAGE:latest" \
-            -t "$DOCKERHUB_IMAGE:$TAG_MAJOR" \
-            -t "$DOCKERHUB_IMAGE:$TAG_MINOR" \
-            -t "$DOCKERHUB_IMAGE:$TAG_FULL" \
-            -t "$DOCKERHUB_IMAGE:$TAG_FULL-r$TAG_REV" \
-            $REFS_HUB
+          docker buildx imagetools create -t "$DOCKERHUB_IMAGE:$TAG_FULL-r$TAG_REV" $REFS_HUB
           # shellcheck disable=SC2086
-          docker buildx imagetools create \
-            -t "$GHCR_IMAGE:latest" \
-            -t "$GHCR_IMAGE:$TAG_MAJOR" \
-            -t "$GHCR_IMAGE:$TAG_MINOR" \
-            -t "$GHCR_IMAGE:$TAG_FULL" \
-            -t "$GHCR_IMAGE:$TAG_FULL-r$TAG_REV" \
-            $REFS_GHCR
+          docker buildx imagetools create -t "$GHCR_IMAGE:$TAG_FULL-r$TAG_REV" $REFS_GHCR
 
-      - name: Resolve index digests
+      - name: Resolve the index digest
         id: digest
         env:
+          MODE: ${{ needs.prepare.outputs.mode }}
+          PREPARED: ${{ needs.prepare.outputs.digest }}
           TAG_FULL: ${{ needs.prepare.outputs.full }}
           TAG_REV: ${{ needs.prepare.outputs.rev }}
         run: |
-          HUB=$(docker buildx imagetools inspect "$DOCKERHUB_IMAGE:$TAG_FULL-r$TAG_REV" --format '{{println .Manifest.Digest}}' | head -1)
-          GHCR=$(docker buildx imagetools inspect "$GHCR_IMAGE:$TAG_FULL-r$TAG_REV" --format '{{println .Manifest.Digest}}' | head -1)
-          [ -n "$HUB" ] && [ -n "$GHCR" ] || { echo "index digest resolution failed"; exit 1; }
-          {
-            echo "hub=$HUB"
-            echo "ghcr=$GHCR"
-          } >> "$GITHUB_OUTPUT"
+          HUB=$(bash .github/scripts/registry.sh digest "$DOCKERHUB_IMAGE" "$TAG_FULL-r$TAG_REV")
+          GHCR=$(bash .github/scripts/registry.sh digest "$GHCR_IMAGE" "$TAG_FULL-r$TAG_REV")
+          # Same platform manifests, same index: one digest on both
+          # registries. A difference means one registry rewrote what it was
+          # given — and a release note listing one digest would lie for the
+          # other. Stop before signing either.
+          [ "$HUB" = "$GHCR" ] || { echo "::error::index digest differs: Docker Hub $HUB, GHCR $GHCR"; exit 1; }
+          # Resuming: the index must still be the one prepare found signed.
+          if [ "$MODE" = resume ] && [ "$HUB" != "$PREPARED" ]; then
+            echo "::error::X.Y.Z-rN moved from $PREPARED to $HUB since prepare"; exit 1
+          fi
+          echo "digest=$HUB" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
@@ -293,29 +434,105 @@ jobs:
           cosign-release: v2.6.5
 
       - name: Sign images (keyless OIDC)
+        if: needs.prepare.outputs.mode == 'full'
         env:
-          DIGEST_HUB: ${{ steps.digest.outputs.hub }}
-          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
-          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST_HUB}"
-          cosign sign --yes "${GHCR_IMAGE}@${DIGEST_GHCR}"
+          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST}"
+          cosign sign --yes "${GHCR_IMAGE}@${DIGEST}"
 
-      - name: Verify signatures (the published index must verify with the documented identity)
+      # The certificate names the workflow file and the ref it ran from
+      # (Fulcio's SAN is https://github.com/ + the job_workflow_ref claim):
+      #   https://github.com/<repo>/.github/workflows/release.yml@refs/tags/vX.Y.Z-rN
+      # Using a deployment environment changes the token's `sub` claim, not
+      # this. Two checks per registry: the exact identity printed in this
+      # release's notes, and the tag-pattern regexp the docs publish — the
+      # release fails if either published command would not verify.
+      - name: Verify signatures (the identities this release and the docs publish)
         env:
-          DIGEST_HUB: ${{ steps.digest.outputs.hub }}
-          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
           REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          for ref in "${DOCKERHUB_IMAGE}@${DIGEST_HUB}" "${GHCR_IMAGE}@${DIGEST_GHCR}"; do
-            cosign verify "$ref" \
-              --certificate-identity-regexp "https://github.com/${REPO}/.*" \
+          IDENTITY="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
+          PATTERN="^https://github\.com/${REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+\$"
+          for ref in "${DOCKERHUB_IMAGE}@${DIGEST}" "${GHCR_IMAGE}@${DIGEST}"; do
+            cosign verify "$ref" --certificate-identity "$IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
+            cosign verify "$ref" --certificate-identity-regexp "$PATTERN" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
           done
 
-      - name: Checkout for Docker Hub description
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: GitHub provenance attestation (Docker Hub image)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          subject-name: index.docker.io/${{ env.DOCKERHUB_IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+
+      - name: GitHub provenance attestation (GHCR image)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+
+      - name: Move the mutable tags to the signed digest
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          TAG_MAJOR: ${{ needs.prepare.outputs.major }}
+          TAG_MINOR: ${{ needs.prepare.outputs.minor }}
+          TAG_FULL: ${{ needs.prepare.outputs.full }}
+          TAG_REV: ${{ needs.prepare.outputs.rev }}
+        run: |
+          # Proved BEFORE anything moves: `--dry-run` prints the exact index
+          # imagetools would push for these tags, and its sha256 must be the
+          # signed digest. Checking only afterwards would be too late — the
+          # mutable tags would already sit on an unsigned digest, and moving
+          # them back is a second write that can fail the same way.
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
+            docker buildx imagetools create --dry-run -t "$image:latest" "$image@$DIGEST" > /tmp/planned.json
+            PLANNED=$(python3 -c 'import hashlib,sys; print("sha256:" + hashlib.sha256(open(sys.argv[1], "rb").read().rstrip(b"\n")).hexdigest())' /tmp/planned.json)
+            [ "$PLANNED" = "$DIGEST" ] \
+              || { echo "::error::imagetools would push $PLANNED for $image, not the signed $DIGEST — mutable tags not moved"; exit 1; }
+          done
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
+            docker buildx imagetools create \
+              -t "$image:latest" -t "$image:$TAG_MAJOR" -t "$image:$TAG_MINOR" -t "$image:$TAG_FULL" \
+              "$image@$DIGEST"
+          done
+          # And confirmed afterwards, tag by tag.
+          for image in "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"; do
+            for t in latest "$TAG_MAJOR" "$TAG_MINOR" "$TAG_FULL" "$TAG_FULL-r$TAG_REV"; do
+              got=""
+              for _ in 1 2 3; do
+                got=$(bash .github/scripts/registry.sh digest "$image" "$t") && [ "$got" = "$DIGEST" ] && break
+                sleep 5
+              done
+              [ "$got" = "$DIGEST" ] || { echo "::error::$image:$t is ${got:-unresolvable}, expected $DIGEST"; exit 1; }
+            done
+          done
+
+      # Before the Docker Hub description: a Docker Hub API hiccup must not
+      # leave a published, signed release without its notes.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            **Unbound ${{ needs.prepare.outputs.full }}** (revision r${{ needs.prepare.outputs.rev }}) — multi-arch (amd64, arm64), distroless, signed.
+
+            **Images:**
+            - `${{ env.DOCKERHUB_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
+            - `${{ env.GHCR_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
+
+            **Digest** (identical on both registries): `${{ steps.digest.outputs.digest }}`
+
+            Verify (this exact build — signed by `release.yml` running on this tag):
+            ```
+            cosign verify ${{ env.DOCKERHUB_IMAGE }}@${{ steps.digest.outputs.digest }} \
+              --certificate-identity 'https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ needs.prepare.outputs.tag }}' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            ```
 
       - name: Prepare Docker Hub README (absolute links)
         run: |
@@ -337,49 +554,22 @@ jobs:
           short-description: Production-grade Unbound DNS resolver on a distroless base. Non-root, DNSSEC, signed, auto-updated.
           readme-filepath: ./README.dockerhub.md
 
-      - name: GitHub provenance attestation (Docker Hub image)
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: index.docker.io/${{ env.DOCKERHUB_IMAGE }}
-          subject-digest: ${{ steps.digest.outputs.hub }}
-
-      - name: GitHub provenance attestation (GHCR image)
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.GHCR_IMAGE }}
-          subject-digest: ${{ steps.digest.outputs.ghcr }}
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          generate_release_notes: true
-          body: |
-            **Unbound ${{ needs.prepare.outputs.full }}** (revision r${{ needs.prepare.outputs.rev }}) — multi-arch (amd64, arm64), distroless, signed.
-
-            **Images:**
-            - `${{ env.DOCKERHUB_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
-            - `${{ env.GHCR_IMAGE }}:${{ needs.prepare.outputs.full }}-r${{ needs.prepare.outputs.rev }}`
-
-            **Digests:** Docker Hub `${{ steps.digest.outputs.hub }}` · GHCR `${{ steps.digest.outputs.ghcr }}`
-
-            Verify:
-            ```
-            cosign verify ${{ env.DOCKERHUB_IMAGE }}@${{ steps.digest.outputs.hub }} \
-              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.*' \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com
-            ```
-
   notify-failure:
     needs: [prepare, build, merge]
-    if: failure()
+    # Not `failure()` alone: a job that hits its timeout-minutes ends
+    # `cancelled`, and failure() is false for that — a timed-out release
+    # would open no issue. `always()` so this job is not itself skipped by
+    # the cancelled dependency; a whole-run cancel is reported too.
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      issues: write
     steps:
       - name: Notify admin (release failed)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RAW_TAG: ${{ needs.prepare.outputs.tag || github.ref_name }}
+          RAW_TAG: ${{ needs.prepare.outputs.tag || inputs.tag }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # One open issue per broken tag; repeats add comments instead of
@@ -391,5 +581,5 @@ jobs:
             gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body "Failed again: $RUN_URL"
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --assignee euca01 \
-              --body "$(printf 'The release pipeline failed — nothing was published.\n\nInvestigate: %s' "$RUN_URL")"
+              --body "$(printf 'The release pipeline failed or was cancelled. Mutable tags (latest, X, X.Y, X.Y.Z) move only after the index is signed, verified and attested, so they still point at the previous release unless the run got past that step.\n\nInvestigate: %s' "$RUN_URL")"
           fi

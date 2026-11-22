@@ -1,1060 +1,477 @@
-# Production deployment guide
+# Production deployment
 
-## Audience and outcome
+A reference deployment for running `esitcparis/unbound-distroless` as the
+resolver an organisation depends on: two hosts, each with the resolver and the
+[update sidecar](../updater/README.md), Prometheus alerts, and a runbook per
+failure. What the sidecar does, its variables, notifications and metrics are
+described in [updater/README.md](../updater/README.md); the alert and scrape
+files are in [observability/](observability/).
 
-This guide is for the operator who has to run `esitcparis/unbound-distroless`
-as the DNS resolver a company actually depends on, and who will be paged when
-it breaks. It describes a two-host reference deployment, the host preparation
-it needs, a hardened Compose project that was brought up and validated on a
-real Docker daemon before being written down here, what to put in Prometheus,
-and the runbook for every failure the update sidecar can report. Everything
-below is derived from the files in this repository and from commands that were
-run; where something could not be verified on the machine this guide was
-written on, it says so instead of guessing.
+Every command below was run on Docker Engine 29.9.3 with Compose v5.7.1
+(arm64), against the files of this repository, unless it is marked *not run*.
+The project files are checked in CI by `tests/sidecar-docs.sh` (Compose) and
+`tests/observability.sh` (Prometheus).
 
 ## Reference architecture
 
-Two independent hosts. Each runs one resolver, one `unbound-autoupdate` in
-`loop` mode, and one `unbound-metrics`. Nothing is shared between the hosts:
-no cluster, no shared state, no leader. Clients are configured with **both**
-resolver addresses.
-
 ```
-                 clients — resolv.conf / DHCP option 6 lists BOTH
-                    │                                      │
-        ┌───────────┘                                      └───────────┐
-        ▼                                                              ▼
-┌──────────────────────────────────┐        ┌──────────────────────────────────┐
-│ host A — 10.0.0.11               │        │ host B — 10.0.0.12               │
-│  /opt/unbound (compose project)  │        │  /opt/unbound (compose project)  │
-│                                  │        │                                  │
-│  ┌────────────────────────────┐  │        │  ┌────────────────────────────┐  │
-│  │ unbound            :53     │  │        │  │ unbound            :53     │  │
-│  │ read_only, cap NET_BIND    │  │        │  │ read_only, cap NET_BIND    │  │
-│  └──────────────▲─────────────┘  │        │  └──────────────▲─────────────┘  │
-│                 │ canary + swap  │        │                 │ canary + swap  │
-│  ┌──────────────┴─────────────┐  │        │  ┌──────────────┴─────────────┐  │
-│  │ unbound-autoupdate  (loop) │  │        │  │ unbound-autoupdate  (loop) │  │
-│  │ INTERVAL=1h  SPLAY=10%     │  │        │  │ INTERVAL=1h  SPLAY=10%     │  │
-│  └──────────────┬─────────────┘  │        │  └──────────────┬─────────────┘  │
-│                 │ state volume   │        │                 │ state volume   │
-│  ┌──────────────┴─────────────┐  │        │  ┌──────────────┴─────────────┐  │
-│  │ unbound-metrics     :9167  │  │        │  │ unbound-metrics     :9167  │  │
-│  └──────────────┬─────────────┘  │        │  └──────────────┬─────────────┘  │
-│  started at T                    │        │  started at T + 30 min           │
-└─────────────────┼────────────────┘        └─────────────────┼────────────────┘
-                  │                                           │
-                  └──────────► Prometheus ◄───────────────────┘
+             clients: resolv.conf / DHCP option 6 list BOTH addresses
+                 │                                         │
+   ┌─────────────▼──────────────┐            ┌─────────────▼──────────────┐
+   │ host A  10.0.0.11          │            │ host B  10.0.0.12          │
+   │ /opt/unbound               │            │ /opt/unbound               │
+   │  unbound             :53   │            │  unbound             :53   │
+   │  unbound-autoupdate  loop  │            │  unbound-autoupdate  loop  │
+   │  unbound-metrics     :9167 │            │  unbound-metrics     :9167 │
+   │ started at T               │            │ started at T + 30 min      │
+   └─────────────┬──────────────┘            └─────────────┬──────────────┘
+                 └───────────► Prometheus ◄────────────────┘
                      Healthchecks.io: one check per host (HC_URL)
 ```
 
-Why two hosts. A successful update is a **recreation of the resolver
-container** — `updater/unbound-autoupdate` logs `swapping <service> (brief
-restart)` and then runs `docker compose up -d --no-deps` on that one service.
-The container is stopped and a new one is started; during that window this
-host answers nothing. A second resolver on a second host, listed in every
-client's resolver list, is what makes that window invisible to clients. It is
-also what covers the case the sidecar cannot fix by itself: the `critical`
-outcome, where both the swap and the rollback failed.
+Nothing is shared between the hosts. An update recreates the resolver
+container, and the host answers nothing for the seconds that takes; the
+second host, listed by every client, covers that window, and covers a host
+whose resolver is down until someone intervenes (runbook (b)).
 
-Why staggering matters, and what actually staggers. `updater/entrypoint.sh`
-runs a cycle **immediately** when the container starts, then sleeps
-`INTERVAL` plus a random jitter of up to `SPLAY` (`SPLAY` is a percentage of
-`INTERVAL`, or an absolute duration), and repeats. That jitter is drawn
-per-cycle inside one container, and it only spreads cycles across the jitter
-window, not across the interval: `SPLAY=10%` of `INTERVAL=1h` scatters a
-fleet over **6 minutes**, not over the hour. It does not put two hosts in a
-fixed opposite phase either — each draw is added to the sleep, so the phase
-between two hosts drifts by up to `SPLAY` every cycle and that drift
-accumulates. What separates two hosts is
-**when you start them**: bring host B up about 30 minutes after host A and
-their first cycles are 30 minutes apart. Observed on the test run with
-`INTERVAL=1h SPLAY=10%`:
-
-```
-ts=2026-09-17T09:32:06Z level=info msg="next cycle in 3671s"
-```
-
-3600 s + 71 s of jitter, within the 0–360 s (10 % of 1 h) the code allows.
+The sidecar runs a cycle when its container starts, then waits `INTERVAL`
+plus a random delay of up to `SPLAY` before each next one
+(`updater/entrypoint.sh`). With `INTERVAL=1h` and `SPLAY=10%` the cycles of
+several hosts are spread over 6 minutes at most, and their phase drifts by up
+to that much at each cycle. What keeps two hosts apart is starting them about
+30 minutes apart.
 
 ## Host prerequisites
 
-### Docker Engine and Compose v2
+**Docker Engine with the Compose v2 plugin** (`docker compose`, not the old
+`docker-compose`): the sidecar runs `docker compose` itself. Older versions
+than the ones above were not tested.
 
-The sidecar shells out to `docker compose` for everything it does:
-`compose pull --quiet`, `compose config --format json`, `compose ps -q`,
-`compose up -d --no-deps [--force-recreate]`. `--format json` on
-`compose config` and `-p/--project-directory` handling as used in
-`updater/lib/discover.sh` are Compose **v2** (the `docker compose`
-subcommand, not the old `docker-compose` script).
-
-Versions this guide was tested with:
-
-```console
-$ docker compose version
-Docker Compose version v5.5.1
-$ docker version --format '{{.Server.Version}}'
-29.8.0
-```
-
-Older Engine/Compose combinations were not tested here, so no minimum is
-claimed beyond "Compose v2".
-
-### A free port 53
-
-The reference file publishes `53:53/udp` and `53:53/tcp` on all host
-addresses. Before the first `docker compose up -d`, find out what already
-holds port 53:
+**Port 53.** The reference project publishes `53:53/udp` and `53:53/tcp` on
+every host address. See what already listens:
 
 ```bash
-ss -lntup 'sport = :53'          # what is listening, and which process
-systemctl is-active systemd-resolved
+ss -lntup 'sport = :53'
 ```
 
-On Ubuntu, `systemd-resolved` normally binds its stub listener on
-**127.0.0.53:53**. Whether that conflicts with a container publishing
-`0.0.0.0:53` could **not be verified for this guide** — the smoke test ran on
-Docker Desktop on macOS, where there is no systemd — so this guide does not
-tell you to set `DNSStubListener=no`. Check first, and decide from what `ss`
-shows:
+If something does (on Ubuntu, usually the `systemd-resolved` stub on
+`127.0.0.53`), the fix is in the README, [Run it](../README.md#run-it).
+Publishing on the host's LAN address only, for example
+`"10.0.0.11:53:53/udp"`, also keeps the source address of clients visible to
+`access-control` ([usage.md](usage.md#docker-run)).
 
-- nothing on the address you publish → nothing to do;
-- `docker compose up -d` fails with an "address already in use" bind error →
-  either free the address (on Ubuntu that means `DNSStubListener=no` in
-  `/etc/systemd/resolved.conf` plus `systemctl restart systemd-resolved`, and
-  repointing `/etc/resolv.conf`), or publish on a specific LAN address
-  instead: `"10.0.0.11:53:53/udp"`.
-
-Related, and worth knowing before you pick: `docs/usage.md` notes that with
-`-p 53:53` on all interfaces, client source addresses can be rewritten to the
-bridge gateway by Docker's userland proxy, which the shipped ACL allows.
-Publishing on a specific LAN address keeps `access-control` meaningful.
-
-### Kernel socket buffers
-
-`unbound.conf` asks for 4 MiB socket buffers:
-
-```
-  so-rcvbuf: 4m
-  so-sndbuf: 4m
-```
-
-These are clamped by `net.core.rmem_max` / `net.core.wmem_max`, which are
-**not namespaced** — the container cannot raise them, only the host can. 4m
-is 4194304 bytes:
+**Socket buffers.** `unbound.conf` asks for 4 MiB receive and send buffers
+(`so-rcvbuf`, `so-sndbuf`). The kernel limits `net.core.rmem_max` and
+`net.core.wmem_max` are not namespaced: only the host can raise them.
 
 ```bash
-sysctl net.core.rmem_max net.core.wmem_max          # current values
+sysctl net.core.rmem_max net.core.wmem_max    # 4194304 or more
+```
+
+To raise them (*not run*: it changes the host):
+
+```bash
 printf 'net.core.rmem_max = 4194304\nnet.core.wmem_max = 4194304\n' \
   | sudo tee /etc/sysctl.d/90-unbound.conf
 sudo sysctl --system
 ```
 
-If the kernel value is lower, Unbound logs that the buffer "was not granted"
-and runs with the smaller one — harmless, but it is the signal that the
-sysctl is missing. On the host used for the smoke test both values were
-already `4194304` and no such line appeared in the resolver log, so the
-warning text itself is quoted here from `unbound.conf` and `docs/usage.md`,
-not from an observed run. Grep for it after bring-up:
+When the limit is lower, Unbound starts anyway and logs
+`warning: so-rcvbuf 4194304 was not granted.` with the size it got:
 
 ```bash
-docker compose logs unbound | grep -i 'not granted'
+docker compose logs unbound | grep 'not granted'
 ```
 
-### Open files
+**Open files.** `outgoing-range: 4096` times `num-threads: 2` needs 8192
+descriptors for the outgoing port pool alone; the reference project sets
+`nofile` to 16384. Raise both together.
 
-`unbound.conf` declares `outgoing-range: 4096` and `num-threads: 2`, so the
-outgoing port pool alone wants 4096 × 2 = **8192** descriptors, before the
-listening sockets, `incoming-num-tcp: 128`, `outgoing-num-tcp: 32` and the
-control socket. The reference file sets `nofile` to 16384 soft and hard —
-8192 rounded up with headroom. `docs/usage.md` suggests `nofile=65535:65535`
-for high-traffic deployments; raise `outgoing-range`, `num-threads` and this
-limit together, and verify:
+**Clock.** DNSSEC signatures have a validity window: a host clock outside it
+turns valid answers into SERVFAIL. Keep the host synchronised (NTP) and
+monitored.
 
-```bash
-docker inspect unbound --format '{{.HostConfig.Ulimits}}'
-docker compose logs unbound | grep -i 'reduc'   # unbound says so when it lowers the pool
-```
+**Egress.**
 
-Verified on the test run: `Ulimits=[nofile=16384:16384]`, and no reduction
-line in the resolver log.
+| Destination | Used by |
+|---|---|
+| The registry: for Docker Hub `index.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com` | Every cycle's pull, the canary, the self-update |
+| `tuf-repo-cdn.sigstore.dev:443` | Keyless signature verification: with that name unreachable, `cosign verify` fails |
+| The `auth-zone` primaries in `unbound.conf` (root servers), TCP and UDP 53 | The local root zone copy, refreshed by zone transfer. Without them, `fallback-enabled: yes` keeps resolution working on the copy in the image, which ages. |
+| The Internet, TCP and UDP 53 | Recursion (no forwarders in `unbound.conf`) |
+| Your `HC_URL` and `WEBHOOK_URL` hosts | Notifications |
 
-### Time synchronisation
-
-DNSSEC signatures carry an inception and an expiration. From the smoke test:
-
-```
-.  86386  IN  RRSIG  SOA 8 0 86400 20260929050000 20260916040000 57780 . ...
-```
-
-A host clock outside that window makes valid signatures look expired or
-not-yet-valid, and a validating resolver answers SERVFAIL. Keep the host
-synchronised and alert on it:
-
-```bash
-timedatectl status          # "System clock synchronized: yes"
-chronyc tracking            # or the equivalent for your NTP daemon
-```
-
-### Egress
-
-| Destination | Why | How to test |
-|---|---|---|
-| Your container registry — for the references in this guide, Docker Hub: `index.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com` | `docker compose pull` every cycle; the canary and the preflight run the pulled image | `docker pull esitcparis/unbound-distroless:1.26.1-r0` |
-| Your `HC_URL` / `WEBHOOK_URL` hosts (`hc-ping.com` in the examples) | `/start`, success and `/fail` pings from every cycle and from the self-update helper | `curl -fsS "$HC_URL"` |
-| `tuf-repo-cdn.sigstore.dev:443` (the Sigstore TUF trust root) | `updater/lib/verify.sh` runs `cosign verify` fail-closed before any new image is deployed | the command below |
-| Root servers, TCP/53 and UDP/53, to the `auth-zone` primaries in `unbound.conf` | RFC 8806 hyperlocal root: Unbound keeps `/var/lib/unbound/root.zone` fresh by AXFR/IXFR from those 14 addresses | `unbound-control list_auth_zones` |
-| The public internet, UDP/53 and TCP/53 | full recursion: `module-config: "validator iterator"`, no forwarders | `dig @<resolver> example.com` |
-
-What a keyless verification actually contacts was measured on a run of the
-command below: `index.docker.io`, `auth.docker.io` and
-`production.cloudfront.docker.com` (the registry), and
-`tuf-repo-cdn.sigstore.dev` (the trust root). Nothing else — no `rekor`, no
-`fulcio` host: the Rekor entry travels inside the signature bundle and is
-checked offline, which is what the third line of the output below says.
-
-Signature verification, run exactly as `updater/lib/verify.sh` runs it — this
-is both the egress test and the manual check for runbook (d). Any image
-carrying the `cosign` binary, or a local `cosign`, does the same job; the
-upstream image is used here so the check does not depend on the sidecar
-image being present on the host.
-The tag below is cosign **v3.1.3** — the version the sidecar image itself
-embeds, and which verifies the signatures the release workflows produce with
-cosign v2.6.5 (the transcript is from a real run against the published
-image):
-
-```console
-$ docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.3 verify \
-    --certificate-identity-regexp 'https://github.com/ESITC-Paris/unbound-distroless/.*' \
-    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-    esitcparis/unbound-distroless:1.26.1-r0
-
-Verification for index.docker.io/esitcparis/unbound-distroless:1.26.1-r0 --
-The following checks were performed on each of these signatures:
-  - The cosign claims were validated
-  - Existence of the claims in the transparency log was verified offline
-  - The code-signing certificate was verified using trusted certificate authority certificates
-```
-
-Root zone transfer, confirmed on the test resolver a few seconds after start:
-
-```console
-$ docker exec unbound /usr/local/sbin/unbound-control \
-    -c /etc/unbound/unbound.conf list_auth_zones
-.	serial 2026091600	 since 1789637523 2026-09-17T09:32:03
-```
-
-If your egress policy blocks AXFR to the root servers, the zone simply stays
-at the copy baked into the image and `fallback-enabled: yes` keeps resolution
-working through ordinary recursion — but you lose the hyperlocal benefit and
-the copy ages.
-
-## Directory layout on the host
+## Project layout
 
 ```
 /opt/unbound/
-├── docker-compose.yml      # the reference project below
-├── unbound.conf            # your configuration (start from the repo's)
-├── .env                    # HC_URL, WEBHOOK_URL — mode 600, never committed
-└── tls/                    # optional: certificate + key for DoT/DoH
+├── docker-compose.yml   # docs/production/docker-compose.yml
+├── unbound.conf         # your configuration
+├── .env                 # HC_URL, WEBHOOK_URL; mode 600
+└── tls/                 # optional: certificate and key for DoT/DoH
 ```
 
-**The path must be the same inside the sidecar as on the host.** The sidecar
-runs `docker compose` itself against these files, using the file list Compose
-stamped on the resolver container; Compose resolves the project's relative
-bind mounts against the project directory and the Docker daemon applies them
-on the host. A path that means one thing in the sidecar and another on the
-host would deploy the wrong files. `updater/lib/discover.sh` refuses to guess:
+The sidecar mounts this directory read-only at the **same absolute path**
+(`/opt/unbound:/opt/unbound:ro`): see
+[the same-absolute-path rule](../updater/README.md#the-same-absolute-path-rule).
+Elsewhere than `/opt/unbound`, change the path on both sides of that mount.
 
-```
-compose file '/opt/unbound/docker-compose.yml' is not readable from inside the sidecar — mount the project directory read-only at the SAME absolute path
-```
+## The reference project
 
-and, for each declared bind-mount source:
+[`production/docker-compose.yml`](production/docker-compose.yml), copied to
+`/opt/unbound/docker-compose.yml`. Compared with the README's root
+`docker-compose.yml` it adds the sidecar's two services, mounts
+`unbound.conf`, and sets a memory limit and log rotation. On the test host,
+`docker inspect` of the resolver showed `ReadonlyRootfs=true`,
+`CapDrop=[ALL]`, `CapAdd=[CAP_NET_BIND_SERVICE]`,
+`SecurityOpt=[no-new-privileges:true]`, `Ulimits=[nofile=16384:16384]`,
+`Memory=536870912` and json-file logging with `max-size:10m`, `max-file:5`
+(50 MiB per service at most).
 
-```
-declared bind mount '<src>' is not readable from inside the sidecar — it must be mounted read-only at the same absolute path
-```
+The memory limit is twice the cache sizes of the shipped `unbound.conf`
+(240 MiB in total): change it with them, or the resolver is killed when its
+caches fill.
 
-So `- /opt/unbound:/opt/unbound:ro` in the sidecar service, and if you put the
-project anywhere else, that path changes on **both** sides.
+### What the resolver follows
 
-## The reference Compose project
+The sidecar pulls the tag the compose file declares, at each cycle, and
+deploys what it finds there after a canary.
 
-The file is [`production/docker-compose.yml`](production/docker-compose.yml)
-in this repository; copy it to `/opt/unbound/docker-compose.yml`.
+| `image:` of the `unbound` service | Resolver updates |
+|---|---|
+| `esitcparis/unbound-distroless:1` (the file as shipped) | Automatic: each new release of major version 1. |
+| An `X.Y.Z-rN` tag or `@sha256:` digest taken from the [releases page](https://github.com/ESITC-Paris/unbound-distroless/releases) | Only when you edit that line; the next cycle canaries and deploys the new value. An `X.Y.Z-rN` tag is published once and never moved, so a pinned file sees no new image. |
 
-```yaml
-name: unbound
-
-services:
-  unbound:
-    # MODE A — pinned, manual updates (this file's default).
-    # MODE B — tracking a major tag: esitcparis/unbound-distroless:1
-    # 1.26.1-r0 was the current release when this guide (and its transcripts)
-    # was written; take today's from the releases page.
-    image: esitcparis/unbound-distroless:1.26.1-r0
-    container_name: unbound
-    restart: unless-stopped
-    stop_grace_period: 20s
-
-    cap_drop: [ALL]
-    cap_add: [NET_BIND_SERVICE]
-    security_opt: ["no-new-privileges:true"]
-
-    read_only: true
-    tmpfs:
-      - "/run/unbound:uid=65532,gid=65532"
-
-    ports:
-      - "53:53/udp"
-      - "53:53/tcp"
-
-    volumes:
-      - unbound-data:/var/lib/unbound
-      - ./unbound.conf:/etc/unbound/unbound.conf:ro
-      # - ./tls:/etc/unbound/tls:ro
-
-    ulimits:
-      nofile:
-        soft: 16384
-        hard: 16384
-
-    deploy:
-      resources:
-        limits:
-          memory: 512m
-
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-  unbound-autoupdate:
-    image: esitcparis/unbound-autoupdate:1
-    restart: unless-stopped
-    stop_grace_period: 30s
-    environment:
-      INTERVAL: 1h
-      SPLAY: 10%
-      NOTIFY_HOST: resolver-1.example
-      HC_URL: ${HC_URL:?set HC_URL in .env}
-      # WEBHOOK_URL: ${WEBHOOK_URL}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/unbound:/opt/unbound:ro
-      - autoupdate-state:/var/lib/unbound-autoupdate
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "5" }
-
-  unbound-metrics:
-    image: esitcparis/unbound-autoupdate:1
-    command: ["metrics"]
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9167:9167"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - autoupdate-state:/var/lib/unbound-autoupdate:ro
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "5" }
-
-volumes:
-  unbound-data:
-  autoupdate-state:
-```
-
-The two sidecar services are based on `updater/compose.snippet.yml`: same
-images, command, volumes and published port, with `HC_URL` moved to a
-`${HC_URL:?…}` reference into `.env` (the snippet inlines a literal URL),
-`NOTIFY_HOST` uncommented, and `SPLAY`, `stop_grace_period` and log rotation
-added.
-
-### Which tag the resolver should follow
-
-The sidecar updates the resolver by re-pulling the tag the compose file
-**declares** and comparing repository digests
-(`updater/unbound-autoupdate`: `compose pull --quiet "$TARGET_SERVICE"`, then
-`declared_digest` against `running_digest`). That has one consequence worth
-stating plainly:
-
-| | Mode A — pinned | Mode B — tracking `:1` |
-|---|---|---|
-| `image:` | `esitcparis/unbound-distroless:1.26.1-r0` | `esitcparis/unbound-distroless:1` |
-| Resolver updates | never automatically: the automation never re-pushes an `X.Y.Z-rN` tag, so the pull yields the same digest every cycle (a human re-running that tag's release would republish it, and the sidecar would then canary and deploy the new digest) and, as long as nothing else changed, the cycle ends `up_to_date` (a configuration change still ends `updated`, and a refused sidecar self-update still ends `blocked`) | automatically, whenever the tag moves |
-| What the sidecar still does | pulls, fingerprints your configuration, canaries and redeploys on **configuration** changes, exports metrics, self-updates | all of that, plus resolver image updates |
-| Upgrading | you edit the tag; the next cycle canaries and deploys it | the sidecar canaries and deploys it |
-| Verified here | `1.26.1-r0` exists on Docker Hub (`docker buildx imagetools inspect`), the cycle recorded a baseline and then `up to date` | the `1`, `1.26`, `1.26.1` and `latest` tags exist on Docker Hub |
-
-Mode A is the honest default for an environment where every production change
-must be a deliberate, ticketed act — you still get the canary, because the
-cycle canaries the new digest when *you* move the tag. Mode B is what buys you
-the unattended CVE-response the sidecar exists for. Pick one per fleet, not
-per host.
-
-The **sidecar** follows `:1` in both modes, and that is not an inconsistency:
-it replaces itself (`updater/lib/selfupdate.sh`), and
-`_self_running_digest`/`declared` comparison needs the declared tag to move
-for anything to happen. Pin the sidecar immutably and you freeze the updater,
-not the resolver.
-
-### Why each hardening line is there
-
-- `cap_drop: [ALL]` + `cap_add: [NET_BIND_SERVICE]` + `no-new-privileges` —
-  the same set the README and `docs/usage.md` document; the binary carries
-  `cap_net_bind_service` so it can bind :53 as UID 65532.
-- `read_only: true` + `tmpfs: /run/unbound` — the image writes in exactly two
-  places: `/var/lib/unbound` (trust anchor and root zone; the named volume)
-  and `/run/unbound` (control socket and PID file, from `unbound.conf`). The
-  tmpfs is owned by 65532 so the non-root process can create the socket the
-  `HEALTHCHECK` connects to. **Verified:** with `read_only: true` the
-  container reached `healthy`, answered with the AD flag, and the sidecar's
-  canary — which replicates `read_only`, `tmpfs`, `environment`, `ulimits`
-  and `sysctls` from the declaration (`_read_declared_runtime`) — validated
-  under the same settings.
-- `unbound-data:/var/lib/unbound` as a **named** volume — not optional: the
-  sidecar refuses a resolver without one ("no named volume on
-  /var/lib/unbound — required to persist the DNSSEC trust anchor and to clone
-  state for the canary").
-- `deploy.resources.limits.memory: 512m` — arithmetic from `unbound.conf`:
-  `msg-cache-size 64m + rrset-cache-size 128m + key-cache-size 32m +
-  neg-cache-size 16m = 240m`, plus the infra cache (`infra-cache-numhosts:
-  50000`), per-thread buffers and the binary. 512m is roughly 2× the cache
-  total. **Resize it with the cache sizes, never on its own** — a resolver
-  OOM-killed at its cache high-water mark is an outage that looks like a
-  crash loop. Verified applied: `Memory=536870912`; the resolver sat at
-  25.1 MiB / 512 MiB in a freshly started, lightly queried state, which is
-  the floor, not the steady state. Compose v2 honours
-  `deploy.resources.limits.memory` outside Swarm; `mem_limit: 512m` is the
-  equivalent older spelling — use one, not both.
-- `ulimits.nofile` — see *Open files* above.
-- `logging` — `json-file` with `max-size: 10m` and `max-file: 5` caps each
-  service at 50 MiB. Without it the default json-file driver never rotates.
-  Verified applied: `LogConfig={json-file map[max-file:5 max-size:10m]}`.
-- `stop_grace_period` — how long Docker waits between SIGTERM and SIGKILL
-  when the service is stopped or recreated (default 10s). Verified applied:
-  `StopTimeout=20`.
-- `restart: unless-stopped` — on all three services, so a daemon restart
-  brings back the resolver *and* its updater.
+In both cases the sidecar still canaries and deploys configuration changes,
+exports metrics and updates itself. The sidecar's own services follow
+`esitcparis/unbound-autoupdate:1` in both cases: self-update needs a tag that
+moves ([Self-update](../updater/README.md#self-update)). Choose the same mode
+on every host.
 
 ## Secrets
 
-`HC_URL` and `WEBHOOK_URL` are capability URLs: anyone holding them can flip
-your monitoring green or post to your alerting channel. They belong in a
-`.env` file next to the compose file, which Compose reads automatically:
+`HC_URL` and `WEBHOOK_URL` are capability URLs: whoever holds them can mark a
+check green or post to the alert channel. Keep them in `.env`, which Compose
+reads from the project directory:
 
 ```bash
 cd /opt/unbound
 cat > .env <<'EOF'
-HC_URL=https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-WEBHOOK_URL=https://hooks.example/services/...
+HC_URL=https://hc-ping.com/<uuid>
 EOF
 chmod 600 .env
-chown root:root .env
 ```
 
-The compose file references them as `${HC_URL:?set HC_URL in .env}`, so a
-missing value fails `docker compose config` instead of silently starting a
-sidecar that alerts nobody. They are never baked into an image and never
-appear in `docker inspect` of the *image*. They do appear in `docker inspect`
-of the container and in `docker compose config` output — treat both as
-sensitive, and keep `.env` out of git (the repository's `.gitignore` is not a
-substitute for checking).
-
-**Verified:** the smoke test ran with a mode-600 `.env` containing
-`HC_URL=http://127.0.0.1:9/hc`; the sidecar picked it up and logged
-`healthchecks ping failed` when that endpoint refused the connection.
+The compose file reads `${HC_URL:?set HC_URL in .env}`: without a value,
+every `docker compose` command fails with that message instead of starting a
+sidecar that alerts nobody. The values are visible in `docker inspect` of the
+container and in `docker compose config`.
 
 ## Bring-up
 
+On host A (commands from `/opt/unbound`):
+
 ```bash
-# 1. Lay the project down
-sudo install -d -m 755 /opt/unbound
-cd /opt/unbound
-sudo curl -fsSLo unbound.conf \
-  https://raw.githubusercontent.com/ESITC-Paris/unbound-distroless/main/unbound.conf
-# edit unbound.conf, put docs/production/docker-compose.yml here, write .env
+curl -fsSLO https://raw.githubusercontent.com/ESITC-Paris/unbound-distroless/main/unbound.conf
+# edit unbound.conf; copy docs/production/docker-compose.yml here; write .env
 
-# 2. Validate the configuration with the image that will run it
-docker run --rm -v /opt/unbound/unbound.conf:/etc/unbound/unbound.conf:ro \
-  --entrypoint /usr/local/sbin/unbound-checkconf \
-  esitcparis/unbound-distroless:1.26.1-r0 /etc/unbound/unbound.conf
-# → unbound-checkconf: no errors in /etc/unbound/unbound.conf
+# The configuration, checked by the image and mounts the project declares
+docker compose run --rm --no-deps --entrypoint /usr/local/sbin/unbound-checkconf \
+  unbound /etc/unbound/unbound.conf
+#   unbound-checkconf: no errors in /etc/unbound/unbound.conf
 
-# 3. Validate the project itself (catches a missing .env value)
-docker compose config --quiet
-
-# 4. Start
 docker compose up -d
 ```
 
-Verify, in this order:
+Then check, in this order:
 
 ```bash
-# Resolver healthy (the image ships a HEALTHCHECK: unbound-control status)
-docker compose ps
-docker inspect unbound --format '{{.State.Health.Status}}'     # healthy
-
-# DNSSEC validation live — the 'ad' flag must be in the flags line
-dig @10.0.0.11 . SOA +dnssec | grep -E '^;; flags'
-#   ;; flags: qr rd ra ad; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
-
-# Ordinary recursion
+docker compose ps                                     # unbound: (healthy)
+dig @10.0.0.11 . SOA +dnssec | grep '^;; flags'       # flags include ad
 dig @10.0.0.11 example.com +short
-
-# Hyperlocal root zone transferred
 docker exec unbound /usr/local/sbin/unbound-control \
-  -c /etc/unbound/unbound.conf list_auth_zones
-
-# The sidecar took its baseline
-docker compose logs unbound-autoupdate
-#   ... msg="unbound-autoupdate <version> starting: interval=1h splay=10%"
-#   ... msg="baseline recorded (image esitcparis/unbound-distroless@sha256:…)"
-#   ... event=baseline subject="baseline recorded"
-#   ... msg="up to date (esitcparis/unbound-distroless@sha256:…)"
-#   ... msg="next cycle in 3671s"
-
-# Full dress rehearsal: pull, cosign (when the pulled digest differs from the
-# running one), preflight, canary on a clone of production state, DNS
-# validation — and no swap.
-docker compose run --rm unbound-autoupdate check
-echo $?        # 0 — see the exit codes below
-
-# Metrics
-curl -s http://127.0.0.1:9167/metrics | grep -c '^unbound_'      # > 0
+  -c /etc/unbound/unbound.conf list_auth_zones        # .  serial …
+docker compose logs unbound-autoupdate                # baseline recorded, up to date
+docker compose run --rm unbound-autoupdate check; echo $?   # 0
+curl -s http://127.0.0.1:9167/metrics | grep '^unbound_exporter_scrape_success'   # 1
 ```
 
-### Reading `check`'s exit code
+`check` runs a canary on a copy of production's state without swapping
+([Validate without deploying](../updater/README.md#validate-without-deploying));
+its exit code is described there. Bring host B up the same way about 30
+minutes later, with its own `NOTIFY_HOST` and `HC_URL`.
 
-0 is a verdict on your change, and so is 1 unless the log says the cycle died
-before judging anything (discovery failure, unreadable compose file, locally
-built resolver image without a digest). 2 means the cycle never got as far as
-judging it:
+## Alerts
 
-| Exit | Meaning | What to do |
-|---|---|---|
-| 0 | Everything validated on a canary with a clone of production state; production untouched. | Nothing. This is the green light. |
-| 1 | A gate refused it: `docker compose pull` failed, the configuration fingerprint could not be computed, cosign refused the image, `unbound-checkconf` rejected the configuration, or the canary could not start or did not validate. | Read the log line — it names the gate. A cosign refusal is runbook (d). |
-| 2 | **Not evaluated.** Another cycle holds the state lock (`another cycle is already running` — a `loop` sidecar holds it for its whole cycle, which is minutes when there is a pull and a canary), or the change is quarantined, or it is a major version bump with `ALLOW_MAJOR=0`. | Read the log line and re-run. Do not read this as "fine" or as "broken". |
+Load [`observability/prometheus.yml`](observability/prometheus.yml) and
+[`observability/alerts.yml`](observability/alerts.yml). The reference project
+publishes `/metrics` on `127.0.0.1:9167`; for a Prometheus on another host,
+publish it on the host's monitoring address instead (never on a public one:
+the endpoint uses the Docker socket). The metrics themselves:
+[updater/README.md](../updater/README.md#metrics).
 
-`check` is **not** side-effect-free, which matters during an incident: the
-cycle pings `HC_URL` (`/start`, then success or `/fail`) like any other, and
-`record_cycle` rewrites `LAST_CYCLE_STATUS`, the cycle counters and
-`metrics.prom` in the shared state volume. A failing `check` run therefore
-turns that host's Healthchecks check red and moves
-`unbound_autoupdate_last_cycle_status`, even though production was never
-touched.
+| Alert | First action |
+|---|---|
+| `UnboundDown` | From a client, `dig @<host> . SOA`. No answer: runbook (b). An answer: the metrics service or the Docker socket is the problem, not DNS. |
+| `UnboundServfailRatioHigh` | `docker compose logs unbound \| grep -i servfail` (the shipped configuration logs the reason), then upstream reachability and the host clock. |
+| `UnboundNoDnssecValidation` | `dig @<host> . SOA +dnssec`: no `ad` flag means no validation. Check that the `unbound-data` volume is mounted and was not recreated empty. |
+| `UnboundTrustAnchorProbeStale` | Check that the root servers are reachable from the resolver and that `/var/lib/unbound` is writable. |
+| `UnboundAutoupdateStale` | `docker compose ps unbound-autoupdate` and its logs. |
+| `UnboundAutoupdateFailed` | The sidecar's log and notification name the reason ([Behaviour](../updater/README.md#behaviour)). A signature refused or not checkable: runbook (d). |
+| `UnboundAutoupdateRolledBack` | Runbook (a). |
+| `UnboundAutoupdateCritical` | Runbook (b). |
+| `UnboundAutoupdateQuarantined` | Runbook (a), (c) or (e), by the `axis` label. |
 
-`check` output from the smoke test:
-
-```
-ts=… level=info msg="preflight: configuration accepted by esitcparis/unbound-distroless@sha256:0d80…"
-ts=… level=info msg="canary running at 192.168.224.2 on esitcparis/unbound-distroless@sha256:0d80…"
-ts=… level=info msg="canary validated: image, production state and configuration work together"
-ts=… level=info msg="check mode: everything validated, no swap performed"
-```
-
-Then bring host B up the same way, about 30 minutes later, with
-`NOTIFY_HOST: resolver-2.example` and its own `HC_URL`.
-
-## Observability
-
-The scrape config and the alert rules live in
-[`observability/`](observability/) and are checked by `promtool check rules`
-in CI. The scrape config:
-
-```yaml
-scrape_configs:
-  - job_name: unbound
-    scrape_interval: 30s
-    static_configs:
-      - targets: ['resolver-1.example:9167', 'resolver-2.example:9167']
-
-rule_files:
-  - alerts.yml
-```
-
-One endpoint per host carries three sources: the resolver's own counters
-(converted from `unbound-control stats_noreset`), the updater's state (read
-from `metrics.prom` in the shared state volume) and the scrape itself, so a
-resolver that cannot be reached shows up as `unbound_exporter_scrape_success
-0` rather than as missing data. `/metrics` needs the Docker socket — publish
-it on loopback or on a private monitoring interface, never publicly. If you
-change `METRICS_PORT`, change the container side of the `ports:` mapping to
-match (`updater/lib/metrics.sh` binds the port it is given).
-
-### The alerts, what they mean, and the first action
-
-| Alert | What happened | First action |
-|---|---|---|
-| `UnboundDown` (critical, 2m) | The scrape cannot reach `unbound-control` in the resolver container, or Prometheus cannot reach the endpoint at all. | Check clients first: `dig @<host> . SOA`. If DNS is dead, go to runbook (b). If DNS answers, the metrics sidecar or the socket is the problem, not the resolver. |
-| `UnboundServfailRatioHigh` (warning, 10m) | More than 5 % of answers are SERVFAIL over 5 minutes. | `docker compose logs unbound \| grep -i servfail` — `log-servfail: yes` prints the reason. Then check upstream reachability and the host clock (DNSSEC signatures expire). |
-| `UnboundNoDnssecValidation` (warning, 1h) | Queries are flowing but nothing validated in an hour. | Confirm with `dig @<host> . SOA +dnssec` (no `ad` = not validating). Check `/var/lib/unbound/root.key` is on the named volume and readable, and that the volume was not recreated empty. |
-| `UnboundTrustAnchorProbeStale` (warning, 1h after 3 days) | The RFC 5011 probe of the root DNSKEY has not succeeded for three days; a root KSK rollover would then break validation. | Check that `root.key` on the named volume is writable by UID 65532 and that the root servers are reachable from the resolver. |
-| `UnboundAutoupdateStale` (warning, 10m after 3h) | No cycle finished for over three hours; with `INTERVAL=1h` three should have. | `docker compose ps unbound-autoupdate` and its logs. A cycle that died mid-way records itself as `error` on the way out; a container that is gone records nothing at all. |
-| `UnboundAutoupdateFailed` (warning, 5m) | The last cycle ended `blocked` or `error`: pull failure, fingerprint failure, cosign refusal, preflight rejection, or a canary that could not start or did not validate; `error` also covers a cycle that died in discovery (resolver absent for `DISCOVER_WAIT`, unreadable compose file). In all of those, production was not touched. A refused sidecar self-update (an unsigned sidecar image, or a helper that would not start) also ends `blocked`, at the end of an `up_to_date` cycle (production untouched) or of an `updated` one (production updated **successfully** first). | Read the sidecar log for the specific line. If it is a cosign refusal, go to runbook (d) — that one is a security event, not an operations event. If it is a sidecar self-update refusal, runbook (c): production is fine. |
-| `UnboundAutoupdateRolledBack` (warning) | A swap failed its post-swap gate in the last hour; production was restored and the change quarantined. | Runbook (a). |
-| `UnboundAutoupdateCritical` (critical) | The swap failed **and** the rollback did not restore a working resolver. | Runbook (b), now. Clients should already be on the other host. |
-| `UnboundAutoupdateQuarantined` (warning, 30m) | An image, a configuration or a sidecar image is being held back. The `axis` label says which. | Runbook (a), (c) or (e). Decide before `RETRY_AFTER` (24h) elapses, because the sidecar will retry on its own then. |
-
-The `for: 30m` on the quarantine alert is deliberate: the series clears itself
-when `RETRY_AFTER` elapses, so — as the comment in `alerts.yml` puts it — a
-`for:` longer than `RETRY_AFTER` would never fire at all. Note also that
-`metrics.prom` is only rewritten by `record_cycle` at the end of a cycle (and
-by the self-update helper); the scrape just serves the file. So
-`unbound_autoupdate_quarantine_active` can stay at 1 for up to `INTERVAL`
-plus `SPLAY` (and one cycle's duration) after the window has actually expired.
+Healthchecks.io: one check per host, with a grace time longer than
+`INTERVAL` plus `SPLAY`.
 
 ## Runbooks
 
-Common to all of them — where the state lives:
+The commands assume the reference project: one `docker-compose.yml` in
+`/opt/unbound`, run from that directory. With the sidecar installed as
+`docker-compose.override.yml`, add `-f docker-compose.override.yml` after
+every `-f docker-compose.yml`. The sidecar's state:
 
 ```bash
-cd /opt/unbound
 docker compose exec -T unbound-autoupdate cat /var/lib/unbound-autoupdate/state.env
 ```
 
-```
-LAST_CONFIG_HASH=aad59c1f…
-LAST_IMAGE_DIGEST=esitcparis/unbound-distroless@sha256:0d80…
-CYCLES_UP_TO_DATE=1
-LAST_CYCLE_STATUS=check_ok
-LAST_CYCLE_TS=1789637558
-LAST_CYCLE_DURATION=6
-CYCLES_CHECK_OK=1
-```
-
-`LAST_IMAGE_DIGEST` is the breadcrumb that tells you what was last known
-good; no code path reads it back as a control input.
+The keys are described in [updater/README.md](../updater/README.md#state).
 
 ### (a) An update was rolled back
 
-**What you see.** `UnboundAutoupdateRolledBack`, a Healthchecks `/fail`, and
-the notification:
+Notification `ROLLBACK performed`, alert `UnboundAutoupdateRolledBack`. The
+new image or configuration failed its checks after the swap; the previous
+image serves again, and what changed (image, configuration or both) is
+quarantined for `RETRY_AFTER`.
 
-> **ROLLBACK performed** — The swap to `<new digest>` failed its post-swap
-> validation. Production was rolled back to `<old digest>` and is healthy.
-> WARNING: the compose file still declares the failing image. Running
-> `docker compose up -d` by hand would redeploy it. The updater will not retry
-> before RETRY_AFTER=24h.
+1. Check that production answers: `dig @<host> . SOA +dnssec` shows `ad`.
+2. Read why: `docker compose logs --since 2h unbound-autoupdate`.
+3. If the notification says the configuration was not reverted, fix or
+   revert the files yourself: a rollback restores the image only.
+4. Do not run `docker compose pull`. The local tag was put back on the
+   previous image, so `docker compose up -d` alone keeps it; a pull followed
+   by `up -d` would deploy the failing image without any check. (If the
+   compose file declares a digest, `up -d` deploys that digest: change the
+   line first.)
+5. Test a fix without touching production:
+   `docker compose run --rm unbound-autoupdate check`. While the failed value
+   is still the declared one, `check` ends `skipped` (exit 2) on the
+   quarantine: change what is declared, or lift the quarantine (runbook (e)).
+6. Otherwise the sidecar tries the same value again once `RETRY_AFTER` has
+   elapsed, and rolls back again if it still fails.
 
-If the configuration also changed, the body carries an extra sentence:
+### (b) The resolver is down on this host
 
-> NOTE: the bind-mounted configuration file was NOT reverted — only the image
-> was pinned back. Production is recreated on the previous image but is still
-> reading the CURRENT configuration on disk. A human must fix or revert that
-> file.
+Notification `CRITICAL: rollback failed`, alert `UnboundAutoupdateCritical`,
+or `UnboundDown` with no DNS answer. After a failed rollback the next cycle
+tries once more; if that fails too, the sidecar leaves the resolver as it
+finds it.
 
-**What is quarantined.** Every axis that actually changed in that cycle, and
-only those:
-
-| Axis | Keys in `state.env` | Set when |
-|---|---|---|
-| image | `QUARANTINE_DIGEST`, `QUARANTINE_TS` | the declared digest differed from the running one |
-| config | `CONFIG_QUARANTINE_HASH`, `CONFIG_QUARANTINE_TS` | the bind-mount fingerprint differed from the recorded one |
-
-Both are set when both changed. A quarantine holds for `RETRY_AFTER` (default
-24h) from its timestamp, and only for that exact value: a **different** digest
-or a **different** fingerprint always gets a fresh attempt.
-
-**Do not run `docker compose up -d` by hand.** The rollback pin lives in the
-sidecar's own state volume (`/var/lib/unbound-autoupdate/rollback.yml`) and is
-passed to Compose for that one invocation only. Your project file still
-declares the tag that resolved to the failing image, so a plain `up -d`
-redeploys exactly what was just rolled back — with no canary in front of it.
-
-**Steps.**
-
-1. Confirm production is serving: `dig @<host> . SOA +dnssec` shows `ad`, and
-   `docker inspect unbound --format '{{.State.Health.Status}}'` is `healthy`.
-2. Read why it failed: `docker compose logs --since 2h unbound-autoupdate`.
-   The post-swap gate refuses in five ways — `docker compose ps -q` failed or
-   named no container for the service, the service came back on the *same*
-   container id (Compose did not recreate), the running digest is not the
-   declared one, the probe address could not be determined, or the resolver
-   did not pass the same validation the canary passed. The 45 s in the code is
-   `wait_resolver`'s budget for the first answer only; `validate_resolver`
-   then retries each of its queries up to four times with 5 s between
-   attempts, so the real ceiling is longer.
-3. If the configuration changed, fix or revert the file yourself. Nothing
-   reverted it.
-4. Reproduce without touching production:
-   `docker compose run --rm unbound-autoupdate check`. **`check` honours the
-   quarantine.** Only the "nothing changed, nothing to do" short-circuit looks
-   at `CHECK_ONLY`; the image and configuration quarantine gates do not look
-   at `CHECK_ONLY` either: each applies whenever its own axis changed, before
-   the canary. So while the quarantine is open and the
-   declared image (or the configuration on disk) is the quarantined value,
-   `check` logs `update skipped (quarantine)`, exits **2** and canaries
-   nothing. To re-test the change, lift the quarantine first — runbook (e) —
-   or change what is declared, which is a different value on that axis and is
-   never quarantined. Reproduced with a seeded `CONFIG_QUARANTINE_HASH`:
-
-   ```
-   ts=… level=warn msg="configuration aad59c1f… is quarantined after a failed deployment — not retrying yet"
-   ts=… level=notice event=skipped subject="update skipped (quarantine)"
-   EXIT=2
-   ```
-5. Decide before 24h: either leave it (the sidecar retries when the window
-   lapses, and will roll back again if it is still broken), or lift the
-   quarantine early — runbook (e) — or change what is declared.
-
-### (b) Rollback failed — DNS is down on this host
-
-**What you see.** `UnboundAutoupdateCritical`, and:
-
-> **CRITICAL: rollback failed** — The swap to `<new>` failed AND the rollback
-> to `<old>` did not restore a working resolver. DNS is likely down on this
-> host. MANUAL INTERVENTION REQUIRED.
-
-**Steps.**
-
-1. Make sure clients are covered: the other host must be answering. Check it
-   from a client, not from the broken host.
-2. Find a known-good digest: `LAST_IMAGE_DIGEST` in `state.env`, or the
-   sidecar's own pin at `/var/lib/unbound-autoupdate/rollback.yml`, or the
-   releases page.
-3. Stop the updater so it cannot fight you:
-   `docker compose stop unbound-autoupdate`.
-4. Pin by digest with an override **inside the project directory**, so the
-   sidecar can still read it later:
+1. Check from a client that the other host answers.
+2. If the notification says the configuration was not reverted, revert it
+   first: the previous image will not start on a broken configuration
+   either.
+3. Stop the sidecar: `docker compose stop unbound-autoupdate`.
+4. Find a known-good digest: `LAST_IMAGE_DIGEST` in `state.env` is the image
+   of the last successful update (or of the baseline); the releases page
+   lists every published digest.
+5. Pin the resolver to it with an override file **in the project
+   directory**, where the sidecar can read it:
 
    ```bash
-   cat > /opt/unbound/pin.yml <<'EOF'
+   cat > pin.yml <<'EOF'
    services:
      unbound:
        image: esitcparis/unbound-distroless@sha256:<known-good>
    EOF
    docker compose -f docker-compose.yml -f pin.yml up -d --no-deps unbound
-   dig @127.0.0.1 . SOA +dnssec | grep -E '^;; flags'
+   dig @127.0.0.1 . SOA +dnssec | grep '^;; flags'
    ```
 
-   Two things follow from `updater/lib/discover.sh`. The override **must** be
-   readable inside the sidecar at the same absolute path, or the next cycle
-   dies with "compose file … is not readable from inside the sidecar" — that
-   is why it goes in `/opt/unbound`. And the sidecar only filters its *own*
-   rollback files out of the discovered file list, so once you restart the
-   updater it will treat your `pin.yml` as part of the declared project and
-   compare against the pinned digest. While the pin is in place, that is
-   exactly what you want.
-5. Restart the updater: `docker compose start unbound-autoupdate`.
-6. When the underlying problem is fixed: delete `pin.yml` and
-   `docker compose up -d --no-deps unbound` to hand control back — the
-   container must be recreated without the override for Compose to stop
-   stamping it on the file list.
+6. Once DNS answers, start the sidecar again:
+   `docker compose start unbound-autoupdate`. If a swap is still recorded,
+   its first cycle settles it first
+   ([What a cycle does](../updater/README.md#what-a-cycle-does), step 3).
 
-### (c) Sidecar self-update failed
+   Compose records the file list on the container, and the sidecar reads the
+   project from that list: while the pin is in place, the pinned digest is the
+   declared image, and the cycles end `up to date`.
+7. To hand control back: `rm pin.yml && docker compose up -d --no-deps unbound`.
 
-**What you see.** `unbound_autoupdate_quarantine_active{axis="self"} 1`, and:
+### (c) The sidecar's self-update failed
 
-> **sidecar self-update FAILED — rolled back** — The new sidecar image
-> `<new>` did not come up. Services `<…>` were pinned back to `<old>`.
-> `<new>` is quarantined for RETRY_AFTER=24h. The compose file still declares
-> the failing tag.
+Notification `sidecar self-update FAILED — rolled back`, or
+`CRITICAL: sidecar self-update FAILED and rollback failed`; alert
+`UnboundAutoupdateQuarantined` with `axis="self"`. The resolver is not
+involved; the sidecar, and possibly `/metrics`, are.
 
-or, worse:
+1. A helper container may still be at work:
+   `docker ps --filter label=unbound-autoupdate.helper=1`. It is removed when
+   it exits: read `docker logs <id>` while it runs.
+2. `docker compose ps`: which image do `unbound-autoupdate` and
+   `unbound-metrics` run? Do not run `docker compose pull` on them: the
+   failing image would come back without verification.
+3. To hold the sidecar on a known-good image while the failure is
+   investigated, pin both of its services by digest, in the project
+   directory:
 
-> **CRITICAL: sidecar self-update FAILED and rollback failed** — Neither
-> `<new>` nor `<old>` could be brought up for `<…>`. Automatic updates are
-> DOWN on this host. MANUAL INTERVENTION REQUIRED.
+   ```bash
+   cat > pin.yml <<'EOF'
+   services:
+     unbound-autoupdate:
+       image: esitcparis/unbound-autoupdate@sha256:<known-good>
+     unbound-metrics:
+       image: esitcparis/unbound-autoupdate@sha256:<known-good>
+   EOF
+   docker compose -f docker-compose.yml -f pin.yml up -d --no-deps unbound-autoupdate unbound-metrics
+   ```
 
-**What it means.** The resolver is untouched — self-update runs only at the
-*end* of a cycle that already ended `up_to_date` or `updated`. What is broken
-is the updater, and possibly `/metrics`. The recreation is done by an
-ephemeral helper container started from the new image (a `compose up` issued
-from the container being replaced would die mid-way), which moves the
-sidecar's own service first and alone, requires it to be running and
-un-restarted 30 s later and to be a genuinely new container on the verified
-digest, and only then moves the other services on that image.
+   Self-update reads the files its own container was created from, so it
+   sees the pin and leaves those services alone. To undo:
+   `rm pin.yml && docker compose up -d --no-deps unbound-autoupdate unbound-metrics`.
+   `SELF_UPDATE=0` disables self-update altogether.
 
-**Steps.**
+### (d) Signature verification failed, or could not be done
 
-1. Is a helper still at work? `docker ps --filter label=unbound-autoupdate.helper=1`.
-   Only one runs at a time; a cycle that sees one skips self-update.
-   It runs with `--rm`, so capture `docker logs <id>` *while it exists*.
-2. Confirm the resolver is fine: `dig`, and the healthcheck.
-3. Confirm what the sidecar services are on:
-   `docker compose ps` and `docker inspect <container> --format '{{.Image}}'`.
-   The helper's pin is at `/var/lib/unbound-autoupdate/self-rollback.yml`.
-4. Read `SELF_QUARANTINE_DIGEST` / `SELF_QUARANTINE_TS` in `state.env`. The
-   `self` axis is separate on purpose: a broken sidecar release never blocks
-   resolver updates.
-5. If neither image came up (the critical variant), pin the sidecar services
-   by digest with an override exactly as in runbook (b), and remember that
-   with the sidecar down nothing is updating or scraping this host.
+The cycle ends `blocked` with one of four notifications. In every case
+nothing was deployed or recreated, and a new image that was refused or could
+not be checked was never run.
 
-### (d) Signature verification failed
+**`signature could not be checked`** or **`sidecar signature could not be
+checked`**: the registry (often its rate limit) or the transparency log did
+not answer. Not a security event. Check the host's access to the registry
+and to `tuf-repo-cdn.sigstore.dev`, and the registry credentials
+(`DOCKER_CONFIG`). The next cycle tries again.
 
-**What you see.** Cycle status `blocked`, and:
+**`signature verification FAILED`** or **`sidecar signature verification
+FAILED`**: a signature was checked and refused. Treat it as a security
+event. If the refused image is the one already running, it keeps serving (the
+notification says so), but nothing is canaried or recreated on it.
 
-> **signature verification FAILED** — Image `<digest>` is not signed by the
-> expected release pipeline. Deployment refused; production untouched.
-> Investigate immediately.
-
-or the sidecar variant:
-
-> **sidecar signature verification FAILED** — … an unsigned sidecar image in
-> the registry is a supply-chain incident.
-
-**What it means.** `updater/lib/verify.sh` is fail-closed: the image was
-pulled but is **never run**, not even as a canary. Production is still on the
-old image and still serving. This is a security event.
-
-**Do not bypass it.** Do not set `COSIGN_PUBLIC_KEY` to something more
-convenient, do not set `COSIGN_IGNORE_TLOG=1` (key mode only, and it exists
-for private mirrors that re-sign, not for silencing a refusal), and do not
-loosen `COSIGN_IDENTITY_REGEXP` or `COSIGN_ISSUER`.
-
-**Steps.**
-
-1. Reproduce by hand with the command in *Egress* above, against the exact
-   digest from the log. Keep cosign's own stderr — the sidecar prints it.
-2. Compare the digest with the one on the releases page for that tag.
-3. If the digest is not one this project published, you are looking at a
-   registry compromise or an account takeover: freeze updates on every host
-   (`SELF_UPDATE=0` and stop the loop, or pin as in runbook (b)) and escalate.
-4. If it is legitimate and the signature is simply missing (a release that
-   failed to sign), the fix belongs in the release pipeline, not here.
+1. Do not work around it: do not change `COSIGN_PUBLIC_KEY`,
+   `COSIGN_IGNORE_TLOG` or the identity and issuer variables to make it pass.
+2. Verify the digest from the log by hand, with the commands in
+   [trust.md](trust.md#verifying-releases), and compare it with the digests
+   on the releases page.
+3. A digest this project did not publish: a registry or account compromise.
+   Stop updates on every host (`docker compose stop unbound-autoupdate`) and
+   report it ([SECURITY.md](../SECURITY.md)).
+4. A published digest that does not verify: report it as well; the fix is in
+   the release pipeline.
 
 ### (e) Lifting a quarantine early
 
-A quarantine is `<value key>` + `<timestamp key>` in `state.env`, and it is
-active only while the stored value equals the value being considered **and**
-`now - timestamp < RETRY_AFTER`. Four ways out, cheapest first:
+A quarantined value is retried once `RETRY_AFTER` has elapsed, or at once if
+the declared value changes. To retry the same value earlier, either lower
+`RETRY_AFTER` in the sidecar's environment and run `docker compose up -d`
+(the window is evaluated at each cycle, for every axis), or clear the keys
+with the sidecar stopped:
 
-1. **Change what is declared.** A different image digest or an edited
-   configuration is a different value on that axis and gets a fresh attempt
-   immediately. This is usually the right answer: the thing that failed was
-   the thing you changed.
-2. **Wait.** `RETRY_AFTER` (default 24h) and the next cycle retries by itself.
-3. **Shorten `RETRY_AFTER`** in the sidecar's environment and recreate it
-   (`docker compose up -d --no-deps unbound-autoupdate`). The window is
-   evaluated at check time, so a shorter value lifts every open quarantine at
-   once — image, config and self.
-4. **Clear the keys.** Stop the sidecar first: a running cycle and the
-   self-update helper both rewrite `state.env` under a lock, and an editor
-   racing them loses.
+```bash
+docker compose stop unbound-autoupdate
+docker compose run --rm --no-deps --entrypoint /bin/sh unbound-autoupdate -c \
+  "sed -i -e 's/^QUARANTINE_DIGEST=.*/QUARANTINE_DIGEST=/' \
+          -e 's/^QUARANTINE_TS=.*/QUARANTINE_TS=/' \
+          /var/lib/unbound-autoupdate/state.env"
+docker compose start unbound-autoupdate
+```
 
-   ```bash
-   docker compose stop unbound-autoupdate
-   docker compose run --rm --entrypoint /bin/sh unbound-autoupdate -c \
-     "sed -i -e 's/^QUARANTINE_DIGEST=.*/QUARANTINE_DIGEST=/' \
-             -e 's/^QUARANTINE_TS=.*/QUARANTINE_TS=/' \
-             /var/lib/unbound-autoupdate/state.env"
-   docker compose start unbound-autoupdate
-   ```
-
-   Use `CONFIG_QUARANTINE_HASH`/`CONFIG_QUARANTINE_TS` for the config axis and
-   `SELF_QUARANTINE_DIGEST`/`SELF_QUARANTINE_TS` for the sidecar axis. An
-   empty value or an empty timestamp is what "not quarantined" looks like.
-
-Whatever you clear, the change still goes through the full canary before it
-reaches production. Lifting a quarantine does not lower a gate; it only lets
-the cycle try again.
+Use `CONFIG_QUARANTINE_HASH` and `CONFIG_QUARANTINE_TS` for the configuration
+axis, `SELF_QUARANTINE_DIGEST` and `SELF_QUARANTINE_TS` for the sidecar. The
+value goes through the full canary again.
 
 ### (f) Backing up and restoring the volumes
 
-Two volumes matter. With `name: unbound` in the compose file they are
-`unbound_unbound-data` (the DNSSEC trust anchor `root.key` and the root zone
-copy) and `unbound_autoupdate-state` (`state.env`, `metrics.prom`, the
-quarantine timestamps and the cycle counters). Confirm the names with
-`docker volume ls`.
-
-Back up (stop the service first for a consistent copy — the resolver rewrites
-`root.key` and `root.zone` on its own schedule). Any image with a shell, `tar`
-and `gzip` does this — the commands below name the sidecar image because it is
-already on the host; `alpine` would do as well (the resolver's own image will
-not: it is distroless and has no shell).
-
-While the resolver is stopped, the sidecar's next cycle finds no candidate
-service, dies in discovery and is recorded as `error`, and the metrics scrape
-reports `unbound_exporter_scrape_success 0`. Expect `UnboundAutoupdateFailed`
-and, after 2 minutes, `UnboundDown` — that is the backup, not an incident.
-Either keep the stop short, or silence those two alerts for the window.
+`unbound_unbound-data` holds the trust anchor (`root.key`) and the root zone
+copy; `unbound_autoupdate-state` holds the sidecar's state. Any image with a
+shell and `tar` will do; the sidecar's image is already on the host. While
+the resolver is stopped, expect `UnboundDown` and `UnboundAutoupdateFailed`.
 
 ```bash
-cd /opt/unbound
-docker compose stop unbound
+docker compose stop unbound unbound-autoupdate
 docker run --rm --entrypoint /bin/sh \
   -v unbound_unbound-data:/src:ro -v "$PWD/backup":/backup \
   esitcparis/unbound-autoupdate:1 \
   -c 'tar czf /backup/unbound-data.tgz --numeric-owner -C /src .'
-docker compose start unbound
-
 docker run --rm --entrypoint /bin/sh \
   -v unbound_autoupdate-state:/src:ro -v "$PWD/backup":/backup \
   esitcparis/unbound-autoupdate:1 \
   -c 'tar czf /backup/autoupdate-state.tgz --numeric-owner -C /src .'
+docker compose start unbound unbound-autoupdate
 ```
 
-Restore into a genuinely fresh volume. `docker compose down` **keeps** named
-volumes and `docker volume create` on a name that already exists is a no-op,
-so without the removal step the tar merges over whatever is still in there and
-stale files survive the "restore":
+Restore into new, empty volumes (`docker compose down` keeps volumes; `-v`
+removes them, and `up --no-start` creates them again):
 
 ```bash
-docker compose down -v          # -v is what removes the named volumes
-# or, keeping the rest of the project: docker compose down
-#    docker volume rm unbound_unbound-data unbound_autoupdate-state
-
-docker volume create unbound_unbound-data
-docker run --rm --entrypoint /bin/sh \
-  -v unbound_unbound-data:/dst -v "$PWD/backup":/backup:ro \
-  esitcparis/unbound-autoupdate:1 \
-  -c 'tar xzf /backup/unbound-data.tgz --numeric-owner -C /dst'
+docker compose down -v
+docker compose up --no-start
+for v in unbound-data autoupdate-state; do
+  docker run --rm --entrypoint /bin/sh \
+    -v "unbound_$v":/dst -v "$PWD/backup":/backup:ro \
+    esitcparis/unbound-autoupdate:1 \
+    -c "tar xzf /backup/$v.tgz --numeric-owner -C /dst"
+done
 docker compose up -d
 ```
 
-`--numeric-owner` on both sides is what keeps the files owned by UID/GID
-65532, which is the user the resolver runs as. **Verified** by round-tripping
-a 65532-owned file through both commands: ownership survived.
+`--numeric-owner` keeps the files owned by UID and GID 65532, the resolver's
+user. Without a backup, a lost `unbound-data` starts the resolver from the
+anchor and zone in the image; a lost `autoupdate-state` makes the next cycle
+record a new baseline.
 
-Losing `unbound-data` is not fatal — the image ships a trust anchor and a root
-zone copy, and Unbound re-primes — but the resolver starts cold and the
-sidecar has nothing to clone until the volume exists again. Losing
-`autoupdate-state` resets the baseline: the next cycle records a new one
-(`baseline recorded`) and the counters and any open quarantine are gone.
+### (g) Upgrading the sidecar by hand
 
-### (g) Upgrading the sidecar manually
-
-Normally the sidecar replaces itself. Do it by hand when `SELF_UPDATE=0`, when
-the `self` axis is quarantined and you have decided the new image is fine, or
-when you are running a locally built image (which never self-updates — there
-is no repository digest to compare or roll back to):
+When `SELF_UPDATE=0`, or after a self-update failure you have resolved:
 
 ```bash
-cd /opt/unbound
 docker compose pull unbound-autoupdate unbound-metrics
 docker compose up -d --no-deps unbound-autoupdate unbound-metrics
-docker compose logs --tail 20 unbound-autoupdate
 ```
 
-`--no-deps` keeps the resolver out of it: the two sidecar services are
-recreated, the resolver container is not touched, and DNS keeps answering. The
-first cycle after the upgrade reads the same `state.env` from the same volume,
-so counters, the baseline and any quarantine survive.
+`docker compose pull` does not verify signatures: verify the pulled digest
+first ([trust.md](trust.md#verifying-releases)). The resolver is not
+recreated; the state volume, and with it the baseline, counters and
+quarantines, is kept.
 
-### (h) Rotating a TLS certificate under `tls/`
+### (h) Rotating a certificate under `tls/`
 
-`config_fingerprint` in `updater/lib/discover.sh` hashes **every** declared
-bind mount, not just `unbound.conf`. A mount that is a directory is expanded
-with `find -L . \( -type f -o -type l \)`, sorted, and each file contributes
-its content hash *and* its path relative to the mount — so a renewed
-certificate, a renamed file, and a Let's Encrypt `live/` layout made entirely
-of symlinks all move the fingerprint. Two failure modes are deliberately
-loud, because a configuration the sidecar cannot read whole is not one it may
-hash partially:
-
-- a directory mount that expands to no file at all →
-  `config fingerprint: directory mount '<src>' expands to no files`, cycle
-  ends `blocked`;
-- a dangling symlink → `sha256sum` fails and the cycle ends `blocked`.
-
-So: never empty the directory as an intermediate step, and never leave a
-symlink pointing at a file that is not there yet.
+The sidecar fingerprints every file of every declared bind mount, so a new
+certificate is canaried and deployed like a configuration change. A directory
+mount that contains no file, or a symbolic link to a missing file, stops the
+cycle: replace the directory in one step.
 
 ```bash
-# 1. Put the new material in place atomically (new dir, then swap)
-sudo install -d -m 755 /opt/unbound/tls.new
-sudo cp fullchain.pem /opt/unbound/tls.new/server.pem
-sudo cp privkey.pem   /opt/unbound/tls.new/server.key
-sudo mv /opt/unbound/tls /opt/unbound/tls.old && sudo mv /opt/unbound/tls.new /opt/unbound/tls
-
-# 2. Prove it before the loop touches production
-docker compose run --rm unbound-autoupdate check && echo OK
-
-# 3. Let the next cycle deploy it (it will: the fingerprint changed), or
-#    deploy now — this skips the canary, so only do it after step 2 passed:
-#    docker compose up -d --force-recreate --no-deps unbound
-#    (the sidecar does not learn the new fingerprint from a manual deploy: its
-#    next cycle canaries and recreates the resolver once more — a second
-#    brief restart)
+install -d -m 755 tls.new
+cp fullchain.pem tls.new/server.pem
+cp privkey.pem tls.new/server.key
+mv tls tls.old && mv tls.new tls
+docker compose run --rm unbound-autoupdate check   # exit 0
 ```
 
-`--force-recreate` is what the sidecar itself uses on a config-only change:
-Compose keys recreation on the service definition, and the *contents* of a
-bind-mounted file do not change that, so without it the swap would be a silent
-no-op. If the new certificate is bad, the post-swap gate rolls the image back
-but **cannot revert your files** — the notification says so, and runbook (a)
-step 3 applies.
+The next cycle deploys it. A rollback, if the new certificate fails after
+the swap, does not restore `tls.old`: runbook (a), step 3.
 
 ## Go-live checklist
 
-- [ ] Two hosts, each with the project at the **same absolute path** used on
-      both sides of the sidecar's bind mount.
-- [ ] Docker Engine + Compose v2 present on both (`docker compose version`).
-- [ ] Port 53 free on the address you publish (`ss -lntup 'sport = :53'`).
-- [ ] `net.core.rmem_max` / `net.core.wmem_max` ≥ 4194304, persisted in
-      `/etc/sysctl.d/`.
-- [ ] Host clock synchronised and monitored.
-- [ ] Egress open: registry, Sigstore, root servers (TCP+UDP 53), general
-      recursion — each tested with the commands above.
-- [ ] `unbound.conf` validated with `unbound-checkconf` **using the image that
-      will run it**.
-- [ ] `.env` present, mode 600, one `HC_URL` **per host**;
-      `docker compose config --quiet` passes.
-- [ ] `NOTIFY_HOST` set per host, so notifications name the machine.
-- [ ] Resolver tag mode chosen deliberately — pinned (A) or tracking `:1` (B)
-      — and the same on both hosts.
-- [ ] `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, named volume
-      on `/var/lib/unbound`, `ulimits.nofile`, memory limit and log rotation
-      all present.
-- [ ] Both resolvers `healthy`; `dig … . SOA +dnssec` shows `ad` on both.
-- [ ] `docker compose logs unbound-autoupdate` shows `baseline recorded` on
-      both.
-- [ ] `docker compose run --rm unbound-autoupdate check` exits **0** on both
-      — not 2, which means it never evaluated the change (lock held,
-      quarantine, or a refused major bump). Note this run pings `HC_URL`
-      and rewrites the cycle metrics like any other cycle.
-- [ ] `/metrics` scraped by Prometheus on both; `alerts.yml` loaded
-      (`promtool check rules`) and routed to a human.
-- [ ] Healthchecks.io checks receiving pings from both hosts, with a grace
-      period longer than `INTERVAL + SPLAY`.
-- [ ] Host B started ~30 min after host A.
-- [ ] Clients (DHCP option 6, `resolv.conf`, or the upstream forwarder) list
-      **both** addresses.
-- [ ] Failover rehearsed: `docker compose stop unbound` on host A, clients
-      still resolve. Expect `UnboundAutoupdateFailed` (the cycle cannot find
-      the resolver and records `error`) and `UnboundDown` after 2 minutes on
-      that host — both are the rehearsal, not an incident.
-- [ ] Volume backups taken and a restore rehearsed — runbook (f).
-- [ ] Whoever is on call has read the runbooks and knows the Docker socket
-      makes the sidecar root-equivalent on the host.
+- [ ] Two hosts; on each, the project directory at the path mounted on both
+      sides of the sidecar's bind mount.
+- [ ] Port 53 free on the published address; socket buffer limits of at
+      least 4194304; clock synchronised; egress open.
+- [ ] `unbound.conf` accepted by `unbound-checkconf` of the declared image.
+- [ ] `.env` with one `HC_URL` per host, mode 600; `NOTIFY_HOST` per host.
+- [ ] The same resolver tag mode on both hosts.
+- [ ] Both resolvers `healthy`, `ad` in `dig … . SOA +dnssec`.
+- [ ] `docker compose run --rm unbound-autoupdate check` exits 0 on both.
+- [ ] Prometheus scrapes both hosts; `alerts.yml` loaded and routed to a
+      person; Healthchecks.io receives both hosts.
+- [ ] Host B started about 30 minutes after host A.
+- [ ] Clients list both addresses; `docker compose stop unbound` on one host
+      leaves them resolving.
+- [ ] Backups taken and a restore rehearsed (runbook (f)).
+- [ ] On-call staff know that the sidecar's Docker socket is root on the
+      host ([updater/README.md](../updater/README.md#the-docker-socket-is-root-on-the-host)).
 
-## Known limits
-
-From `updater/README.md`, and they are design decisions, not gaps to work
-around:
-
-- **No Kubernetes.** The sidecar is Compose-native: it reads Compose labels,
-  runs `docker compose`, and pins rollbacks with a Compose override. On
-  Kubernetes a rollout plus a readiness probe covers the same ground.
-- **Nothing outside its own Compose project.** Discovery starts from the
-  sidecar's own `com.docker.compose.project` label; containers in another
-  project, or outside Compose entirely, are invisible to it.
-- **No `network_mode: host` canary.** A host-networked container cannot join
-  the canary's isolated network, so a host-networked sidecar refuses up front
-  — and a host-networked *resolver* requires a host-networked sidecar to be
-  probed at all. The reference project uses the default bridge for this
-  reason.
-- **Configuration files are never reverted.** A rollback pins the previous
-  image; it cannot un-edit a bind-mounted file. When the configuration is what
-  changed, the notification says so and a human fixes the file.
-- **Locally built sidecar images never self-update.** No repository digest
-  means nothing to compare against and nothing to roll back to; the cycle logs
-  it and moves on. The same rule applies to the resolver: a locally built
-  resolver image is refused rather than guessed at.
-- **No Grafana dashboards.** Plain Prometheus exposition; build what you like
-  on top of it.
-
-## See also
-
-- [`updater/README.md`](../updater/README.md) — the sidecar in detail:
-  variables, per-outcome behaviour, `/metrics`, self-update, the Docker socket
-- [`usage.md`](usage.md) — run recipes, Kubernetes, DoT/DoH, tuning,
-  troubleshooting
-- [`trust.md`](trust.md) — release gates, signing, how to verify an image
-- [`observability/`](observability/) — the scrape config and the alert rules
+What the sidecar does not do:
+[updater/README.md](../updater/README.md#what-it-does-not-do).

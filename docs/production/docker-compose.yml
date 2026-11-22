@@ -1,76 +1,58 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# Reference production Compose project for unbound-distroless + the
-# unbound-autoupdate sidecar. Documented in ../production.md.
+# Reference production Compose project: the resolver and the update sidecar.
+# Documented in ../production.md; tests/sidecar-docs.sh validates it.
 #
-# This file is written for /opt/unbound. The project directory's absolute path
-# appears on BOTH sides of the sidecar's bind mount, and it must: the sidecar
-# runs `docker compose` against these very files, and the Docker daemon then
-# applies the project's bind mounts on the host (see updater/lib/discover.sh).
-# If you put the project somewhere else, change /opt/unbound everywhere below.
+# Written for the project directory /opt/unbound. That path appears on BOTH
+# sides of the sidecar's bind mount below, and must: the sidecar runs
+# `docker compose` against these files from inside its container, and the
+# Docker daemon applies the project's bind mounts on the host
+# (updater/README.md, "The same-absolute-path rule"). Elsewhere, change
+# /opt/unbound on both sides.
 #
-# Secrets (HC_URL, WEBHOOK_URL) live in a .env file next to this one, mode 600.
-# ──────────────────────────────────────────────────────────────────────────────
+# HC_URL (and WEBHOOK_URL if used) come from a .env file next to this one.
 name: unbound
 
 services:
   unbound:
-    # MODE A — pinned, manual updates (this file's default).
-    #   The automation never re-pushes an X.Y.Z-rN tag, so the sidecar pulls it
-    #   and finds the same digest every cycle: `up_to_date`, never a swap (a
-    #   human re-running that tag's release would republish it, though).
-    #   1.26.1-r0 was current when this file was written; take today's release.
-    #   You move this line by hand when you decide to upgrade.
-    # MODE B — tracking a major tag, automatic updates.
-    #   Replace the reference below with `esitcparis/unbound-distroless:1`.
-    #   The sidecar re-pulls the DECLARED tag every cycle, so a moving tag is
-    #   what gives it something new to canary and deploy.
-    image: esitcparis/unbound-distroless:1.26.1-r0
+    # The sidecar pulls this tag every cycle and deploys what it moves to,
+    # after a canary. To change the resolver only by hand, replace it with an
+    # X.Y.Z-rN tag or a digest from the releases page
+    # (../production.md, "What the resolver follows").
+    image: esitcparis/unbound-distroless:1
     container_name: unbound
     restart: unless-stopped
-    # Time Docker waits after SIGTERM before SIGKILL when the service is
-    # stopped or recreated (default 10s).
-    stop_grace_period: 20s
 
     cap_drop: [ALL]
-    cap_add: [NET_BIND_SERVICE]     # binding :53 as UID 65532
+    cap_add: [NET_BIND_SERVICE]   # binding :53 as UID 65532
     security_opt: ["no-new-privileges:true"]
 
-    # The image writes in exactly two places: /var/lib/unbound (the volume
-    # below: DNSSEC trust anchor and the hyperlocal root zone copy) and
-    # /run/unbound (the control socket and the PID file). Everything else can
-    # be read-only.
+    # The image writes only to /var/lib/unbound (the volume below) and
+    # /run/unbound (control socket, PID file).
     read_only: true
     tmpfs:
       - "/run/unbound:uid=65532,gid=65532"
 
+    # All host addresses. Port 53 already in use: README.md, "Run it".
     ports:
       - "53:53/udp"
       - "53:53/tcp"
 
     volumes:
-      # Named volume, required: the sidecar refuses to run without a named
-      # volume on /var/lib/unbound (it clones it for the canary).
+      # Named volume, required by the sidecar: it holds the DNSSEC trust
+      # anchor and the root zone copy, and the canary runs on a copy of it.
       - unbound-data:/var/lib/unbound
-      # Your configuration. Compose resolves this relative path against the
-      # project directory, i.e. /opt/unbound/unbound.conf.
       - ./unbound.conf:/etc/unbound/unbound.conf:ro
-      # Serving DoT/DoH? Mount the certificate directory too — the sidecar
-      # fingerprints EVERY declared bind mount, so a renewed certificate is
-      # canaried and redeployed like a configuration change:
       # - ./tls:/etc/unbound/tls:ro
 
-    # outgoing-range (4096) × num-threads (2) from unbound.conf = 8192 sockets
-    # for the outgoing port pool alone. Raise both together if you raise
-    # either in unbound.conf.
+    # outgoing-range 4096 x num-threads 2 in unbound.conf = 8192 sockets for
+    # the outgoing port pool alone.
     ulimits:
       nofile:
         soft: 16384
         hard: 16384
 
-    # unbound.conf's caches: msg 64m + rrset 128m + key 32m + neg 16m = 240m,
-    # plus the infra cache (infra-cache-numhosts 50000), per-thread buffers and
-    # the binary itself. 512m leaves roughly 2× headroom over the cache total.
-    # Resize this WITH the cache sizes, never on its own.
+    # unbound.conf's caches add up to 240m (msg 64m, rrset 128m, key 32m,
+    # neg 16m), before the infra cache and per-thread buffers. Change this
+    # together with the cache sizes.
     deploy:
       resources:
         limits:
@@ -82,26 +64,19 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # ── Automatic updates ───────────────────────────────────────────────────────
-  # Based on updater/compose.snippet.yml, plus SPLAY, NOTIFY_HOST,
-  # stop_grace_period, log rotation and HC_URL read from .env. The Docker
-  # socket is root on the host: read updater/README.md before enabling this.
+  # The Docker socket is root on the host: updater/README.md.
   unbound-autoupdate:
-    # The sidecar follows a major tag on purpose: it replaces itself (see
-    # updater/lib/selfupdate.sh), so a moving tag is how it gets its own
-    # updates. Pinning it immutably freezes the updater, not the resolver.
     image: esitcparis/unbound-autoupdate:1
     restart: unless-stopped
-    stop_grace_period: 30s
+    # A stop during a swap lets the swap finish first (updater/README.md,
+    # "Signals"); Docker's default 10 s would cut it short.
+    stop_grace_period: 2m
     environment:
-      # Host A: a cycle at start, then every hour plus up to 6 minutes of jitter
-      # Host B: identical, but `docker compose up -d` it ~30 min after host A
-      # (see ../production.md — SPLAY jitters one host, it does not phase two).
       INTERVAL: 1h
       SPLAY: 10%
       NOTIFY_HOST: resolver-1.example
       HC_URL: ${HC_URL:?set HC_URL in .env}
-      # WEBHOOK_URL: ${WEBHOOK_URL}
+      # WEBHOOK_URL: ${WEBHOOK_URL:?set WEBHOOK_URL in .env}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/unbound:/opt/unbound:ro
@@ -117,9 +92,9 @@ services:
     command: ["metrics"]
     restart: unless-stopped
     ports:
-      # Bind to the monitoring interface only — /metrics needs the Docker
-      # socket, so it is never published publicly. 127.0.0.1 when Prometheus
-      # scrapes through a tunnel; the host's monitoring IP otherwise.
+      # Loopback only. For a Prometheus on another host, replace 127.0.0.1
+      # with this host's address on the monitoring network: /metrics uses the
+      # Docker socket and must not be reachable from anywhere else.
       - "127.0.0.1:9167:9167"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

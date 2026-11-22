@@ -1,155 +1,192 @@
 # unbound-autoupdate
 
-A Compose-native sidecar that keeps a Docker Compose resolver on the current
-`unbound-distroless` image — and proves the new image works, with your
-configuration, before production ever sees it. The same image also serves a
-Prometheus `/metrics` endpoint for the resolver and for the updater itself.
+A sidecar for a Docker Compose project running `unbound-distroless`. Every
+hour (`INTERVAL`) it checks whether the resolver's declared image or configuration has
+changed; when one has, it verifies the image's signature, tries image and
+configuration together on a copy of production's state, replaces the
+resolver, checks it, and rolls back if the checks fail. The same image serves
+a Prometheus `/metrics` endpoint for the resolver and for itself, and keeps
+itself up to date.
 
-## What it does
+## What a cycle does
 
-One cycle, every `INTERVAL`:
+In this order (`updater/unbound-autoupdate`):
 
-1. **Discover** — finds the resolver service in its own Compose project from
-   the container labels (or `TARGET_SERVICE`), reads the project's declared
-   state with `docker compose config`, and the running state with
-   `docker inspect`. Those two are kept apart on purpose: the canary must test
-   what Compose *will* deploy, not what happens to be mounted right now.
-2. **Compare image and configuration** — `docker compose pull` on the service,
-   then the declared repository digest against the running one. Independently,
-   a SHA-256 fingerprint over *every* declared bind mount (not just
-   `unbound.conf`: a rotated certificate is a change too) against the one
-   recorded at the last successful cycle. A mount that is a directory is
-   expanded to the files beneath it **with symlinks followed**, so a `tls/`
-   directory in the Let's Encrypt `live/` layout is covered like any other;
-   a dangling symlink, or a directory mount that expands to no file at all,
-   fails the cycle loudly rather than quietly contributing nothing. Nothing
-   changed and nothing is due: the cycle ends there.
-3. **Quarantine** — an image digest or a configuration fingerprint that
-   already failed a deployment is not retried before `RETRY_AFTER`. The two
-   are separate axes, so a bad configuration does not hold back a good image,
-   and a different digest or an edited file always gets a fresh attempt.
-4. **Major guard, then cosign** — a change of major Unbound version (read from
-   the images' `org.opencontainers.image.version` labels) is refused unless
-   `ALLOW_MAJOR=1` — if either image carries no version label the guard is
-   skipped, with a warning. Then the new image's signature is verified with
-   `cosign`,
-   fail-closed: an unverified image is never run, not even as a canary.
-5. **Preflight** — the new image's own `unbound-checkconf` runs against the
-   declared configuration. This is what turns "the canary never came up" into
-   an error message naming the offending directive or file.
-6. **Canary on cloned state** — the new image starts on an isolated bridge
-   network, with the declared bind mounts, the declared runtime settings
-   (`read_only`, `tmpfs`, `environment`, `ulimits`, `sysctls`) and a **copy**
-   of production's `/var/lib/unbound` volume. It must answer `VALIDATE_DOMAIN`
-   over UDP and over TCP, and — unless `REQUIRE_DNSSEC=0` — return the AD flag
-   on the root SOA. Production keeps serving throughout and is not touched.
-7. **Swap** — `docker compose up -d --no-deps` on the one service (with
-   `--force-recreate` when only the configuration changed, because Compose
-   keys recreation on the service definition, which the *contents* of a
-   bind-mounted file do not affect).
-8. **Post-swap gate, then rollback** — Compose exiting 0 is not proof: the
-   container id must have changed, the running digest must now be the declared
-   one, and the resolver must pass the *same* validation the canary passed. If
-   any of that fails, an override pins the previous digest back, production is
-   revalidated, the failing change is quarantined, and you are notified.
+1. **Lock.** One cycle at a time per state directory. A cycle that finds the
+   lock taken ends at once (exit 2, nothing recorded, no ping).
+2. **Discover.** The resolver is the one service of the sidecar's own Compose
+   project described under `TARGET_SERVICE` ([Variables](#variables)). The
+   project's declared state is read with `docker compose config`, using the
+   compose files recorded on the resolver container; the running state with
+   `docker inspect`. When no resolver container runs, the cycle waits up to
+   `DISCOVER_WAIT` seconds for one.
+3. **Finish an interrupted swap.** If the previous cycle stopped between the
+   start of a swap and its verdict (state key `SWAP_INTENT`), a stopped or
+   only created resolver container is accepted, and:
+   - a resolver running neither the previous nor the new image: the intent
+     is dropped;
+   - the previous image still running, production unchanged: the intent is
+     cleared, and leftover created or exited containers of the service are
+     removed;
+   - the new image running: it gets the post-swap checks of step 13, and is
+     rolled back if they fail;
+   - otherwise: the previous image is put back (step 14), without
+     quarantine since the new image never ran.
 
-So the new image is validated with **your** configuration and a clone of
-**your** state before anything is deployed.
+   A recovery that fails is not tried again: the intent is cleared and the
+   cycle ends `critical`.
+4. **Name what runs.** The images the resolver and the sidecar run are given a
+   local name of the sidecar's own, `<repository>:autoupdate-<project>-<service>`,
+   so their local records survive later tag moves.
+5. **Resolve and pull by digest.** The declared tag is resolved to the digest
+   it names in the registry now, with a `HEAD` request for its manifest (the
+   registry's token protocol, the static credentials of `DOCKER_CONFIG`;
+   plain HTTP only for a registry on a loopback address). Where that fails,
+   the Docker daemon is asked (Engine API `GET /distribution/<ref>/json`, with
+   the daemon's registry configuration). That digest is pulled unless it is
+   already present. No tag moves: until the swap, the operator's tag keeps
+   naming the image that runs.
+6. **Compare.** The image changed if the pulled image's ID differs from the
+   running container's. The configuration changed if the SHA-256 fingerprint
+   of the declared bind mounts differs from the one recorded (only with
+   `WATCH_CONFIG=1`). The fingerprint covers every file of every bind mount
+   of the resolver service except those under `/var/lib/unbound` and
+   `FINGERPRINT_EXCLUDE`; directories are expanded with symbolic links
+   followed, and a directory with no file or a link to a missing file stops
+   the cycle.
+7. **Baseline.** On the first cycle (no recorded fingerprint) the fingerprint
+   and the running image are recorded and a `baseline` notification is sent;
+   the cycle continues.
+8. **Nothing changed** (and not `check` mode): the running image's signature
+   is verified if this digest has not passed under the current verification
+   settings yet; then self-update (step 15). The cycle ends `up_to_date`.
+9. **Quarantine.** An image or a configuration that failed after a swap is
+   not tried again before `RETRY_AFTER`, unless it changes. Either quarantine
+   ends the cycle, including when the other axis carries a change that is not
+   quarantined.
+10. **Major version.** The leading number of the
+    `org.opencontainers.image.version` labels of the running container and the
+    new image must be equal, unless `ALLOW_MAJOR=1`. A new label without a
+    leading number is refused the same way; a running label without one, or a
+    missing label, skips this check with a warning in the log.
+11. **Host network.** A sidecar with `network_mode: host` cannot join the
+    canary's network: a cycle with a change stops here.
+12. **Verify, downgrade, preflight, canary.** The image to deploy (also the
+    unchanged image of a configuration-only change) is verified with cosign,
+    once per digest and verification settings. A new image whose version
+    label (`X.Y.Z` or `X.Y.Z-rN`) is older than the running one is then
+    refused, unless `ALLOW_DOWNGRADE=1`; revisions are compared only when
+    both labels carry one, and a label of another form skips this check with
+    a warning. Its `unbound-checkconf` then checks the declared
+    configuration. The canary is that image started on an isolated
+    network with a copy of production's `/var/lib/unbound` volume, the
+    declared bind mounts read-only, and the declared `read_only`, `tmpfs`,
+    `environment`, `ulimits` and `sysctls`; its capabilities are always
+    `--cap-drop=ALL --cap-add=NET_BIND_SERVICE` with `no-new-privileges`. It
+    must answer within 90 s, then pass the validation below. In `check` mode
+    the cycle ends here (`check_ok`).
+13. **Swap.** The resolver's cache is exported (`KEEP_CACHE`); the intent is
+    recorded (`SWAP_INTENT`); the operator's tag is pointed at the verified
+    image and `docker compose up -d --no-deps --pull never` recreates the
+    service from the operator's own files (`--force-recreate` when only the
+    configuration changed). The new container must be a different container,
+    run the verified image ID, answer within 45 s and pass the validation.
+    Then the cache is reloaded, quarantines are cleared and the cycle ends
+    `updated`, followed by self-update.
+14. **Rollback**, when step 13 fails: the operator's tag is pointed back at
+    the previous image and the service is recreated with
+    `--force-recreate --pull never`. For a service declared by digest, or by a
+    tag of another repository than the previous image's, no tag can name the
+    previous image: an override file in the state directory (`rollback.yml`)
+    names its keep name instead, and the declared tag is put back on what it
+    named before the swap. A new container running the previous image must
+    then pass the validation. What changed (image, configuration or both) is
+    quarantined. The configuration files themselves are not reverted. A
+    rollback that fails leaves `SWAP_INTENT` set: the next cycle tries once
+    more (step 3).
+15. **Self-update**, after `up_to_date` and `updated`: see
+    [Self-update](#self-update).
+
+**Validation**, for the canary and after a swap or rollback: `VALIDATE_DOMAIN`
+resolves with NOERROR over UDP and over TCP; the root SOA carries the AD flag
+(unless `REQUIRE_DNSSEC=0`); with `STRICT_BOGUS_CHECK=1`, `dnssec-failed.org`
+fails with SERVFAIL. Each query is tried up to four times, 5 s apart.
+
+**Signals.** SIGTERM ends a cycle (status `error`), except between the start
+of a swap and its verdict: the swap or rollback finishes first. A container
+killed in between (stop timeout, reboot), even inside `docker compose up`,
+is finished by the next cycle (step 3); `stop_grace_period: 2m` on the sidecar service gives a swap time to
+finish.
+
+After every cycle, the operator's tags name the images that run, so a plain
+`docker compose up -d` recreates nothing. The exception is a rollback through
+`rollback.yml`: the compose file then names something other than what runs
+(for a digest, the failed image), and `up -d` deploys what it names. Only `docker compose pull` (or
+`pull_policy: always`) followed by `up -d` would deploy what the registry
+serves under the tag, without the sidecar's checks.
+
+On the containerd image store (the default of a fresh Docker Engine 29
+install), this needs Docker Compose 5.5.0 or later on the host
+(`docker compose version`). The sidecar recreates containers with the Compose
+it ships, which is newer than 5.5.0, and Compose 5.5.0 changed the image
+identity it records on each container: an older Compose sees a container
+created by a newer one as out of date, and its next `up -d` recreates it on
+the same image. Nothing unverified is deployed, but the resolver restarts.
+The classic image store is not affected.
 
 ## The Docker socket is root on the host
 
-The sidecar mounts `/var/run/docker.sock`. Anyone who can write to that socket
-can start a privileged container and own the host, so this is a real decision,
-not a formality — but **no container-based updater can do without it**: pulling
-an image, running a canary and recreating a service are all Docker API calls.
+The sidecar mounts `/var/run/docker.sock`. Whoever can use that socket can
+start a privileged container and control the host, so the sidecar is a
+root-equivalent component, and runs as root. Through the socket it:
 
-What this sidecar does with the socket:
+- reads containers, images and Compose labels (`docker ps`, `docker inspect`,
+  `docker image inspect`, `docker info`);
+- resolves tags to digests when the registry cannot be asked directly
+  (Engine API distribution endpoint), pulls by
+  digest, tags images (the operator's tag at a swap or rollback, the
+  `autoupdate-<project>-<service>` keep names) and removes the digest references it pulled;
+- runs `docker compose config`, `ps` and `up` on its own project;
+- runs containers: `unbound-checkconf`, the copy of the state volume, the
+  canary (with its network and volume), and the self-update helper;
+- runs `unbound-control` in the resolver (`docker exec`: statistics at every
+  scrape, cache export and import around a swap) and copies its
+  `/var/lib/unbound/root.key` out at every scrape (`docker cp`).
 
-- `docker inspect` / `docker ps` on its own container and its project's, to
-  discover the resolver and read the Compose labels;
-- `docker compose pull` and `docker compose config` on the project;
-- `docker run --rm` for the `unbound-checkconf` preflight and for the state
-  clone, and `docker run -d` for the canary, plus the `docker network` and
-  `docker volume` create/remove that the canary needs;
-- `docker compose up -d --no-deps` on the one resolver service — the swap,
-  and the rollback;
-- `docker exec … unbound-control` in the resolver: `stats_noreset` on every
-  metrics scrape and, with `KEEP_CACHE=1`, `stats_noreset`/`dump_cache`/
-  `load_cache` around a swap; `docker cp` of `/var/lib/unbound/root.key` on
-  every scrape, for the trust-anchor metrics;
-- `docker run -d` of an ephemeral helper from the new sidecar image when it
-  updates itself (see [Self-update](#self-update)).
-
-If you run something like `tecnativa/docker-socket-proxy`, the sidecar needs
-`POST=1` plus `CONTAINERS`, `IMAGES`, `NETWORKS`, `VOLUMES`, `EXEC` and
-`INFO`. That set allows creating and starting arbitrary containers with
-arbitrary mounts, so the proxy buys you very little here: treat the sidecar as
-a root-equivalent component on the host either way, and keep the rest of the
-project's attack surface small instead.
+A socket proxy that allows these calls allows creating containers with
+arbitrary mounts, so it does not reduce what the sidecar can do. Not using the
+sidecar: [Updating without the sidecar](../docs/usage.md#updating-without-the-sidecar).
 
 ## Install
 
-Add both services to the resolver's own Compose project — the sidecar only
-ever manages services that carry its own `com.docker.compose.project` label.
-This is [`compose.snippet.yml`](compose.snippet.yml):
+The sidecar joins the resolver's own Compose project: it only ever manages
+services of the project its own container belongs to. From the directory of
+the project started in the README's [Run it](../README.md#run-it) section:
 
-```yaml
-  unbound-autoupdate:
-    image: esitcparis/unbound-autoupdate:1
-    restart: unless-stopped
-    environment:
-      INTERVAL: 1h
-      # One Healthchecks.io check per host. The updater pings /start, success
-      # and /fail, so every failure alerts immediately.
-      HC_URL: https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-      # NOTIFY_HOST: resolver-1.example   # defaults to the Docker daemon's host name
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/unbound:/opt/unbound:ro
-      - autoupdate-state:/var/lib/unbound-autoupdate
-
-  unbound-metrics:
-    image: esitcparis/unbound-autoupdate:1
-    command: ["metrics"]
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9167:9167"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - autoupdate-state:/var/lib/unbound-autoupdate:ro
-
-volumes:
-  autoupdate-state:
-```
-
-Replace `/opt/unbound` with the absolute path of *this* project's directory on
-both sides of the mount, then:
-
+<!-- sidecar:install — tests/sidecar-docs.sh runs the first line and validates the resulting project -->
 ```bash
+curl -fsSL https://raw.githubusercontent.com/ESITC-Paris/unbound-distroless/main/updater/compose.snippet.yml | sed "s|/opt/unbound|$PWD|g" > docker-compose.override.yml
 docker compose up -d
-docker compose logs -f unbound-autoupdate
+docker compose logs unbound-autoupdate
 ```
 
-The first cycle records a baseline of the configuration (no configuration
-canary on first sight of a resolver that is already running fine); if the
-declared image already differs from the running one, that same cycle then
-canaries and deploys it:
+Without `-f`, `docker compose` reads `docker-compose.override.yml` together
+with `docker-compose.yml`, so the project now has two more services: the
+update loop (`unbound-autoupdate`) and the `/metrics` endpoint
+(`unbound-metrics`, on `127.0.0.1:9167`). The `sed` writes the project's
+absolute path on both sides of the bind mount (next section). A command that
+names its files with `-f` must name both:
+`docker compose -f docker-compose.yml -f docker-compose.override.yml …`.
+To be alerted, uncomment `HC_URL` (or set `WEBHOOK_URL`) in
+`docker-compose.override.yml` and run `docker compose up -d` again.
 
-```
-ts=2026-09-16T10:00:00Z level=info msg="unbound-autoupdate 1.0.0-r0 starting: interval=1h splay=10%"
-ts=2026-09-16T10:00:04Z level=info msg="baseline recorded (image esitcparis/unbound-distroless@sha256:…)"
-ts=2026-09-16T10:00:04Z level=notice event=baseline subject="baseline recorded"
-```
+Requirements on the resolver service: a **named volume on
+`/var/lib/unbound`** (the canary runs on a copy of it), and an image pulled
+from a registry, which carries a repository digest; a locally built resolver
+image is refused.
 
-The resolver service must have a **named volume on `/var/lib/unbound`** (the
-DNSSEC trust anchor lives there, and it is what the canary clones) and must
-declare an image that carries a repository digest — a locally built image is
-refused rather than guessed at.
-
-For a full two-host production deployment — host prerequisites, a hardened
-Compose reference that was brought up and validated before being written down,
-Prometheus alerts and a runbook per failure mode — see
-[`../docs/production.md`](../docs/production.md).
+A two-host deployment with alerts and runbooks:
+[docs/production.md](../docs/production.md).
 
 ## The same-absolute-path rule
 
@@ -171,244 +208,302 @@ compose file '/opt/unbound/docker-compose.yml' is not readable from inside the s
 
 ## Validate without deploying
 
-`check` mode runs the whole cycle — pull, compare, cosign (when the pulled
-digest differs from the running one), preflight, canary, DNS validation — and
-stops before the swap. Use it after editing
-`unbound.conf`, or to see what the next cycle would do:
-
 ```bash
 docker compose run --rm unbound-autoupdate check
 ```
 
-Exit 0 means the declared image and configuration passed everything on a
-canary with a clone of production state; production was not touched.
+Runs a cycle up to the end of the canary (steps 1 to 12) and stops before the
+swap, even when nothing changed. Exit 0: the declared image and configuration
+passed on a copy of production's state. Exit 1: a check refused them, or the
+cycle failed before judging (the log says which). Exit 2: not evaluated
+(another cycle holds the lock, a quarantine, or a refused major version). The
+run is recorded like any cycle: Healthchecks pings, `state.env` counters and
+metrics.
 
 ## Variables
 
+The sidecar's configuration is its environment. `tests/sidecar-docs.sh`
+checks that this table lists exactly the variables the code reads, with the
+code's defaults. Durations accept `45s`, `30m`, `1h`, `2d` or a number of
+seconds.
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `RUN_MODE` | `loop` | `loop`, `once`, `check`, `metrics` or `idle`. Overridden by a command argument (`command: ["metrics"]`). |
-| `INTERVAL` | `1h` | Time between cycles in `loop` mode. `45s`, `30m`, `1h`, `2d` or bare seconds. |
-| `SPLAY` | `10%` | Random jitter added to `INTERVAL`, as a percentage of it or an absolute duration, so a fleet never updates in the same minute. |
-| `WATCH_CONFIG` | `1` | Also treat a change in the declared bind mounts as an update to canary and deploy. |
-| `TARGET_SERVICE` | auto | The resolver service. Discovery picks the one sibling service in the project whose image reference contains `unbound`, excluding services on the sidecar's own image repository; set this when there are several. |
-| `ALLOW_MAJOR` | `0` | Accept a major version bump (resolver **and** sidecar) instead of refusing it. |
-| `RETRY_AFTER` | `24h` | How long a failed image, configuration or sidecar image stays quarantined. |
-| `VALIDATE_DOMAIN` | `example.com` | Domain queried to decide a resolver is healthy. |
-| `REQUIRE_DNSSEC` | `1` | Require the AD flag on the root SOA. Set to `0` only for a resolver deliberately run without the validator (a forwarder to an unsigned internal upstream). |
-| `STRICT_BOGUS_CHECK` | `0` | Also require `dnssec-failed.org` to SERVFAIL. Needs working external DNS from the canary. |
-| `HC_URL` | unset | Healthchecks.io check URL. The cycle pings `/start`, then the plain URL on success or `/fail` on failure. |
-| `WEBHOOK_URL` | unset | JSON webhook for notifications (`event`, `host`, `subject`, `body`, `text`). |
-| `NOTIFY_HOST` | Docker daemon host name | Host name notifications are attributed to. Falls back to the daemon's name, then the container's. |
-| `SELF_UPDATE` | `1` | Let the sidecar update itself. See [Self-update](#self-update). |
-| `SELF_LOCK_WAIT` | `900` | Seconds the self-update helper waits for the cycle lock before writing state anyway (loudly). A live cycle legitimately holds it for minutes. |
-| `COSIGN_PUBLIC_KEY` | unset | Path to a PEM public key. Unset means keyless verification. |
-| `COSIGN_IDENTITY_REGEXP` | `https://github.com/ESITC-Paris/unbound-distroless/.*` | Keyless mode: the certificate identity that must have signed the image. |
-| `COSIGN_ISSUER` | `https://token.actions.githubusercontent.com` | Keyless mode: the OIDC issuer. |
-| `COSIGN_IGNORE_TLOG` | `0` | Key mode only: accept a signature that is not in the public Rekor log. |
-| `METRICS_PORT` | `9167` | Port `metrics` mode listens on. |
-| `STATE_DIR` | `/var/lib/unbound-autoupdate` | Where `state.env` and `metrics.prom` live. Must be writable and survive container recreation — a named volume, or a bind mount. |
-| `CHECK_ONLY` | `0` | Validate but never swap. `check` mode sets it; you rarely set it by hand. |
-| `DISCOVER_WAIT` | `60` | Seconds a cycle waits for the resolver container when it is absent — the window where `docker compose up` has removed the old one and not yet started the new one. The metrics scrape leaves this at `0` and fails fast. |
-| `FINGERPRINT_EXCLUDE` | *(empty)* | Container paths (space-separated) removed from configuration CHANGE DETECTION — for data another tool manages and applies at runtime, typically a blocklist loaded with `unbound-control local_zones`. Without it every regeneration is a canary and a container swap, which restarts unbound and empties its cache. The mount is still given to the canary, so image updates are validated against the real data. The owning tool must validate the data itself. |
-| `KEEP_CACHE` | `1` | Carry the resolver cache over a swap: exported from the outgoing container (`dump_cache`) just before it, imported into the new one (`load_cache`) only after the new one has passed its post-swap validation, and into the previous one after a rollback. Only entries still valid at export time travel: unbound's export skips expired ones, so entries kept for serve-expired are lost and must be re-learned (a host-side warm-up helps). Skipped when the unbound major.minor version changes, or when either image carries no version label. Best effort: a failure only means starting with an empty cache, never a failed update. `0` disables it. |
-| `KEEP_CACHE_MAX_ENTRIES` | `500000` | Record sets above which the cache is not exported. The export holds one worker thread of the outgoing resolver (measured: 0.8 s per 100 000 entries). |
-| `KEEP_CACHE_CHUNK` | `2000` | Entries per `load_cache` batch. One 100 000-entry import held a worker thread for 4.7 s; batches of 5 000 kept every answer under 140 ms. |
-| `KEEP_CACHE_TIMEOUT` | `120` | Seconds allowed to the export, and to the import as a whole; what is loaded by then stays. |
+| `RUN_MODE` | `loop` | `loop`, `once`, `check`, `metrics` or `idle` (no cycle; for `docker compose exec`). A command argument (`command: ["metrics"]`) takes precedence. |
+| `INTERVAL` | `1h` | Time between cycles in `loop` mode; the first cycle runs at start. |
+| `SPLAY` | `10%` | Random delay of up to this much added to each `INTERVAL`: a percentage of it, or a duration. |
+| `WATCH_CONFIG` | `1` | `0`: a change of the declared bind-mounted files alone does not start a canary and a redeploy. |
+| `TARGET_SERVICE` | auto | The resolver service. Unset: the one running service of the project whose image reference contains `unbound` and whose repository is not the sidecar's own; with two or more, the cycle stops and asks for this variable. |
+| `ALLOW_MAJOR` | `0` | `1`: accept a new major version of the resolver and of the sidecar. |
+| `ALLOW_DOWNGRADE` | `0` | `1`: accept a resolver or sidecar image whose version label is older than the running one. |
+| `RETRY_AFTER` | `24h` | How long a failed image, configuration or sidecar image is not retried. |
+| `VALIDATE_DOMAIN` | `example.com` | Name resolved (UDP and TCP) to judge a resolver. |
+| `REQUIRE_DNSSEC` | `1` | `0`: do not require the AD flag on the root SOA (a resolver deliberately run without the validator). |
+| `STRICT_BOGUS_CHECK` | `0` | `1`: also require `dnssec-failed.org` to fail with SERVFAIL. |
+| `HC_URL` | unset | Healthchecks.io check URL: `/start` at the start of a cycle, then the URL itself on success or `/fail`. |
+| `WEBHOOK_URL` | unset | Receives each notification as a JSON POST with `event`, `host`, `subject`, `body` and `text`. |
+| `NOTIFY_HOST` | unset | Host name in notifications. Unset: the Docker daemon's host name, else the container's. |
+| `SELF_UPDATE` | `1` | `0`: the sidecar never replaces itself. See [Self-update](#self-update). |
+| `SELF_LOCK_WAIT` | `900` | Seconds the self-update helper waits for the cycle lock (before recreating the sidecar, and before writing state) before going ahead without it. |
+| `COSIGN_PUBLIC_KEY` | unset | Path, inside the container, of a PEM public key: key mode instead of keyless. See [Verifying with your own key](#verifying-with-your-own-key). |
+| `COSIGN_RESOLVER_IDENTITY_REGEXP` | `^https://github\.com/ESITC-Paris/unbound-distroless/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$` | Keyless mode: the certificate identity that must have signed a resolver image. |
+| `COSIGN_SIDECAR_IDENTITY_REGEXP` | `^https://github\.com/ESITC-Paris/unbound-distroless/\.github/workflows/updater\.yml@refs/tags/updater-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$` | Keyless mode: the certificate identity that must have signed a sidecar image. |
+| `COSIGN_IDENTITY_REGEXP` | unset | Keyless mode: when set, used for both kinds of image instead of the two above. |
+| `COSIGN_ISSUER` | `https://token.actions.githubusercontent.com` | Keyless mode: the OIDC issuer of the signing certificate. |
+| `COSIGN_IGNORE_TLOG` | `0` | Key mode: `1` accepts a signature that is not in the public Rekor log. |
+| `METRICS_PORT` | `9167` | Port of `/metrics` in `metrics` mode. |
+| `STATE_DIR` | `/var/lib/unbound-autoupdate` | Directory of the state files. Must survive the container: a named volume. |
+| `DOCKER_CONFIG` | unset | Directory of a Docker client `config.json` whose static `auths` entries are used for the registry (default `$HOME/.docker`). Credential helpers are not supported. |
+| `SIGSTORE_ROOT_FILE` | unset | cosign's own variable (`cosign env --show-descriptions`): Fulcio root CA file. Its content is part of the verification settings ([State](#state)). |
+| `SIGSTORE_REKOR_PUBLIC_KEY` | unset | cosign's own variable: Rekor public key file. Same remark. |
+| `SIGSTORE_CT_LOG_PUBLIC_KEY_FILE` | unset | cosign's own variable: CT log public key file. Same remark. |
+| `SIGSTORE_TSA_CERTIFICATE_FILE` | unset | cosign's own variable: TSA certificate chain file. Same remark. |
+| `CHECK_ONLY` | `0` | `1`: validate without swapping. Set by `check` mode. |
+| `DISCOVER_WAIT` | `60` | Seconds a cycle waits for the resolver container when none is running (a recreation in progress). A `/metrics` scrape does not wait. |
+| `FINGERPRINT_EXCLUDE` | unset | Container paths, space-separated, whose files are left out of configuration change detection (data that another tool updates and loads at run time, such as a blocklist). They are still mounted in the canary. |
+| `KEEP_CACHE` | `1` | Carry the resolver's cache over a swap (`dump_cache` before, `load_cache` after the new container has passed its checks). Not done when the Unbound major.minor version changes or an image has no version label. Only unexpired entries are exported. `0` disables it. |
+| `KEEP_CACHE_MAX_ENTRIES` | `500000` | Above this many record sets, the cache is not exported. |
+| `KEEP_CACHE_CHUNK` | `2000` | Entries per `load_cache` batch. |
+| `KEEP_CACHE_TIMEOUT` | `120` | Seconds allowed to the export, and to the whole import. |
 
 ## Behaviour
 
-Every cycle ends in exactly one of these. "Metric status" is the label that
-goes to 1 in `unbound_autoupdate_last_cycle_status`; its
-`unbound_autoupdate_cycles_total{status=…}` counter is incremented at the same
-time.
+How each cycle ends. "Metric status" is the `status` label set to 1 in
+`unbound_autoupdate_last_cycle_status`, and incremented in
+`unbound_autoupdate_cycles_total`. Every cycle that takes the lock sends
+`/start` to `HC_URL` first; the column shows the final ping. A notification
+is a log line `level=notice event=<event> subject="<subject>"` and, with
+`WEBHOOK_URL`, a POST.
 
-| Situation | Exit code | Healthchecks | Notification event | Metric status |
+| Outcome | Exit | Final ping | Notification `event`: subject | Metric status |
 |---|---|---|---|---|
-| Nothing new | 0 | `/start`, success | — | `up_to_date` |
-| First cycle on a host (baseline recorded; the cycle then continues) | the cycle's own | `/start`, then the cycle's own | `baseline` | the cycle's own |
-| `check` mode, everything validated | 0 | `/start`, success | — | `check_ok` |
-| Pull or config fingerprint failed | 1 | `/start`, `/fail` | — | `blocked` |
-| Unsigned image (cosign refused it) | 1 | `/start`, `/fail` | `blocked` | `blocked` |
-| Preflight (`unbound-checkconf`) rejected the configuration | 1 | `/start`, `/fail` | `blocked` | `blocked` |
-| Canary could not start, or failed DNS validation | 1 | `/start`, `/fail` | `blocked` | `blocked` |
-| Quarantined image or configuration | 2 | `/start`, `/fail` | `skipped` | `skipped` |
-| Major version bump refused | 2 | `/start`, `/fail` | `skipped` | `skipped` |
-| Another cycle is already running | 2 | — (no ping) | — | unchanged |
-| Swap OK, post-swap gate passed | 0 | `/start`, success | `updated` | `updated` |
-| Swap failed → rolled back, resolver healthy | 1 | `/start`, `/fail` | `rollback` | `rollback` |
-| Rollback did not restore a working resolver | 1 | `/start`, `/fail` | `critical` | `critical` |
-| Unexpected death (a `log_die`, an unhandled error) | non-zero | `/start`, no final ping | — | `error` |
+| Another cycle holds the lock | 2 | none (no `/start` either) | none | unchanged |
+| First cycle on a host (then continues) | — | — | `baseline`: baseline recorded | — |
+| Nothing changed | 0 | success | none | `up_to_date` |
+| `check` mode, everything passed | 0 | success | none | `check_ok` |
+| Updated and checked | 0 | success | `updated`: updated successfully | `updated` |
+| Pull failed (`pulling the declared image failed` in the log) | 1 | `/fail` pull failed | none | `blocked` |
+| Configuration fingerprint failed | 1 | `/fail` config fingerprint failed | none | `blocked` |
+| Signature refused (new image, or the running one) | 1 | `/fail` signature verification failed | `blocked`: signature verification FAILED | `blocked` |
+| Signature could not be checked: a network or registry error only (connection failure, timeout, rate limit, HTTP 5xx); any sign that a signature was evaluated counts as refused | 1 | `/fail` signature check unavailable | `blocked`: signature could not be checked | `blocked` |
+| Quarantined image or configuration | 2 | `/fail` | `skipped`: update skipped (quarantine) | `skipped` |
+| Major version refused | 2 | `/fail` major bump refused | `skipped`: major version bump not deployed | `skipped` |
+| Older version refused (after verification) | 2 | `/fail` downgrade refused | `skipped`: downgrade not deployed | `skipped` |
+| Host-networked sidecar with a change | 1 | `/fail` canary start failed | `blocked`: canary could not start | `blocked` |
+| Preflight rejected the configuration | 1 | `/fail` preflight failed | `blocked`: configuration rejected in preflight | `blocked` |
+| Canary did not start | 1 | `/fail` canary start failed | `blocked`: canary could not start | `blocked` |
+| Canary failed the validation | 1 | `/fail` canary validation failed | `blocked`: canary rejected the update | `blocked` |
+| Post-swap checks failed, rollback succeeded | 1 | `/fail` post-swap validation failed | `rollback`: ROLLBACK performed | `rollback` |
+| Post-swap checks failed, rollback failed | 1 | `/fail` post-swap validation failed | `critical`: CRITICAL: rollback failed | `critical` |
+| Any other failure (discovery, unreadable compose file, SIGTERM outside a swap) | non-zero | none after `/start` | none | `error` |
 
-The last row is why the `/start` ping matters: the cycle records itself as
-`error` on the way out, and Healthchecks alerts on its own grace timer because
-the run it was told about never finished.
+In every row before the swap, production is not touched and the operator's
+tag does not move.
+After a refused signature or one that could not be checked, self-update is
+still attempted, and the cycle ends `blocked` whatever it does. A rollback
+that fails leaves `SWAP_INTENT` set, so the next cycle tries once more; if
+that also fails, the intent is cleared and the resolver is left as it is
+found. After a recovered interrupted swap, the `updated` notification says
+so.
 
-Sidecar self-update happens at the *end* of an `up_to_date` or `updated`
-cycle, never after a failure and never in `check` mode:
+Self-update, at the end of an `up_to_date` or `updated` cycle:
 
-| Situation | Exit code | Healthchecks | Notification event | Metric status |
-|---|---|---|---|---|
-| Nothing to do, a helper is still running, locally built image, no state volume, pull or `compose config` failed, or the sidecar image is quarantined | 0 | `/start`, success | — (log line only) | the cycle's own (`up_to_date` / `updated`) |
-| Sidecar major version bump refused | 0 | `/start`, success | `skipped` | the cycle's own |
-| Sidecar image failed cosign verification | 1 | `/start`, `/fail` | `blocked` | `blocked` |
-| The helper container could not be started | 1 | `/start`, `/fail` | `blocked` | `blocked` |
-| Helper launched | 0 | `/start`, success | — | the cycle's own |
-| Helper: sidecar replaced and healthy | 0 (helper) | — | `updated` | unchanged; `…_self_update_last_timestamp_seconds` is set |
-| Helper: new sidecar did not come up, rolled back | 1 (helper) | `/fail` | `critical` | unchanged; `…_quarantine_active{axis="self"}` goes to 1 |
-| Helper: neither image could be brought up | 1 (helper) | `/fail` | `critical` | unchanged; `…_quarantine_active{axis="self"}` goes to 1 |
+| Outcome | Cycle exit | Notification | Effect on the cycle |
+|---|---|---|---|
+| Skipped (`SELF_UPDATE=0`, a helper still running, a compose file unreadable, the declared image unchanged or not resolvable, a quarantine, no state volume found) | unchanged | none (log line) | none |
+| Major version refused | unchanged | `skipped`: sidecar major version bump not applied | none |
+| Older version refused (after verification) | unchanged | `skipped`: sidecar downgrade not applied | none |
+| Signature refused | 1 | `blocked`: sidecar signature verification FAILED | `blocked`, `/fail` sidecar self-update refused |
+| Signature could not be checked | 1 | `blocked`: sidecar signature could not be checked | same |
+| Helper could not start | 1 | `blocked`: sidecar self-update could not start | same |
+| Helper started | unchanged | none | none |
 
-## Metrics and alerts
+The helper's own outcomes (it is not a cycle: it sends no `/start` and no
+success ping):
 
-In `metrics` mode the image serves `/metrics` on port `METRICS_PORT` (9167).
-Publish it on a loopback address, or on a private network — it needs the
-Docker socket, so do not expose it publicly.
-
-One endpoint, three sources:
-
-- **the resolver**, converted from `unbound-control stats_noreset` executed in
-  the resolver container on each scrape;
-- **the updater**, read from `metrics.prom` in the shared state volume, which
-  every cycle rewrites;
-- **the scrape itself**, so a resolver that cannot be reached is still visible
-  rather than being a hole in the data.
-
-The scrape never fails: it answers 200 even when `unbound-control` is
-unreachable, and reports that with `unbound_exporter_scrape_success 0`.
-
-```
-unbound_queries_total 2468
-unbound_cachehits_total 1800
-unbound_thread_queries_total{thread="0"} 1234
-unbound_query_types_total{type="AAAA"} 800
-unbound_answer_rcodes_total{rcode="SERVFAIL"} 12
-unbound_answers_secure_total 2100
-unbound_cache_entries{cache="rrset"} 9876
-unbound_recursion_time_seconds{stat="median"} 0.098304
-unbound_query_queue_time_seconds{stat="max"} 0.012500
-unbound_response_time_seconds_bucket{le="0.000512"} 3
-unbound_mem_cache_rrset_bytes 178860
-unbound_time_up_seconds 86400.000000
-unbound_stat{name="num.query.tcpout"} 44
-
-unbound_autoupdate_info{version="1.0.0-r0",image_digest="esitcparis/unbound-autoupdate@sha256:…"} 1
-unbound_autoupdate_last_cycle_timestamp_seconds 1789000012
-unbound_autoupdate_last_cycle_duration_seconds 47
-unbound_autoupdate_last_cycle_status{status="updated"} 1
-unbound_autoupdate_cycles_total{status="up_to_date"} 214
-unbound_autoupdate_quarantine_active{axis="image"} 0
-unbound_autoupdate_target_image_info{digest="esitcparis/unbound-distroless@sha256:…",version="1.26.0"} 1
-unbound_autoupdate_self_update_last_timestamp_seconds 0
-
-unbound_exporter_scrape_success 1
-unbound_exporter_scrape_duration_seconds 0.061
-```
-
-Two families are derived rather than copied from `unbound-control`:
-
-- `unbound_response_time_percentile_seconds{percentile="50"|"95"|"99"}` —
-  p50/p95/p99 of the recursion-time histogram (linear interpolation inside
-  the bucket, as `histogram_quantile` would), for consumers that cannot
-  compute quantiles from buckets. Cumulative since the counters were last
-  reset, like the histogram.
-- `unbound_trust_anchor_*` — the RFC 5011 state read from the resolver's
-  `root.key`: `last_success_timestamp_seconds` and `next_probe_timestamp_seconds`
-  of the root DNSKEY probe, `failed_probes` (consecutive failures) and one
-  `key_info{keytag,state}` sample per known root KSK. Alert when the last
-  success ages beyond a few days: that is the mechanism that carries the
-  resolver across a root KSK rollover.
-
-
-Anything `unbound-control` reports that has no family of its own lands in
-`unbound_stat{name="…"}`, so a new statistic in a future Unbound release is
-exported rather than dropped.
-
-A scrape job and a set of alert rules — resolver down, SERVFAIL ratio, DNSSEC
-validation stopped, stale RFC 5011 probe, stale or failed cycles, rollbacks,
-critical failures, quarantines — are in
-[`../docs/observability/`](../docs/observability/). The rules are checked by
-`promtool check rules` in CI.
+| Outcome | Helper exit | Notification | Ping |
+|---|---|---|---|
+| Sidecar services replaced and running | 0 | `updated`: sidecar updated | none |
+| Failed, previous image back | 1 | `critical`: sidecar self-update FAILED — rolled back | `/fail` self-update failed |
+| Failed, rollback failed too | 1 | `critical`: CRITICAL: sidecar self-update FAILED and rollback failed | `/fail` self-update failed |
 
 ## Self-update
 
-The sidecar keeps itself current, by default (`SELF_UPDATE=0` turns it off).
-It runs at the end of a cycle that ended `up_to_date` or `updated`, and only
-when no other helper is still at work.
+With `SELF_UPDATE=1` (the default), after a cycle that ended `up_to_date` or
+`updated`, and when no helper from an earlier cycle is still running:
 
-The new sidecar image goes through the same guards as a resolver image: the
-major-version refusal, the `RETRY_AFTER` quarantine (on its own `self` axis,
-so a broken sidecar release never blocks resolver updates) and **cosign
-verification, fail-closed**. An unsigned sidecar image is not run; it is
-reported as a supply-chain incident and the cycle ends `blocked`.
+1. The image declared for the sidecar's own service is read from the compose
+   files the sidecar's own container was created from. An override file that
+   pins the sidecar is therefore taken into account.
+2. That tag is resolved to its registry digest and pulled by digest, as for
+   the resolver. Same image ID as the running sidecar: nothing to do.
+3. The self quarantine (`RETRY_AFTER`) and the major-version rule apply,
+   then cosign verification against the sidecar's identity, then the
+   downgrade rule. There is no canary.
+4. A helper container is started from the new image, labelled
+   `unbound-autoupdate.helper=1`, removed when it exits. It first waits for
+   the cycle that launched it to end (the cycle lock is free), since that
+   cycle still records its outcome inside the container about to be
+   replaced. It then points the
+   operator's sidecar tag at the new image and recreates the sidecar's own
+   service with `--pull never`; that container must be new, run the new
+   image, and still be running without restart 30 s later. Only then are the
+   other services declared on the same image (`unbound-metrics`) recreated
+   and checked the same way, without the 30 s wait.
+5. On failure the helper points the tag back at the previous image (or, for a
+   sidecar declared by digest, writes `self-rollback.yml` naming
+   its keep name), recreates the services it moved,
+   checks they run the previous image, and quarantines the new one.
 
-The recreation itself cannot run inside the container being replaced — a
-`docker compose up -d` issued from it dies the moment Compose stops it, before
-the new container is started. So it runs in an **ephemeral helper container,
-started from the new, already verified image**. The helper:
+Both waits for the cycle lock, before recreating the sidecar and before the
+helper writes `state.env`, last at most `SELF_LOCK_WAIT` seconds; when it runs
+out the helper logs an error and goes ahead without the lock.
 
-1. recreates the sidecar's own service **first and alone**, and requires it to
-   be running, with no restart, 30 seconds later;
-2. only then moves the other services of the project declared on that same
-   image (the metrics endpoint) — so an image that cannot start costs one
-   container instead of all of them, and `/metrics` keeps answering while the
-   rollback happens;
-3. on any failure, pins every service it moved back to the previous digest,
-   quarantines the new one and notifies `critical`.
+## State
 
-The helper writes the shared state file under the same lock a cycle uses,
-waiting up to `SELF_LOCK_WAIT` (900 s) for it — and if that runs out it logs
-an error and writes anyway, because losing the quarantine would relaunch a
-sidecar image that cannot start, on every cycle, silently.
+`STATE_DIR` (a named volume) holds:
 
-A sidecar running a **locally built** image (no repository digest) never
-self-updates: there is nothing to compare against and nothing to roll back to.
+| File | Content |
+|---|---|
+| `state.env` | The keys below, `KEY=value` per line |
+| `metrics.prom` | The sidecar's metrics, rewritten at the end of each cycle and by the self-update helper |
+| `lock` | The cycle lock |
+| `rollback.yml`, `self-rollback.yml` | Written by a rollback of a service declared by digest or by another repository; used for that `compose up` only, and ignored when found in a compose file list |
+
+| Key | Meaning |
+|---|---|
+| `LAST_CONFIG_HASH` | Configuration fingerprint at the baseline, then at each successful update |
+| `LAST_IMAGE_DIGEST` | Image running at the baseline, then deployed at each successful update. Not read by the code |
+| `VERIFIED_DIGEST`, `VERIFIED_POLICY` | The last image that passed verification, and a hash of the settings it passed under: mode, identity, issuer, key content, `COSIGN_IGNORE_TLOG`, every `COSIGN_*`, `SIGSTORE_*` and `TUF_ROOT` variable, and the content of the `SIGSTORE_*` files. A change of either verifies again |
+| `QUARANTINE_DIGEST`, `QUARANTINE_TS` | Quarantined resolver image, and when |
+| `CONFIG_QUARANTINE_HASH`, `CONFIG_QUARANTINE_TS` | Quarantined configuration fingerprint, and when |
+| `SELF_QUARANTINE_DIGEST`, `SELF_QUARANTINE_TS` | Quarantined sidecar image, and when |
+| `SWAP_INTENT` | Set while a swap or rollback is in progress, nine fields: new image, its ID, previous image ID, fingerprint, image changed (0/1), configuration changed (0/1), previous repository, container before the swap, image the declared tag named before the swap (`-` for none). Empty otherwise |
+| `PULLED_REFS` | Digest references the sidecar pulled because they were not present. At the end of a cycle that reaches up to date, updated or rolled back, each one other than the declared image is removed from the local image store, once no tag names its image and neither the resolver nor the sidecar runs it |
+| `LAST_CYCLE_STATUS`, `LAST_CYCLE_TS`, `LAST_CYCLE_DURATION`, `CYCLES_<STATUS>` | The last cycle and the per-outcome counters |
+| `SELF_UPDATE_TS` | Last successful self-update |
+
+A quarantine is active while its value equals the value being considered and
+`RETRY_AFTER` has not elapsed since its timestamp. Emptying both keys of an
+axis lifts it.
+
+Local images: `<repository>:autoupdate-<project>-<service>` (characters
+outside `A-Za-z0-9_.-` replaced by `-`) names what each service runs, and the digest references in `PULLED_REFS` are untagged
+records.
+
+## Metrics
+
+`metrics` mode serves `/metrics` on `METRICS_PORT` with busybox `httpd`. Every
+scrape answers 200, within about 15 s, with:
+
+- **Resolver statistics**: `unbound-control stats_noreset`, run in the
+  resolver container, converted by `stats_to_prometheus`
+  (`updater/lib/metrics.sh`): `total.num.*` keys become
+  `unbound_<name>_total` counters and other `total.*` keys gauges; per-thread
+  keys become `unbound_thread_*{thread}`; `num.query.type|class|opcode|flags|aggressive.*`
+  and `num.answer.rcode.*` become labelled counters
+  (`unbound_query_types_total{type}`, `unbound_answer_rcodes_total{rcode}`, …);
+  `num.answer.secure|bogus` and `num.rrset.bogus` become
+  `unbound_answers_secure_total`, `unbound_answers_bogus_total`,
+  `unbound_rrset_bogus_total`; `mem.*` become `unbound_mem_*_bytes`;
+  `*.cache.count` become `unbound_cache_entries{cache}`; `time.now|up|elapsed`
+  become `unbound_time_*_seconds`; the recursion time average and median
+  become `unbound_recursion_time_seconds{stat}`; the queue-time maximum
+  becomes `unbound_query_queue_time_seconds{stat="max"}` (and per thread);
+  the histogram becomes `unbound_response_time_seconds` with
+  `unbound_response_time_percentile_seconds{percentile="50|95|99"}`; any
+  other key becomes `unbound_stat{name}`.
+- **Trust anchor**, from the resolver's `/var/lib/unbound/root.key`:
+  `unbound_trust_anchor_last_success_timestamp_seconds`,
+  `unbound_trust_anchor_next_probe_timestamp_seconds`,
+  `unbound_trust_anchor_failed_probes`, and
+  `unbound_trust_anchor_key_info{keytag,state}` per root KSK.
+- **The sidecar**, from `metrics.prom`: `unbound_autoupdate_info{version,image_digest}`,
+  `unbound_autoupdate_last_cycle_timestamp_seconds`,
+  `unbound_autoupdate_last_cycle_duration_seconds`,
+  `unbound_autoupdate_last_cycle_status{status}` (one-hot over `up_to_date`,
+  `updated`, `check_ok`, `skipped`, `blocked`, `rollback`, `critical`,
+  `error`), `unbound_autoupdate_cycles_total{status}`,
+  `unbound_autoupdate_quarantine_active{axis="image|config|self"}`,
+  `unbound_autoupdate_target_image_info{digest,version}` (from
+  `LAST_IMAGE_DIGEST`) and
+  `unbound_autoupdate_self_update_last_timestamp_seconds` (0: never).
+  These change only when the file is rewritten: a quarantine series stays 1
+  after `RETRY_AFTER` until the next cycle ends.
+- **The scrape**: `unbound_exporter_scrape_success` (0 when the statistics
+  could not be collected) and `unbound_exporter_scrape_duration_seconds`.
+
+The output passes `promtool check metrics` (`tests/updater.sh`,
+`tests/observability.sh`). Scrape configuration and alert rules:
+[docs/observability/](../docs/observability/). Publish the port on loopback
+or a monitoring network only: the endpoint uses the Docker socket.
 
 ## Verifying with your own key
 
-Keyless verification against a GitHub Actions workflow of this repository is
-the default (`COSIGN_IDENTITY_REGEXP` covers both `release.yml` and
-`updater.yml`). For a private mirror that re-signs what it serves, mount the public
-key read-only and point `COSIGN_PUBLIC_KEY` at it:
+Keyless verification is the default: the resolver must be signed by
+`release.yml` on a `vX.Y.Z-rN` tag of this repository, the sidecar by
+`updater.yml` on an `updater-vX.Y.Z-rN` tag (`COSIGN_RESOLVER_IDENTITY_REGEXP`,
+`COSIGN_SIDECAR_IDENTITY_REGEXP`; `COSIGN_IDENTITY_REGEXP`, when set,
+replaces both). For a private mirror that re-signs what it serves, mount its
+public key and point `COSIGN_PUBLIC_KEY` at it:
 
 ```yaml
     environment:
       COSIGN_PUBLIC_KEY: /keys/mirror.pub
-      COSIGN_IGNORE_TLOG: "1"   # mirror signatures are not in the public Rekor log
+      COSIGN_IGNORE_TLOG: "1"   # only if the mirror's signatures are not in Rekor
     volumes:
       - /etc/unbound-keys/mirror.pub:/keys/mirror.pub:ro
 ```
 
-The two modes are exclusive: with `COSIGN_PUBLIC_KEY` set, the identity and
-issuer settings are not used. A key path that cannot be read is a refusal to
-verify, not a fallback — the cycle stops.
+With a key, the identity and issuer variables are not used. An unreadable
+key file is a refusal. The same key verifies the sidecar's own image: the
+mirror must re-sign `unbound-autoupdate` too, or set `SELF_UPDATE=0`.
 
-The same key verifies the sidecar's own image during self-update: a mirror
-that re-signs the resolver must re-sign `unbound-autoupdate` too, or set
-`SELF_UPDATE=0`.
-
-**Which cosign is inside.** The image embeds the **cosign v3.1.3** CLI, copied
-from `ghcr.io/sigstore/cosign/cosign` and pinned by digest in
-`.build-state.json`. The release workflows still **sign** with cosign v2.6.5,
-so the verify command documented in [docs/trust.md](../docs/trust.md) keeps
-working for users on a v2 CLI; cosign v3 verifies v2-produced signatures, so
-the sidecar's own fail-closed check is unaffected by the difference.
+The image carries the cosign v3.1.3 CLI (pinned by digest in
+`.build-state.json`); the release workflows sign with cosign v2.6.5.
+`tests/updater.sh` verifies the published releases with it, keyless, and a
+key-signed image in key mode. Verifying by hand:
+[docs/trust.md](../docs/trust.md#verifying-releases).
 
 ## What it does not do
 
-- **Kubernetes.** This is Compose-native by design: it reads Compose labels,
-  runs `docker compose` and pins rollbacks with a Compose override. On
-  Kubernetes, a rollout plus a readiness probe already covers the same ground.
-- **Containers outside Compose**, or in a different Compose project from the
-  sidecar's own. Discovery starts from the sidecar's
-  `com.docker.compose.project` label.
-- **`network_mode: host`.** A host-networked container cannot be connected to
-  another Docker network, so a host-networked sidecar cannot reach the
-  canary's isolated network. The cycle says so and refuses up front, before
-  creating a network, a volume, a state clone or a container. (A resolver in
-  host mode also requires the sidecar to be in host mode, to probe it at all.)
-- **Reverting your configuration.** The rollback override pins the previous
-  *image*; it cannot un-edit a bind-mounted file. When the configuration is
-  what changed, the notification says so explicitly and a human has to fix the
-  file.
-- **Grafana dashboards.** The exposition is plain Prometheus text; build or
-  import whatever dashboard you like on top of it.
+- **Kubernetes, or containers outside its own Compose project.** Discovery
+  starts from the sidecar's `com.docker.compose.project` label.
+- **Canary with `network_mode: host`.** A host-networked container cannot
+  join another network; a host-networked sidecar (which a host-networked
+  resolver requires, to be probed) refuses every cycle that has a change.
+- **Revert configuration files.** A rollback restores the image only; the
+  notification says when the configuration changed.
+- **Registry credential helpers.** Only static `auths` entries of
+  `DOCKER_CONFIG/config.json` are used.
+- **Roll back without a local copy of the previous image.** A rollback uses
+  the local record kept under its keep name; if that record and the tag
+  were already gone before the first cycle of this version could name them
+  (a warning is logged), only the registry can bring the image back.
+- **Survive a kill mid-swap within the same cycle.** If the container is
+  killed during a swap (longer than its stop grace period), the resolver may
+  be stopped until the next cycle finishes or reverts the swap; if that
+  recovery fails, it is abandoned and a person has to act.
+- **Prevent a manual redeploy.** `docker compose pull` followed by `up -d`,
+  or `pull_policy: always` on the sidecar's services, deploys what the
+  registry serves under the tag without these checks.
+- **Dashboards.** Plain Prometheus exposition.
+
+## Upgrading from the removed host-side updater
+
+This repository used to ship a host-side `unbound-autoupdate` script run by a
+systemd timer. It pulled `esitcparis/unbound-distroless:1`, then ran
+`docker compose up -d`, which deploys the tag the compose file declares
+without pulling it; this repository's compose file declared `:latest` at the
+time. Unless your compose file declared `:1`, a resolver it reported as
+updated stayed on its old image. Remove it (*not run* here: systemd host
+commands):
+
+```bash
+systemctl disable --now unbound-autoupdate.timer
+rm -f /usr/local/bin/unbound-autoupdate /etc/systemd/system/unbound-autoupdate.service /etc/systemd/system/unbound-autoupdate.timer /etc/unbound-autoupdate.conf
+systemctl daemon-reload
+```
+
+Then install the sidecar ([Install](#install)), or update by hand
+([Updating without the sidecar](../docs/usage.md#updating-without-the-sidecar)).

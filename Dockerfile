@@ -1,8 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # Base images are parameterised so CI can pin them by digest (the digests live
-# in .build-state.json, which the upstream monitor keeps current). Local builds
-# get the floating tags, which is what docs/usage.md documents.
+# in .build-state.json, which the upstream monitor keeps current).
+#
+# NON-REPRODUCIBLE DEFAULTS: the two floating tags below exist only so that a
+# bare `docker build` still works. They resolve to whatever the registry
+# serves today, so such a build is not the image CI tested or published. To
+# build with exactly the pins CI uses (bases by digest, Unbound version and
+# hash, image revision), run scripts/build.sh.
 ARG DEBIAN_BASE=debian:trixie
 ARG DISTROLESS_BASE=gcr.io/distroless/base-debian13:nonroot
 
@@ -15,8 +20,6 @@ ARG UNBOUND_SHA256
 # InterNIC's documented alternate service (see the header of named.cache).
 ARG ROOT_HINTS_URL=https://www.internic.net/domain/named.cache
 ARG ROOT_HINTS_URL_FALLBACK=ftp://ftp.internic.net/domain/named.cache
-ARG ROOT_ZONE_URL=https://www.internic.net/domain/root.zone
-ARG ROOT_ZONE_URL_FALLBACK=ftp://ftp.internic.net/domain/root.zone
 ENV DEBIAN_FRONTEND=noninteractive
 # Pipelines in RUN must fail on the first broken stage, not the last.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -35,17 +38,70 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 # exists (v1.26.2-r2: zlib1g fixed in trixie-security, debian:trixie not yet
 # rebuilt, release blocked). Rebuilds are still triggered by the monitor's
 # digest tracking (upstream-check.yml), so the pin keeps moving forward.
+#
+# IMAGE_REVISION is the cache-bust contract with the release workflows, which
+# pass the immutable tag being built (X.Y.Z-rN, from versions.env). A
+# revision bump with an unchanged base digest — e.g. a rebuild for a fix
+# published in trixie-security — would otherwise be a layer-cache hit
+# (cache-from: type=gha) and ship the very libraries it was meant to replace.
+# Referencing the ARG in this RUN changes its cache key, and every later step
+# of this stage builds on top of this layer, so the source build and the root
+# hints and trust anchor downloads below are redone for every new
+# revision too. Same revision = same layers (re-running CI for one revision
+# reuses its cache). Empty by default: a bare `docker build` still works and
+# reuses its own local cache as usual.
+ARG IMAGE_REVISION=
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    echo "image revision: ${IMAGE_REVISION:-unset (local build)}" \
+ && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
       build-essential curl ca-certificates \
       libevent-dev libssl-dev libexpat1-dev \
       libnghttp2-dev libhiredis-dev \
+      libprotobuf-c-dev protobuf-c-compiler \
       libcap2-bin
 
 WORKDIR /build
 
 # Download, verify (supply-chain gate), build with hardening flags.
+#
+# Where the OpenPGP check is: not here. The build only compares the tarball
+# with UNBOUND_SHA256, and that pin is minted in exactly one place:
+# .github/workflows/upstream-check.yml downloads the tarball and its .asc,
+# imports the NLnet Labs signing key vendored at
+# .github/keys/nlnetlabs-releases-g2.asc, refuses it unless its fingerprint is
+# the one pinned in that workflow, runs `gpg --verify`, and only then writes
+# the hash into versions.env (fail-closed). A hash match here therefore means
+# "the exact bytes whose signature was verified". To redo it by hand:
+#   curl -fsSLO https://nlnetlabs.nl/downloads/unbound/unbound-X.Y.Z.tar.gz
+#   curl -fsSLO https://nlnetlabs.nl/downloads/unbound/unbound-X.Y.Z.tar.gz.asc
+#   export GNUPGHOME="$(mktemp -d)"
+#   gpg --import .github/keys/nlnetlabs-releases-g2.asc
+#   gpg --fingerprint    # must match UNBOUND_SIGNING_KEY in upstream-check.yml
+#   gpg --verify unbound-X.Y.Z.tar.gz.asc unbound-X.Y.Z.tar.gz
+#   sha256sum unbound-X.Y.Z.tar.gz    # must equal UNBOUND_SHA256 in versions.env
+#
+# Features: DoH (nghttp2), cachedb + Redis/Valkey (hiredis), EDNS Client
+# Subnet (--enable-subnet: compiled in, inert unless "subnetcache" is added to
+# module-config) and dnstap logging (--enable-dnstap, off unless
+# dnstap-enable is set). dnstap needs only libprotobuf-c at run time —
+# Unbound writes Frame Streams itself (dnstap/dtstream.c), libfstrm is not
+# used — and it is DT_NEEDED, so the ldd harvest below ships it.
+# Trade-off accepted by design: DT_NEEDED also means libprotobuf-c is mapped
+# into every resolver process even with dnstap off. Its code is only reached
+# when dnstap encodes a message (it never parses network input here), so the
+# added attack surface is small, and it is scanned by the Trivy gate like
+# every other harvested library; in exchange dnstap works without a rebuild.
+# DNS over QUIC is deliberately absent: Unbound needs ngtcp2's OpenSSL crypto
+# helper (libngtcp2_crypto_ossl, or _quictls), and Debian trixie packages
+# only the GnuTLS one (libngtcp2 1.11), so the link fails without vendoring
+# a second ngtcp2 build.
+# The LICENSE copy is the notice that BSD-3-Clause requires to travel with
+# the binaries; it is shipped as /usr/share/doc/unbound/LICENSE.
+# unbound-control-setup is removed: it is a /bin/sh script (no shell here, so
+# it cannot run), and it only generates TLS keys for a TCP control channel,
+# which this image does not use (control-interface is a unix socket).
+# tests/structure.sh asserts every shipped executable actually runs.
 RUN curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz" \
  && echo "${UNBOUND_SHA256}  unbound-${UNBOUND_VERSION}.tar.gz" | sha256sum -c - \
  && tar xzf "unbound-${UNBOUND_VERSION}.tar.gz" \
@@ -57,12 +113,16 @@ RUN curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSIO
       --with-libnghttp2 \
       --enable-cachedb \
       --with-libhiredis \
+      --enable-subnet \
+      --enable-dnstap \
       --sysconfdir=/etc/unbound \
       --disable-chroot \
       --enable-pie \
       --enable-relro-now \
  && make -j"$(nproc)" \
- && make install
+ && make install \
+ && rm /opt/unbound/sbin/unbound-control-setup \
+ && install -D -m 0644 LICENSE /deps/doc/unbound/LICENSE
 
 # Allow binding port 53 as non-root (xattr survives COPY --from under BuildKit).
 RUN setcap 'cap_net_bind_service=+ep' /opt/unbound/sbin/unbound
@@ -74,16 +134,14 @@ RUN curl -fsSL --retry 3 --retry-delay 5 -o /etc/unbound/root.hints "$ROOT_HINTS
 
 # Stage writable runtime dirs; generate the DNSSEC trust anchor fresh at build
 # (unbound-anchor exits 1 when it updates the anchor — that is success).
-# Also bake a current copy of the root zone (RFC 8806 hyperlocal root): the
-# resolver starts warm from this file and thereafter keeps it fresh itself via
-# AXFR/IXFR from the root servers (auth-zone in unbound.conf), persisting it
-# in /var/lib/unbound alongside the trust anchor.
+# No copy of the root zone is shipped (RFC 8806 hyperlocal root, auth-zone in
+# unbound.conf): its signatures are valid for about two weeks, and Unbound
+# keeps an expired file — it fails the ZONEMD check at every start and is
+# never replaced — whereas with no file it transfers the current zone from
+# the root servers within seconds and writes it to /var/lib/unbound.
 RUN mkdir -p /staging/var-lib-unbound /staging/run-unbound \
  && ( /opt/unbound/sbin/unbound-anchor -a /staging/var-lib-unbound/root.key -v || true ) \
  && test -s /staging/var-lib-unbound/root.key \
- && ( curl -fsSL --retry 3 --retry-delay 5 -o /staging/var-lib-unbound/root.zone "$ROOT_ZONE_URL" \
-      || curl -fsSL --retry 3 --retry-delay 5 -o /staging/var-lib-unbound/root.zone "$ROOT_ZONE_URL_FALLBACK" ) \
- && head -1 /staging/var-lib-unbound/root.zone | grep -q 'IN.*SOA' \
  && chown -R 65532:65532 /staging/var-lib-unbound /staging/run-unbound \
  && ln -s /staging/var-lib-unbound /var/lib/unbound \
  && mkdir -p /run/unbound \
@@ -119,10 +177,21 @@ RUN mkdir -p /staging/var-lib-unbound /staging/run-unbound \
 #
 # The `grep -v '^diversion'` drops the "diversion by libc6 from: ..." lines that
 # `dpkg -S` prefixes to the real "pkg: path" hit; without it they produce a bogus
-# 0-byte status.d entry literally named "diversion by libc6 from".
+# 0-byte status.d entry literally named "diversion by libc6 from". It is
+# applied to each lookup separately: for the loader's /lib path dpkg -S
+# succeeds with ONLY a diversion line, so the canonical-path retry must run
+# when the filtered result is empty, not when dpkg -S fails.
+#
+# Each harvested package also brings its /usr/share/doc/<pkg>/copyright: the
+# licences of these libraries (BSD, MIT, Apache-2.0, LGPL, ...) require the
+# notice to accompany the binaries, and the copy shipped must be the one of
+# the version shipped (this stage's), not the base's. Fail-closed: a library
+# outside /opt/unbound that no package owns, or a package without a copyright
+# file, stops the build instead of shipping unaccounted-for code.
+# tests/structure.sh asserts the pairing on the final image.
 RUN set -eux; \
     triplet="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
-    mkdir -p "/deps/lib/$triplet" /deps/status.d /deps/certs; \
+    mkdir -p "/deps/lib/$triplet" /deps/status.d /deps/certs /deps/doc; \
     : > /tmp/libs; \
     for b in /opt/unbound/sbin/*; do \
       ldd "$b" | awk '{print $3}' | grep -E '^/' >> /tmp/libs || true; \
@@ -130,8 +199,12 @@ RUN set -eux; \
     done; \
     sort -u /tmp/libs | while read -r lib; do \
       cp -L "$lib" "/deps/lib/$triplet/$(basename "$lib")"; \
-      pkg="$( (dpkg -S "$lib" 2>/dev/null || dpkg -S "$(readlink -f "$lib")" 2>/dev/null) | grep -v '^diversion' | cut -d: -f1 | head -n1 )" || true; \
-      if [ -n "$pkg" ]; then dpkg -s "$pkg" > "/deps/status.d/$pkg" 2>/dev/null || true; fi; \
+      case "$lib" in /opt/unbound/*) continue ;; esac; \
+      pkg="$(dpkg -S "$lib" 2>/dev/null | grep -v '^diversion' | cut -d: -f1 | head -n1)" || true; \
+      [ -n "$pkg" ] || pkg="$(dpkg -S "$(readlink -f "$lib")" 2>/dev/null | grep -v '^diversion' | cut -d: -f1 | head -n1)" || true; \
+      [ -n "$pkg" ] || { echo "no dpkg package owns $lib" >&2; exit 1; }; \
+      dpkg -s "$pkg" > "/deps/status.d/$pkg"; \
+      install -D -m 0644 "/usr/share/doc/$pkg/copyright" "/deps/doc/$pkg/copyright"; \
     done; \
     cp -aL /etc/ssl/certs /deps/certs/
 
@@ -140,10 +213,22 @@ RUN set -eux; \
 FROM ${DISTROLESS_BASE}
 
 ARG UNBOUND_VERSION
+# licenses is deliberately SCOPED, not complete: it covers the software this
+# project builds and authors — Unbound (BSD-3-Clause) and this repository's
+# files, e.g. unbound.conf (MIT). The image also redistributes Debian
+# packages (from the harvest and the distroless base) under many more
+# licences, several without an SPDX identifier (glibc's copyright file alone
+# has ~40 stanzas; media-types is "ad-hoc"), so no honest complete SPDX
+# expression exists. The per-component list is NOTICE (shipped at
+# /usr/share/doc/unbound-distroless/NOTICE); the authoritative texts are
+# /usr/share/doc/*/copyright, asserted by tests/structure.sh.
+# image.version carries the revision (X.Y.Z-rN) when the build is given one:
+# the update sidecar compares it to refuse a downgrade to an older revision.
+ARG IMAGE_REVISION=
 LABEL org.opencontainers.image.title="unbound-distroless" \
       org.opencontainers.image.description="Hardened, DNSSEC-validating Unbound DNS resolver on a distroless base" \
       org.opencontainers.image.source="https://github.com/ESITC-Paris/unbound-distroless" \
-      org.opencontainers.image.version="${UNBOUND_VERSION}" \
+      org.opencontainers.image.version="${IMAGE_REVISION:-${UNBOUND_VERSION}}" \
       org.opencontainers.image.licenses="BSD-3-Clause AND MIT" \
       org.opencontainers.image.vendor="ESITC Paris"
 
@@ -153,7 +238,11 @@ COPY --from=build --chown=65532:65532 /staging/var-lib-unbound /var/lib/unbound
 COPY --from=build --chown=65532:65532 /staging/run-unbound /run/unbound
 COPY --from=build /deps/lib /usr/lib
 COPY --from=build /deps/status.d /var/lib/dpkg/status.d
+COPY --from=build /deps/doc /usr/share/doc
 COPY --from=build /deps/certs/certs /etc/ssl/certs
+# This repository's own notice: unbound.conf (and the image recipe) are MIT,
+# and NOTICE lists every redistributed component and the label's scope.
+COPY LICENSE NOTICE /usr/share/doc/unbound-distroless/
 
 # No LD_LIBRARY_PATH: every runtime library (including libunbound.so.8) is
 # harvested into /usr/lib/<triplet>, a default trusted search dir. The main
