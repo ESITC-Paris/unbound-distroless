@@ -2426,7 +2426,9 @@ t_downgrade_refused() {
   r=$(registry_publish "FROM $MOVING_REF
 LABEL org.opencontainers.image.version=\"1.26.1\"" "unbound-down:1"); registry_sign "$dir" "$r"
   rc=0; out=$(updater_run "$dir" "${keys[@]}" 2>&1) || rc=$?
-  [ "$rc" = 2 ] && grep -q 'downgrade 1.26.2 -> 1.26.1 refused' <<<"$out" || fail "a signed older release was not refused (rc=$rc): $out"
+  # The running version is whatever $MOVING_REF currently carries (X.Y.Z, or
+  # X.Y.Z-rN from 1.26.2-r5 on): only the refused target is fixed here.
+  [ "$rc" = 2 ] && grep -qE 'downgrade [0-9]+\.[0-9]+\.[0-9]+(-r[0-9]+)? -> 1\.26\.1 refused' <<<"$out" || fail "a signed older release was not refused (rc=$rc): $out"
   [ "$(fixture_service_cid "$dir" unbound)" = "$cid0" ] || fail "the downgrade touched production"
   compose_up_is_noop "$dir" || fail "after a refused downgrade, 'up -d' recreated containers"
   rc=0; out=$(updater_run "$dir" "${keys[@]}" ALLOW_DOWNGRADE=1 2>&1) || rc=$?
