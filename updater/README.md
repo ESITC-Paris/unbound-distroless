@@ -125,14 +125,21 @@ After every cycle, the operator's tags name the images that run, so a plain
 `pull_policy: always`) followed by `up -d` would deploy what the registry
 serves under the tag, without the sidecar's checks.
 
-On the containerd image store (the default of a fresh Docker Engine 29
-install), this needs Docker Compose 5.5.0 or later on the host
-(`docker compose version`). The sidecar recreates containers with the Compose
-it ships, which is newer than 5.5.0, and Compose 5.5.0 changed the image
-identity it records on each container: an older Compose sees a container
-created by a newer one as out of date, and its next `up -d` recreates it on
-the same image. Nothing unverified is deployed, but the resolver restarts.
-The classic image store is not affected.
+This needs Docker Compose 5 on the host (`docker compose version`), and
+5.5.0 or later on the containerd image store (the default of a fresh Docker
+Engine 29 install). The sidecar recreates containers with the Compose it
+ships, which is newer than 5.5.0, and two changes in Compose make a container
+created by one release look out of date to another:
+
+- Compose 5 computes a different service hash than the 2.x series for any
+  service with a bind mount written in the short syntax
+  (`./unbound.conf:/etc/unbound/unbound.conf:ro`), on every image store;
+- on the containerd image store, Compose 5.5.0 changed the image identity it
+  records on each container.
+
+A host Compose on the other side of either change recreates the resolver at
+its next `up -d`, on the same image. Nothing unverified is deployed, but the
+resolver restarts.
 
 ## The Docker socket is root on the host
 

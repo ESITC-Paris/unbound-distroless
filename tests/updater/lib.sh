@@ -88,28 +88,34 @@ local_names_intact() {
 # run in the project directory, as the operator runs it: creating the
 # fixture, the operator's own `up -d`, an override applied by hand.
 #
-# With a Compose the sidecar supports as the operator's (updater/README.md):
-# on the containerd image store, Compose 5.5.0 changed the image identity it
-# stamps on every container (com.docker.compose.image: the platform manifest
-# digest, where earlier releases stamp the image index digest), so a Compose
-# on one side of 5.5.0 recreates — on the same image — every container one on
-# the other side created. The sidecar ships a Compose >= 5.5. The host's
-# Compose is used whenever it qualifies (always on the classic store, where
-# both generations stamp the same ID); otherwise the sidecar image's own
-# Compose stands in for a supported one, and the run says so once. CI's
-# runners ship an older Compose than the sidecar: asserting with it would
-# test that documented incompatibility, not the sidecar.
+# With a Compose the sidecar supports as the operator's (updater/README.md).
+# Two changes in Compose make a container created by one release look out of
+# date to another, which then recreates it on the same image:
+#   - Compose 5 computes a different service hash than the 2.x series for
+#     any service with a short-syntax bind mount (2.x normalises it with
+#     `create_host_path: true`, 5.x with an empty `bind:`), on every image
+#     store;
+#   - on the containerd image store, Compose 5.5.0 changed the image identity
+#     it stamps on every container (com.docker.compose.image: the platform
+#     manifest digest, where earlier releases stamp the image index digest).
+# The sidecar ships a Compose >= 5.5. The host's Compose is used when it is
+# on the same side of both changes; otherwise the sidecar image's own Compose
+# stands in for a supported one, and the run says so once. CI's runners ship
+# an older Compose than the sidecar: asserting with it would test that
+# documented incompatibility, not the sidecar.
 _OPERATOR_COMPOSE=""
 _operator_compose_pick() {
   [ -z "$_OPERATOR_COMPOSE" ] || return 0
-  local v
+  local v min=5.0.0
   v=$(docker compose version --short 2>/dev/null); v="${v#v}"
-  if ! docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter' \
-     || printf '%s\n%s\n' 5.5.0 "$v" | sort -V -C; then
+  if docker info --format '{{json .DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter'; then
+    min=5.5.0
+  fi
+  if [ -n "$v" ] && printf '%s\n%s\n' "$min" "$v" | sort -V -C; then
     _OPERATOR_COMPOSE=host
   else
     _OPERATOR_COMPOSE=sidecar
-    info "host Compose $v predates 5.5.0 on the containerd image store: the operator's 'docker compose' runs with the sidecar image's Compose ($(docker run --rm --entrypoint docker "$UPDATER_IMAGE" compose version --short))"
+    info "host Compose ${v:-(none)} predates $min, the oldest this image store's hosts can run next to the sidecar: the operator's 'docker compose' runs with the sidecar image's Compose ($(docker run --rm --entrypoint docker "$UPDATER_IMAGE" compose version --short))"
   fi
 }
 operator_compose() {
