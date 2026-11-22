@@ -228,7 +228,8 @@ apply_env() {
     [ -n "$id" ] || continue
     printf '%s\n' "$@" | grep -qxF "$ref" || api DELETE "repos/$REPO/environments/$name/deployment-branch-policies/$id" >/dev/null
   done <<<"$existing"
-  plan "environment '$name' (${envjson:+exists}${envjson:-does not exist yet}, custom policy: $custom): ${WOULD}restricted to $*"
+  local state="does not exist yet"; [ -z "$envjson" ] || state=exists
+  plan "environment '$name' ($state, custom policy: $custom): ${WOULD}restricted to $*"
 }
 apply_env release 'tag:v*' 'tag:updater-v*'
 apply_env monitor 'branch:main'
