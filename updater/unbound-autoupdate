@@ -593,4 +593,10 @@ fi
 if [ "$swap_ok" = 1 ] && post_swap_validated; then
   record_success_and_finish
 fi
+# The rollback replaces the failed container and its log with it: keep what
+# it said, as for a failed canary.
+if [ -n "$SWAPPED_CONTAINER" ] && [ "$SWAPPED_CONTAINER" != "$PRE_SWAP_CONTAINER" ]; then
+  log_error "last lines logged by the container that failed the post-swap validation:"
+  docker logs --tail 20 "$SWAPPED_CONTAINER" >&2 2>&1 || true
+fi
 rollback_and_finish 1

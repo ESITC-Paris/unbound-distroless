@@ -14,16 +14,23 @@ STRICT_BOGUS_CHECK="${STRICT_BOGUS_CHECK:-0}"
 # the unix control socket, which a user's configuration may legitimately
 # replace with a TCP/TLS remote-control — and a resolver that answers queries
 # is exactly what we care about.
+#
+# The failure names what the last attempt got: no reply at all (nothing
+# listening, unreachable) and an rcode such as SERVFAIL (listening, but
+# unable to resolve) are different incidents, and only this message is left
+# to tell them apart once the container has been replaced.
 wait_resolver() {
-  local ip="$1" timeout="${2:-60}" deadline
+  local ip="$1" timeout="${2:-60}" deadline out last="no reply"
   deadline=$(( $(date -u +%s) + timeout ))
   while [ "$(date -u +%s)" -lt "$deadline" ]; do
-    if dig +time=2 +tries=1 "@$ip" "$VALIDATE_DOMAIN" A 2>/dev/null | grep -q 'status: NOERROR'; then
+    out=$(dig +time=2 +tries=1 "@$ip" "$VALIDATE_DOMAIN" A 2>/dev/null) || out=""
+    if grep -q 'status: NOERROR' <<<"$out"; then
       return 0
     fi
+    if [[ "$out" =~ status:\ ([A-Z]+) ]]; then last="${BASH_REMATCH[1]}"; else last="no reply"; fi
     sleep 2
   done
-  log_error "resolver at $ip did not answer within ${timeout}s"
+  log_error "resolver at $ip did not answer within ${timeout}s (last attempt: $last)"
   return 1
 }
 
