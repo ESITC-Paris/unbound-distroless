@@ -235,7 +235,7 @@ seconds.
 | `WEBHOOK_URL` | unset | Receives each notification as a JSON POST with `event`, `host`, `subject`, `body` and `text`. |
 | `NOTIFY_HOST` | unset | Host name in notifications. Unset: the Docker daemon's host name, else the container's. |
 | `SELF_UPDATE` | `1` | `0`: the sidecar never replaces itself. See [Self-update](#self-update). |
-| `SELF_LOCK_WAIT` | `900` | Seconds the self-update helper waits for the cycle lock before writing state without it. |
+| `SELF_LOCK_WAIT` | `900` | Seconds the self-update helper waits for the cycle lock (before recreating the sidecar, and before writing state) before going ahead without it. |
 | `COSIGN_PUBLIC_KEY` | unset | Path, inside the container, of a PEM public key: key mode instead of keyless. See [Verifying with your own key](#verifying-with-your-own-key). |
 | `COSIGN_RESOLVER_IDENTITY_REGEXP` | `^https://github\.com/ESITC-Paris/unbound-distroless/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$` | Keyless mode: the certificate identity that must have signed a resolver image. |
 | `COSIGN_SIDECAR_IDENTITY_REGEXP` | `^https://github\.com/ESITC-Paris/unbound-distroless/\.github/workflows/updater\.yml@refs/tags/updater-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$` | Keyless mode: the certificate identity that must have signed a sidecar image. |
@@ -332,7 +332,10 @@ With `SELF_UPDATE=1` (the default), after a cycle that ended `up_to_date` or
    then cosign verification against the sidecar's identity, then the
    downgrade rule. There is no canary.
 4. A helper container is started from the new image, labelled
-   `unbound-autoupdate.helper=1`, removed when it exits. It points the
+   `unbound-autoupdate.helper=1`, removed when it exits. It first waits for
+   the cycle that launched it to end (the cycle lock is free), since that
+   cycle still records its outcome inside the container about to be
+   replaced. It then points the
    operator's sidecar tag at the new image and recreates the sidecar's own
    service with `--pull never`; that container must be new, run the new
    image, and still be running without restart 30 s later. Only then are the
@@ -343,8 +346,9 @@ With `SELF_UPDATE=1` (the default), after a cycle that ended `up_to_date` or
    its keep name), recreates the services it moved,
    checks they run the previous image, and quarantines the new one.
 
-The helper writes `state.env` under the cycle lock, waiting up to
-`SELF_LOCK_WAIT` seconds for it, then writing without it.
+Both waits for the cycle lock, before recreating the sidecar and before the
+helper writes `state.env`, last at most `SELF_LOCK_WAIT` seconds; when it runs
+out the helper logs an error and goes ahead without the lock.
 
 ## State
 

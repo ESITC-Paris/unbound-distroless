@@ -276,6 +276,30 @@ _self_take_cycle_lock() {
 }
 _self_release_cycle_lock() { exec 9>&-; }
 
+# _self_wait_for_launching_cycle — block until the cycle that started this
+# helper has ended, i.e. until the cycle lock is free, then let go of it.
+#
+# That cycle runs INSIDE the sidecar container this helper is about to
+# replace, and it is not over when it launches the helper: it still sends
+# its health-check ping, records its outcome (state.env, metrics.prom) and
+# exits. Recreating the sidecar under it stops that container, and every
+# process in it is killed outright — the cycle's outcome is then lost or
+# half-written, and a `docker compose exec … once` driving it ends with 137
+# instead of the cycle's own status. The lock is the cycle's own "I am done"
+# signal (it is held from the start of the cycle until its process exits),
+# so waiting for it costs nothing on a host where the cycle ends at once.
+# Not held across the `compose up`: the recreated sidecar starts a cycle of
+# its own straight away, which must not find the lock taken. Running out of
+# the wait is loud but not fatal, as for the state writes: the update the
+# helper exists for still goes ahead.
+_self_wait_for_launching_cycle() {
+  exec 9>"$LOCK_FILE"
+  flock -w "$SELF_LOCK_WAIT" 9 \
+    || log_error "self-update helper: the cycle lock is still held after ${SELF_LOCK_WAIT}s — recreating the sidecar anyway"
+  exec 9>&-
+  return 0
+}
+
 # _self_update_record_success / _self_update_record_failure <new_digest> — the
 # helper's state mutations, under the cycle lock, in functions of their own so
 # the locking itself can be tested directly.
@@ -303,6 +327,9 @@ self_update_apply() {
   local moved=("$self_service")
   state_init
   _compose_file_args "$files"
+  # Nothing is touched — not even the sidecar's tag — while the cycle that
+  # launched this helper is still finishing inside the container it replaces.
+  _self_wait_for_launching_cycle
 
   # The sidecar's own service moves FIRST and ALONE. Everything else declared
   # on the same image (the metrics endpoint) only follows once the new image

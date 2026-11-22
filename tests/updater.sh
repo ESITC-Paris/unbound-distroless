@@ -1887,8 +1887,24 @@ LABEL test.selfrefused=\"resolver\"" "unbound-selfrefused:1")
   v2=$(registry_publish "FROM $UPDATER_IMAGE
 LABEL test.selfrefused=\"2\"" "unbound-autoupdate:1")
   registry_sign "$dir" "$v2"
+  # The cycle is not over when it launches the helper: it still pings
+  # HC_URL (/fail), records its outcome and exits — inside the very container
+  # the helper replaces. A health-check endpoint that takes 8 s to answer
+  # holds the cycle there, so a helper that recreates the sidecar without
+  # waiting for the cycle to end kills it every time (rc 137, outcome never
+  # recorded) instead of only when a slow host happens to stretch that window.
+  # socat is already in the sidecar (registry_forward).
+  updater_exec "$dir" /bin/sh -c \
+    'printf "#!/bin/sh\nsleep 8\nprintf \"HTTP/1.0 200 OK\\r\\n\\r\\n\"\n" > /tmp/slow-hc.sh && chmod +x /tmp/slow-hc.sh
+     nohup socat TCP-LISTEN:8099,fork,reuseaddr EXEC:/tmp/slow-hc.sh >/dev/null 2>&1 &'
+  local _w
+  for _w in $(seq 1 10); do
+    updater_exec "$dir" /bin/sh -c 'netstat -ltn | grep -q ":8099 "' && break
+    [ "$_w" -lt 10 ] || fail "the slow health-check endpoint never came up"
+    sleep 1
+  done
   local rc=0 out
-  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 2>&1) || rc=$?
+  out=$(updater_run "$dir" COSIGN_PUBLIC_KEY="$TEST_PUBKEY" COSIGN_IGNORE_TLOG=1 HC_URL=http://127.0.0.1:8099 2>&1) || rc=$?
   [ "$rc" = 1 ] || fail "a refused running image did not block the cycle (rc=$rc): $out"
   grep -q 'cosign verification FAILED for the RUNNING image' <<<"$out" || fail "the cycle was not blocked by the resolver's verification: $out"
   grep -q 'launching the apply helper' <<<"$out" || fail "self-update was not attempted on the refused-resolver path: $out"
@@ -1899,7 +1915,10 @@ LABEL test.selfrefused=\"2\"" "unbound-autoupdate:1")
     sleep 3
   done
   [ "$(service_label "$dir" updater test.selfrefused)" = 2 ] || fail "the sidecar did not reach the new image"
-  pass "a running resolver image refused by cosign blocks the cycle but not the sidecar's own (verified) self-update"
+  # The launching cycle's outcome survived the sidecar's replacement.
+  updater_exec "$dir" grep -q '^LAST_CYCLE_STATUS=blocked$' /var/lib/unbound-autoupdate/state.env \
+    || fail "the cycle that launched the helper did not record its outcome: $(updater_exec "$dir" cat /var/lib/unbound-autoupdate/state.env)"
+  pass "a running resolver image refused by cosign blocks the cycle but not the sidecar's own (verified) self-update, which waits for that cycle to end"
 }
 
 
