@@ -2108,8 +2108,12 @@ LABEL test.rbnoreg=\"2\"" "unbound-rbnoreg:1"); registry_sign "$dir" "$r"
 
   local log="$TEST_TMPDIR/upd-rbnoreg-$$.log" ev="$TEST_TMPDIR/upd-rbnoreg-ev-$$" rc=0 bg evp _i stopped=0
   : > "$ev"
+  # Matched by name HERE, not only by `--filter name=`: some daemons (29.9.3
+  # observed) pass every container start through that filter, and the
+  # sidecar starts containers of its own before the canary.
   docker events --filter type=container --filter event=start \
-    --filter "name=unbound-canary-$(fixture_project "$dir")" --format '{{.Actor.ID}}' > "$ev" & evp=$!
+    --filter "name=unbound-canary-$(fixture_project "$dir")" --format '{{.Actor.Attributes.name}}' \
+    > >(grep --line-buffered -x "unbound-canary-$(fixture_project "$dir")" > "$ev") & evp=$!
   ( updater_run "$dir" "${keys[@]}" _TEST_FORCE_POSTSWAP_FAIL=1 >"$log" 2>&1 ) & bg=$!
   for _i in $(seq 1 2400); do
     if [ -s "$ev" ]; then docker stop "$REGISTRY_NAME" >/dev/null && stopped=1; break; fi
@@ -2510,8 +2514,12 @@ LABEL test.pin=\"verified\"" "unbound-pin:1")
   # `pull_policy: always` would fetch).
   local log="$TEST_TMPDIR/upd-pin-$$.log" ev="$TEST_TMPDIR/upd-pin-ev-$$" rc=0 bg evp _i moved=0
   : > "$ev"
+  # Matched by name HERE, not only by `--filter name=`: some daemons (29.9.3
+  # observed) pass every container start through that filter, and the
+  # sidecar starts containers of its own before the canary.
   docker events --filter type=container --filter event=start \
-    --filter "name=unbound-canary-$(fixture_project "$dir")" --format '{{.Actor.ID}}' > "$ev" & evp=$!
+    --filter "name=unbound-canary-$(fixture_project "$dir")" --format '{{.Actor.Attributes.name}}' \
+    > >(grep --line-buffered -x "unbound-canary-$(fixture_project "$dir")" > "$ev") & evp=$!
   ( updater_run "$dir" "${keys[@]}" >"$log" 2>&1 ) & bg=$!
   for _i in $(seq 1 2400); do
     if [ -s "$ev" ]; then
