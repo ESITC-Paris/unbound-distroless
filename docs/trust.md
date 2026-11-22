@@ -158,9 +158,10 @@ image's files into a named volume only when the volume is empty; after that,
 the volume's own copy is the one Unbound keeps current.
 
 **Root zone copy** (`/var/lib/unbound/root.zone`, [RFC 8806](https://www.rfc-editor.org/rfc/rfc8806)).
-Downloaded from InterNIC during the build, so the resolver starts with it.
-At run time Unbound keeps it current by zone transfer from the root servers
-listed in `unbound.conf`, checks its ZONEMD record (`zonemd-check: yes`),
+Not shipped in the image: a copy older than its signatures (about two weeks)
+would fail its check at every start and never be replaced. Unbound transfers
+it at start from the root servers listed in `unbound.conf`, keeps it current
+the same way, checks its ZONEMD record (`zonemd-check: yes`),
 and stores it on the volume. Answers built from it are still DNSSEC-validated,
 and with `fallback-enabled: yes` normal recursion takes over if the copy is
 unusable. `unbound-control list_auth_zones` shows its serial.

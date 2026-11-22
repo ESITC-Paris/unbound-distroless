@@ -59,8 +59,8 @@ From the distroless base image (gcr.io/distroless/base-debian13):
   (plus the base's own copies of some libraries above, replaced at build by
   the harvested ones together with their copyright files)
 
-DNS root data fetched at build time: the root hints and root zone published
-by InterNIC/IANA, and the DNSSEC root trust anchor obtained by unbound-anchor
+DNS root data fetched at build time: the root hints published by
+InterNIC/IANA, and the DNSSEC root trust anchor obtained by unbound-anchor
 from IANA.
 
 Update sidecar image (updater/)

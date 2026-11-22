@@ -20,8 +20,6 @@ ARG UNBOUND_SHA256
 # InterNIC's documented alternate service (see the header of named.cache).
 ARG ROOT_HINTS_URL=https://www.internic.net/domain/named.cache
 ARG ROOT_HINTS_URL_FALLBACK=ftp://ftp.internic.net/domain/named.cache
-ARG ROOT_ZONE_URL=https://www.internic.net/domain/root.zone
-ARG ROOT_ZONE_URL_FALLBACK=ftp://ftp.internic.net/domain/root.zone
 ENV DEBIAN_FRONTEND=noninteractive
 # Pipelines in RUN must fail on the first broken stage, not the last.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -48,7 +46,7 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 # (cache-from: type=gha) and ship the very libraries it was meant to replace.
 # Referencing the ARG in this RUN changes its cache key, and every later step
 # of this stage builds on top of this layer, so the source build and the root
-# hints, root zone and trust anchor downloads below are redone for every new
+# hints and trust anchor downloads below are redone for every new
 # revision too. Same revision = same layers (re-running CI for one revision
 # reuses its cache). Empty by default: a bare `docker build` still works and
 # reuses its own local cache as usual.
@@ -136,16 +134,14 @@ RUN curl -fsSL --retry 3 --retry-delay 5 -o /etc/unbound/root.hints "$ROOT_HINTS
 
 # Stage writable runtime dirs; generate the DNSSEC trust anchor fresh at build
 # (unbound-anchor exits 1 when it updates the anchor — that is success).
-# Also bake a current copy of the root zone (RFC 8806 hyperlocal root): the
-# resolver starts warm from this file and thereafter keeps it fresh itself via
-# AXFR/IXFR from the root servers (auth-zone in unbound.conf), persisting it
-# in /var/lib/unbound alongside the trust anchor.
+# No copy of the root zone is shipped (RFC 8806 hyperlocal root, auth-zone in
+# unbound.conf): its signatures are valid for about two weeks, and Unbound
+# keeps an expired file — it fails the ZONEMD check at every start and is
+# never replaced — whereas with no file it transfers the current zone from
+# the root servers within seconds and writes it to /var/lib/unbound.
 RUN mkdir -p /staging/var-lib-unbound /staging/run-unbound \
  && ( /opt/unbound/sbin/unbound-anchor -a /staging/var-lib-unbound/root.key -v || true ) \
  && test -s /staging/var-lib-unbound/root.key \
- && ( curl -fsSL --retry 3 --retry-delay 5 -o /staging/var-lib-unbound/root.zone "$ROOT_ZONE_URL" \
-      || curl -fsSL --retry 3 --retry-delay 5 -o /staging/var-lib-unbound/root.zone "$ROOT_ZONE_URL_FALLBACK" ) \
- && head -1 /staging/var-lib-unbound/root.zone | grep -q 'IN.*SOA' \
  && chown -R 65532:65532 /staging/var-lib-unbound /staging/run-unbound \
  && ln -s /staging/var-lib-unbound /var/lib/unbound \
  && mkdir -p /run/unbound \

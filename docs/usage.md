@@ -142,8 +142,8 @@ instance with an initContainer on the same image running
 `/usr/local/sbin/unbound-anchor -a /var/lib/unbound/root.key`: it exits 1
 when it writes the anchor (that is its "anchor updated" code), so the init
 container fails once and succeeds on the retry, which exits 0. The root zone
-copy is optional: without `root.zone`, Unbound transfers the zone from the
-root servers.
+copy needs no seeding: Unbound transfers the zone from the root servers at
+start.
 
 ## Configuration
 

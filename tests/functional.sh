@@ -161,10 +161,17 @@ grep -q 'dnstap Message/CLIENT_QUERY enabled' <<<"$FEAT_LOGS" || fail "dnstap di
 grep -q 'start of service' <<<"$FEAT_LOGS" || fail "Unbound with subnet + dnstap did not start: $FEAT_LOGS"
 pass "subnet + dnstap inert with the shipped config, initialise when configured"
 
-# 7b. Hyperlocal root zone (RFC 8806) is loaded with a real serial
-docker exec "$NAME" /usr/local/sbin/unbound-control -c /etc/unbound/unbound.conf list_auth_zones \
-  | grep -E '^\.\s.*serial' >/dev/null || fail "auth zone '.' not loaded (list_auth_zones)"
-pass "hyperlocal root zone loaded"
+# 7b. Hyperlocal root zone (RFC 8806): the image ships no copy, Unbound
+# transfers it from the root servers after start and writes it to its
+# state directory.
+ZONE_OK=0
+for _i in $(seq 1 60); do
+  if docker exec "$NAME" /usr/local/sbin/unbound-control -c /etc/unbound/unbound.conf list_auth_zones \
+    | grep -E '^\.\s.*serial' >/dev/null; then ZONE_OK=1; break; fi
+  sleep 1
+done
+[ "$ZONE_OK" = 1 ] || fail "auth zone '.' not transferred within 60 s (list_auth_zones)"
+pass "hyperlocal root zone transferred and loaded"
 
 # 8. No unexpected errors in logs (SERVFAIL lines are expected: test 5 plus
 #    log-servfail deliberately produce them)

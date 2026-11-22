@@ -60,7 +60,6 @@ must_have '^usr/local/sbin/unbound-checkconf$'
 must_have '^etc/unbound/unbound.conf$'
 must_have '^etc/unbound/root.hints$'
 must_have '^var/lib/unbound/root.key$'
-must_have '^var/lib/unbound/root.zone$'
 must_have '^run/unbound/$'
 must_have '^etc/ssl/certs/ca-certificates.crt$'
 must_have '^etc/passwd$'
@@ -84,6 +83,8 @@ pass "expected files present"
 # symlink into the triplet dir on arm64, so it is not checked here.)
 must_not_have '^usr/lib/lib(event|c\.so\.6|crypto|ssl|expat|unbound|protobuf-c)'
 must_not_have '^var/lib/dpkg/status.d/diversion'
+# A baked root zone outlives its signatures and is then never replaced.
+must_not_have '^var/lib/unbound/root.zone$'
 pass "no flat lib copies shadowing the triplet dir, no dpkg diversion junk"
 
 # 5. Effective UID: resolve the configured user against the image's own
