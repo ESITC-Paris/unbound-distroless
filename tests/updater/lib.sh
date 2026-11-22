@@ -89,11 +89,30 @@ local_names_intact() {
 # by the sidecar that must hold: a different configuration hash would make
 # that routine command (or a configuration-management run) restart DNS.
 compose_up_is_noop() {
-  local dir="$1" before after
-  before=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
-  ( cd "$dir" && docker compose -p "$(fixture_project "$dir")" up -d ) >/dev/null 2>&1 || return 1
-  after=$(docker compose -p "$(fixture_project "$dir")" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
-  [ -n "$before" ] && [ "$before" = "$after" ]
+  local dir="$1" before after proj out
+  proj=$(fixture_project "$dir")
+  before=$(docker compose -p "$proj" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
+  out=$( cd "$dir" && docker compose -p "$proj" up -d 2>&1 ) || { printf '%s\n' "$out" >&2; return 1; }
+  after=$(docker compose -p "$proj" --project-directory "$dir" -f "$dir/docker-compose.yml" ps -q | sort)
+  [ -n "$before" ] && [ "$before" = "$after" ] && return 0
+  # Say what Compose did and what it compared: a bare "recreated" is not
+  # enough to tell an image-identity mismatch from a configuration one.
+  {
+    echo "--- compose up -d:"; printf '%s\n' "$out"
+    echo "--- containers before: $(tr '\n' ' ' <<<"$before")"
+    echo "--- containers after:"
+    local c img
+    for c in $after; do
+      img=$(docker inspect "$c" --format '{{.Config.Image}}')
+      echo "$c service=$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.service"}}')" \
+        "declared=$img container.Image=$(docker inspect "$c" --format '{{.Image}}')" \
+        "label.image=$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.image"}}')" \
+        "tag.Id=$(docker image inspect "$img" --format '{{.Id}}' 2>&1)"
+    done
+    docker version --format 'docker client {{.Client.Version}} server {{.Server.Version}}'
+    docker compose version
+  } >&2
+  return 1
 }
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
