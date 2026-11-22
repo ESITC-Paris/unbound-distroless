@@ -219,6 +219,55 @@ volumes:
 YML
   _operator_compose_pick
   operator_compose "$dir" up -d >/dev/null
+  _fixture_fresh_root_zone "$dir"
+}
+
+# _root_zone_expiry <volume> — expiration (YYYYMMDDHHMMSS) of the root DNSKEY
+# signature in the zone file a resolver state volume holds; empty when there
+# is no zone file.
+_root_zone_expiry() {
+  docker run --rm -v "$1:/v:ro" --entrypoint awk "$UPDATER_IMAGE" \
+    '$4 == "RRSIG" && $5 == "DNSKEY" { print $9; exit }' /v/root.zone 2>/dev/null || true
+}
+
+# _fixture_fresh_root_zone <dir> — give the fixture resolver's state volume
+# what a production volume holds: a root zone (RFC 8806 copy, unbound.conf's
+# auth-zone) that is still validly signed.
+#
+# A resolver image bakes the root zone of its build day, and a new named
+# volume is seeded with it. OLD_REF is a pinned release from months ago: its
+# zone's signatures have long expired. unbound loads such a file, fails its
+# ZONEMD check, falls back to plain recursion — and does not replace the file
+# (observed: still the baked serial minutes later), whereas with NO file it
+# transfers the current zone at once and writes it. Every canary cloned from
+# that volume, and every container recreated on it, then starts on the
+# expired zone, and depending on how its first queries race with the
+# fallback it can SERVFAIL ("No DNSKEY record … while building chain of
+# trust", then the key "marked as invalid") for longer than any gate waits:
+# on CI that failed a canary after 90 s and a post-swap gate after 45 s,
+# while the very same image passed in the next container. A production
+# volume holds the zone its running resolver keeps transferring; so the
+# expired file is removed here, once, and the fixture resolver fetches a
+# current one. Not fetching one (no zone transfer possible from this
+# network) is reported, not fatal: unbound then simply recurses without it.
+_fixture_fresh_root_zone() {
+  local dir="$1" vol cid now exp _i
+  vol="$(fixture_project "$dir")_state"
+  now=$(date -u +%Y%m%d%H%M%S)
+  exp=$(_root_zone_expiry "$vol")
+  [ -n "$exp" ] || return 0
+  [[ "$exp" > "$now" ]] && return 0
+  cid=$(fixture_service_cid "$dir" unbound)
+  [ -n "$cid" ] || return 0
+  docker stop -t 5 "$cid" >/dev/null
+  docker run --rm -v "$vol:/v" --entrypoint rm "$UPDATER_IMAGE" -f /v/root.zone
+  docker start "$cid" >/dev/null
+  for _i in $(seq 1 30); do
+    exp=$(_root_zone_expiry "$vol")
+    [ -n "$exp" ] && [[ "$exp" > "$now" ]] && return 0
+    sleep 2
+  done
+  info "the fixture resolver did not fetch a current root zone within 60 s; it runs without one"
 }
 
 fixture_project() { basename "$1" | tr -cd 'a-z0-9'; }
