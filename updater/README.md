@@ -170,6 +170,12 @@ The sidecar joins the resolver's own Compose project: it only ever manages
 services of the project its own container belongs to. From the directory of
 the project started in the README's [Run it](../README.md#run-it) section:
 
+**Requirement: Docker Compose 5 or later on the host** (`docker compose
+version`), and 5.5.0 or later if the host uses the containerd image store
+(the default of a fresh Docker Engine 29 install). With an older Compose the
+sidecar still updates the resolver, but the host's next `docker compose up
+-d` restarts it ([why](#what-a-cycle-does)).
+
 <!-- sidecar:install — tests/sidecar-docs.sh runs the first line and validates the resulting project -->
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ESITC-Paris/unbound-distroless/main/updater/compose.snippet.yml | sed "s|/opt/unbound|$PWD|g" > docker-compose.override.yml
