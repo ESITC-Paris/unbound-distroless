@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1
 
-# Base images are parameterised so CI can pin them by digest (the digests live
-# in .build-state.json, kept current by upstream-check.yml, which also
-# triggers a rebuild when they move). Local builds get the floating tags.
+# Base images are parameterised so CI can pin them by digest (the versions
+# live in versions.env and the digests in .build-state.json, both kept current
+# by upstream-check.yml, which also triggers a rebuild when they move). Local
+# builds get the tags below; the monitor rewrites the cosign one when it
+# follows a new cosign release, and tests/monitor.sh checks that both agree
+# with versions.env.
 ARG ALPINE_BASE=alpine:3.24
 ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.3
 

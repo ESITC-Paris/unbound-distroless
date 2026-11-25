@@ -514,6 +514,37 @@ health yes no $'completed failure\ncompleted failure\ncompleted cancelled'; [ "$
 health yes no "exploded x";                       [ "$rc" = 1 ] || fail "unknown run status accepted: $out"
 pass "release-health: lost / cancelled / timed-out release → re-dispatched, at most 3 runs, then an issue; running → wait"
 
+# pick-version.sh: the cosign release the sidecar is built with.
+PICK="$HERE/.github/scripts/pick-version.sh"
+pick() { printf '%s\n' "${@:2}" | bash "$PICK" "$1"; }
+[ "$(pick 3.1.3 v3.1.5 v3.1.4 v2.6.5 v3.1.3 v3.1.2)" = 3.1.5 ] || fail "newest of the same major: $(pick 3.1.3 v3.1.5 v3.1.4 v2.6.5 v3.1.3)"
+[ "$(pick 3.1.3 v3.2.0 v3.10.1 v3.9.9)" = 3.10.1 ] || fail "version order, not text order"
+[ "$(pick 3.1.3 v2.6.5 v3.1.2 v3.0.6)" = 3.1.3 ] || fail "never older than the pin (a partial listing must not downgrade)"
+[ "$(pick 3.1.3 v4.0.0 v4.1.2)" = 3.1.3 ] || fail "a new major is not followed unattended"
+[ "$(pick 3.1.3 v3.2.0-rc.1 v3.2.0rc1 cosign-v3.9.9 '' 'v3.3' 'v3.4.0 x')" = 3.1.3 ] || fail "only exact [v]X.Y.Z tags count"
+[ "$(pick 3.1.3)" = 3.1.3 ] || fail "an empty listing keeps the pin"
+if out=$(pick v3.1 v3.1.5 2>&1); then fail "a current version that is not X.Y.Z was accepted: $out"; fi
+pass "pick-version: newest stable release of the same major, never older, never another major, never a pre-release"
+
+# One source for the sidecar's third-party versions: versions.env. The
+# workflows read it; the Dockerfile's defaults (a bare `docker build`) agree.
+python3 - "$HERE" <<'PY' || fail "sidecar base versions are not single-sourced"
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+env = dict(l.split("=", 1) for l in (root / "versions.env").read_text().split())
+alpine, cosign = env["ALPINE_VERSION"], env["COSIGN_VERSION"]
+assert re.fullmatch(r"\d+\.\d+", alpine), f"ALPINE_VERSION={alpine} is not X.Y"
+assert re.fullmatch(r"\d+\.\d+\.\d+", cosign), f"COSIGN_VERSION={cosign} is not X.Y.Z"
+docker = (root / "updater/Dockerfile").read_text()
+assert f"\nARG ALPINE_BASE=alpine:{alpine}\n" in docker, "updater/Dockerfile's ALPINE_BASE default differs from versions.env"
+assert f"\nARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v{cosign}\n" in docker, "updater/Dockerfile's COSIGN_IMAGE default differs from versions.env"
+for wf in sorted((root / ".github/workflows").glob("*.yml")):
+    for n, line in enumerate(wf.read_text().splitlines(), 1):
+        code = line.split(" #", 1)[0] if not line.lstrip().startswith("#") else ""
+        assert not re.search(r"alpine:\d|cosign/cosign:v\d", code), f"{wf.name}:{n} hard-codes a version that versions.env owns: {line.strip()}"
+PY
+pass "sidecar base versions: versions.env is the one source — Dockerfile defaults agree, no workflow hard-codes them"
+
 # issue.sh: one open issue per title, assigned; survives a GitHub outage in
 # the middle of its own calls. gh is faked.
 ISSUE="$HERE/.github/scripts/issue.sh"

@@ -108,7 +108,13 @@ and its scripts, exercised by [`tests/monitor.sh`](../tests/monitor.sh):
 
 - **Base updates.** Every run of the monitor resolves the digests of the
   build and runtime bases (and of the sidecar's Alpine and cosign bases); a
-  changed digest publishes a new revision of the image concerned.
+  changed digest publishes a new revision of the image concerned. The
+  sidecar's vendored cosign is a version tag, which never moves: the monitor
+  follows the newest stable release of its major line instead
+  ([`pick-version.sh`](../.github/scripts/pick-version.sh)) and publishes a
+  sidecar revision built with it, after the sidecar's whole test suite. A new
+  cosign major or a new Alpine branch is not taken unattended; for Alpine
+  the monitor opens `Alpine <X.Y> is available for the sidecar`.
 - **Rescan of what is published.** Every run also scans the images behind
   `latest` — resolver and sidecar, amd64 and arm64, by digest — with the
   release gates' own Trivy policy
