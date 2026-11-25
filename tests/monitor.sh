@@ -149,8 +149,17 @@ APK_HIGH='[{"Target": "img (alpine 3.24.4)", "Class": "os-pkgs", "Type": "alpine
 BASEL=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 printf '%s\n' "$BASEL" sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc > "$tmp/base.txt"
 export BASE_DIFFIDS_FILE="$tmp/base.txt" NOW=1800000000
+# The packages the build stage harvests over the base's copies: a finding in
+# one of them is fixed by a rebuild even when Trivy places it in a base layer.
+printf '%s\n' libc6 libssl3t64 libzstd1 > "$tmp/harvested.txt"
+export HARVESTED_PKGS_FILE="$tmp/harvested.txt"
 OS_BASE='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
-  {"VulnerabilityID": "CVE-2026-5", "PkgName": "libc6", "InstalledVersion": "2.41-1", "FixedVersion": "2.41-2", "Status": "fixed", "Severity": "HIGH",
+  {"VulnerabilityID": "CVE-2026-5", "PkgName": "tzdata", "InstalledVersion": "2026f-0", "FixedVersion": "2026g-0", "Status": "fixed", "Severity": "HIGH",
+   "Layer": {"DiffID": "'"$BASEL"'"}}]}]'
+# CVE-2026-124851 as r7 was scanned on 2026-11-25: harvested, still at the
+# base's version, so reported in a base layer.
+OS_BASE_HARVESTED='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
+  {"VulnerabilityID": "CVE-2026-7", "PkgName": "libzstd1", "InstalledVersion": "1.5.7+dfsg-1", "FixedVersion": "1.5.7+dfsg-1+deb13u1", "Status": "fixed", "Severity": "HIGH",
    "Layer": {"DiffID": "'"$BASEL"'"}}]}]'
 NO_ID='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
   {"PkgName": "libssl3t64", "FixedVersion": "3.5.1-2", "Severity": "HIGH"}]}]'
@@ -212,6 +221,17 @@ rescan resolver "$D1" "$OS_BASE" "$OS_HIGH"
 [ "$(sed -n 's/^vulns=//p' <<<"$out")" = "$FP" ] || fail "the fingerprint must cover the rebuild-fixable findings only"
 grep -qx 'count=2' <<<"$out" || fail "count covers both kinds: $out"
 pass "rescan: findings a rebuild cannot fix (vendored cosign CRITICAL, distroless base layer) → blocked, never a revision"
+
+rescan resolver "$D1" "$OS_BASE_HARVESTED"
+[ "$(st)" = new ] || fail "a harvested package reported in a base layer is fixed by a rebuild → new: $out"
+grep -q '^summary=CVE-2026-7 (libzstd1)$' <<<"$out" || fail "a harvested package must not be labelled as needing a new base digest: $out"
+[[ "$(sed -n 's/^vulns=//p' <<<"$out")" =~ ^[0-9a-f]{16}$ ]] || fail "a harvested finding must be in the fingerprint (loop guard): $out"
+rc=0; out=$(cd "$tmp" && HARVESTED_PKGS_FILE="" POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
+[ "$rc" = 1 ] && grep -q 'HARVESTED_PKGS_FILE is required' <<<"$out" || fail "a resolver verdict without the harvested list must be an error: rc=$rc $out"
+: > "$tmp/empty.txt"
+rc=0; out=$(cd "$tmp" && HARVESTED_PKGS_FILE="$tmp/empty.txt" POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
+[ "$rc" = 1 ] && grep -q 'not a list of package names' <<<"$out" || fail "an empty harvested list must be an error, not \"nothing is harvested\": rc=$rc $out"
+pass "rescan: a harvested library reported in a base layer → new (a rebuild fixes it); the harvested list is mandatory and never empty"
 
 # Loop guard. The record names the digest a rebuild was triggered from, the
 # finding set it was triggered for, and when.
