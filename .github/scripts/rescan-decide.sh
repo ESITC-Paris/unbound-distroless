@@ -15,7 +15,12 @@
 # A finding only asks for a rebuild if a rebuild can fix it:
 #   * resolver: a finding in a layer of the distroless base (BASE_DIFFIDS_FILE)
 #     cannot — the final stage has no package manager; only a new base digest
-#     can, and the monitor already rebuilds when that digest moves;
+#     can, and the monitor already rebuilds when that digest moves. UNLESS the
+#     package is one the build stage harvests over the base's copy
+#     (HARVESTED_PKGS_FILE): Trivy attributes a package to the oldest layer
+#     carrying that name and version, so a harvested library still at the
+#     base's version reads as "base layer" although the build stage's
+#     `apt-get upgrade` replaces it on the next rebuild;
 #   * updater: a CRITICAL in the vendored cosign binary cannot — the binary is
 #     copied from a digest-pinned upstream image; only a new cosign release
 #     can, and the monitor already rebuilds when that digest moves.
@@ -32,6 +37,9 @@
 #                     "amd64 arm64": the release gate scans both natively)
 #   BASE_DIFFIDS_FILE resolver only, required: the base image's layer DiffIDs,
 #                     one per line, all platforms
+#   HARVESTED_PKGS_FILE resolver only, required: the packages the published
+#                     image takes from the build stage, one per line
+#                     (harvested-packages.sh)
 #   NOW               epoch seconds (default: the current time)
 #   PENDING_HOURS     how long a triggered rebuild may stay unpublished
 #                     before it is reported (default 6; a release takes ~1 h)
@@ -65,6 +73,7 @@ export EXPECT_ARCHS="${EXPECT_ARCHS:-amd64 arm64}"
 export PENDING_HOURS="${PENDING_HOURS:-6}"
 NOW="${NOW:-$(date +%s)}"; export NOW
 export BASE_DIFFIDS_FILE="${BASE_DIFFIDS_FILE:-}"
+export HARVESTED_PKGS_FILE="${HARVESTED_PKGS_FILE:-}"
 case "$POLICY" in resolver|updater) ;; *) echo "::error::unknown POLICY '$POLICY'" >&2; exit 1 ;; esac
 [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::DIGEST '$DIGEST' is not a sha256 digest" >&2; exit 1; }
 [[ "$NOW" =~ ^[0-9]+$ && "$PENDING_HOURS" =~ ^[0-9]+$ ]] || { echo "::error::NOW and PENDING_HOURS must be integers" >&2; exit 1; }
@@ -81,7 +90,7 @@ def fail(msg):
     print(f"::error::rescan: {msg}", file=sys.stderr)
     sys.exit(1)
 
-base = set()
+base, harvested = set(), set()
 if policy == "resolver":
     path = os.environ["BASE_DIFFIDS_FILE"]
     if not path:
@@ -92,6 +101,17 @@ if policy == "resolver":
         fail(f"base layer list unreadable ({e})")
     if not base or not all(re.fullmatch(r"sha256:[0-9a-f]{64}", d) for d in base):
         fail(f"{path}: not a list of layer DiffIDs")
+    path = os.environ["HARVESTED_PKGS_FILE"]
+    if not path:
+        fail("HARVESTED_PKGS_FILE is required for the resolver policy")
+    try:
+        harvested = {l.strip() for l in open(path) if l.strip()}
+    except OSError as e:
+        fail(f"harvested package list unreadable ({e})")
+    # Never empty: the image always harvests at least libc6. An empty list
+    # would silently turn every base-layer finding back into "blocked".
+    if not harvested or not all(re.fullmatch(r"[a-z0-9][a-z0-9.+-]*", p) for p in harvested):
+        fail(f"{path}: not a list of package names")
 
 fixable, other, archs = set(), set(), set()
 for path in sys.argv[1:]:
@@ -131,7 +151,8 @@ for path in sys.argv[1:]:
             item = f"{vid} ({pkg})"
             if policy == "updater" and target == "usr/local/bin/cosign":
                 other.add(item + " [vendored cosign: needs a new cosign release]")
-            elif policy == "resolver" and (v.get("Layer") or {}).get("DiffID") in base:
+            elif (policy == "resolver" and (v.get("Layer") or {}).get("DiffID") in base
+                  and pkg not in harvested):
                 other.add(item + " [distroless base: needs a new base digest]")
             else:
                 fixable.add(item)

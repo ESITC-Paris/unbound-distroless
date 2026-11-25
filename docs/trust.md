@@ -114,9 +114,13 @@ and its scripts, exercised by [`tests/monitor.sh`](../tests/monitor.sh):
   release gates' own Trivy policy
   ([`rescan-decide.sh`](../.github/scripts/rescan-decide.sh)). A finding the
   gate would refuse, and that a rebuild can fix, publishes a new revision,
-  whose build re-runs the package upgrade. Findings a rebuild cannot change —
-  in the distroless base's own layers, or a CRITICAL in the vendored cosign
-  binary — wait for the next base digest, which the monitor already tracks,
+  whose build re-runs the package upgrade. That includes the libraries the
+  resolver's build stage copies over the base's (libc, OpenSSL, zlib, zstd,
+  …), which the scanner reports in a base layer while their version is still
+  the base's: the list is read from the published image
+  ([`harvested-packages.sh`](../.github/scripts/harvested-packages.sh)).
+  Findings a rebuild cannot change — in the distroless base's own packages,
+  or a CRITICAL in the vendored cosign binary — wait for the next base digest, which the monitor already tracks,
   and open the issue `Published <image> image has findings a rebuild cannot
   fix`. Loop guard: one rebuild per published digest and finding set; if the
   rebuilt image still has the same findings, or the rebuild is not
