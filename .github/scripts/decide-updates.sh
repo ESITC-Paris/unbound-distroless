@@ -21,7 +21,8 @@ for v in LATEST NEW_DEBIAN NEW_DISTROLESS NEW_ALPINE NEW_COSIGN; do
   [ -n "${!v:-}" ] || { echo "::error::$v is empty" >&2; exit 1; }
 done
 
-# Rescan: only `new` asks for a rebuild. Empty means the rescan failed or was not run:
+# Rescan: only `new` asks for a rebuild (a candidate build was scanned clean;
+# `waiting` and `pending` publish nothing). Empty means the rescan failed or was not run:
 # that must never publish anything (the workflow reports the failure on its
 # own), and it must not block a version or base update either. An unknown
 # value is a wiring bug — refuse rather than guess.
@@ -31,7 +32,7 @@ case "${FORCE_REBUILD:-none}" in
 esac
 for v in RESCAN_RESOLVER RESCAN_UPDATER; do
   case "${!v:-}" in
-    ""|clean|new|pending|stuck|blocked) ;;
+    ""|clean|new|pending|waiting) ;;
     *) echo "::error::$v has unexpected value '${!v}'" >&2; exit 1 ;;
   esac
 done
@@ -58,8 +59,9 @@ elif [ "$NEW_DEBIAN" != "$OLD_DEBIAN" ] || [ "$NEW_DISTROLESS" != "$OLD_DISTROLE
   fi
   action=revision
 elif [ "${RESCAN_RESOLVER:-}" = new ] || [ "${FORCE_REBUILD:-none}" = resolver ] || [ "${FORCE_REBUILD:-none}" = both ]; then
-  # Same base digests, but packages published since (trixie-security) fix
-  # something the gate refuses — or a maintainer asked: rebuild. The
+  # Same base digests, but a candidate built from them no longer has what
+  # the gate refuses in the published image (packages published since, e.g.
+  # in trixie-security) — or a maintainer asked: rebuild. The
   # revision bump is also what invalidates the package-upgrade layer
   # (IMAGE_REVISION build arg).
   action=revision

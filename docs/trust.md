@@ -112,20 +112,21 @@ and its scripts, exercised by [`tests/monitor.sh`](../tests/monitor.sh):
 - **Rescan of what is published.** Every run also scans the images behind
   `latest` — resolver and sidecar, amd64 and arm64, by digest — with the
   release gates' own Trivy policy
-  ([`rescan-decide.sh`](../.github/scripts/rescan-decide.sh)). A finding the
-  gate would refuse, and that a rebuild can fix, publishes a new revision,
-  whose build re-runs the package upgrade. That includes the libraries the
-  resolver's build stage copies over the base's (libc, OpenSSL, zlib, zstd,
-  …), which the scanner reports in a base layer while their version is still
-  the base's: the list is read from the published image
-  ([`harvested-packages.sh`](../.github/scripts/harvested-packages.sh)).
-  Findings a rebuild cannot change — in the distroless base's own packages,
-  or a CRITICAL in the vendored cosign binary — wait for the next base digest, which the monitor already tracks,
-  and open the issue `Published <image> image has findings a rebuild cannot
-  fix`. Loop guard: one rebuild per published digest and finding set; if the
-  rebuilt image still has the same findings, or the rebuild is not
-  published within 6 hours, the monitor opens `Published <image> image still fails the release
-  gate after a rebuild` and stops rebuilding for that set. A scanner or
+  ([`rescan-decide.sh`](../.github/scripts/rescan-decide.sh)). When the gate
+  would refuse what is published, the monitor does not guess whether a
+  rebuild would help: it builds a candidate image from the current pins,
+  without cache, and scans it. A clean candidate publishes a new revision. A
+  candidate that still has findings publishes nothing — the release's own
+  gate would refuse it — and is built again an hour later, so a revision goes
+  out by itself in the hour the fix becomes installable; meanwhile the
+  monitor opens `Published <image> image has findings a rebuild cannot fix`,
+  listing what remains (a fix not yet in the package repositories, or one
+  that needs a newer base image or pinned component). A rebuild that is lost,
+  fails, or is published still carrying the findings is tried again after 6,
+  12 and 24 hours, then every 48 hours, and reported in `Published <image>
+  image still fails the release gate after a rebuild`; no finding is ever
+  given up on. Both issues are closed by the monitor once the published
+  image is clean. A scanner or
   registry outage fails the run visibly and triggers no rescan-driven
   rebuild (version and base updates found by the same run still go through).
 - **Visibility.** The rescan results, and the scans of every CI build on

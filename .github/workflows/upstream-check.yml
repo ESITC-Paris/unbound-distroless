@@ -35,7 +35,9 @@ jobs:
   # The monitor below reacts to a new Unbound version or a moved base digest.
   # Neither happens when a fix lands in trixie-security or Alpine without a
   # base rebuild, so the published images are rescanned here with the release
-  # gates' own Trivy policy (.github/scripts/rescan-decide.sh). Only the
+  # gates' own Trivy policy (.github/scripts/rescan-decide.sh); when that
+  # policy refuses one, a candidate is built and scanned to learn whether a
+  # rebuild fixes it. Only the
   # images behind `latest` are rescanned: the pipeline builds one line
   # (versions.env), older X.Y tags are frozen.
   #
@@ -45,7 +47,9 @@ jobs:
   # of a rescan that did not succeed.
   rescan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Normally a few minutes; up to two candidate builds (Unbound compiled
+    # from source) when a published image has findings.
+    timeout-minutes: 45
     permissions:
       contents: read
       issues: write
@@ -57,9 +61,11 @@ jobs:
       resolver: ${{ steps.resolver.outputs.status }}
       resolver_digest: ${{ steps.published.outputs.resolver }}
       resolver_vulns: ${{ steps.resolver.outputs.vulns }}
+      resolver_tries: ${{ steps.resolver.outputs.tries }}
       updater: ${{ steps.updater.outputs.status }}
       updater_digest: ${{ steps.published.outputs.updater }}
       updater_vulns: ${{ steps.updater.outputs.vulns }}
+      updater_tries: ${{ steps.updater.outputs.tries }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,25 +137,44 @@ jobs:
           ignore-unfixed: true
           exit-code: '0'
 
-      # The resolver's distroless base layers: a finding in one of them is
-      # fixed by a new base digest, not by a rebuild (rescan-decide.sh).
-      - name: List the resolver's base layers
-        run: |
-          DISTROLESS=$(python3 -c 'import json; print(json.load(open(".build-state.json"))["distroless"])')
-          docker buildx imagetools inspect "gcr.io/distroless/base-debian13:nonroot@$DISTROLESS" --format '{{json .Image}}' \
-            | python3 -c 'import json,sys; [print(d) for c in json.load(sys.stdin).values() for d in c["rootfs"]["diff_ids"]]' \
-            | sort -u > base-diffids.txt
-          [ -s base-diffids.txt ] || { echo "::error::no base layers resolved"; exit 1; }
-
-      # ...except for the packages the build stage harvests over the base's
-      # copies: Trivy still reports those in a base layer while their version
-      # equals the base's, yet a rebuild replaces them (harvested-packages.sh).
-      - name: List the packages the resolver takes from its build stage
+      # Would a rebuild fix what the gate refuses? Not deduced: tried. When a
+      # published image has findings and no attempt is in flight
+      # (rescan-decide.sh, first pass → `probe`), a candidate is built here
+      # from the current pins — no cache, so its package upgrade is today's —
+      # and scanned with the same policy. Clean candidate → `new`, a revision
+      # is published; otherwise → `waiting`, and the same is tried again next
+      # hour. Nothing is pushed anywhere by these steps.
+      # continue-on-error: a candidate that cannot be built or scanned costs
+      # this image its rebuild for one hour (`waiting`), not the other image
+      # its verdict; the job still fails at its end so that it is seen.
+      - name: Decide (resolver), first pass
+        id: resolver_pre
         env:
+          POLICY: resolver
+          STATE_KEY: rescan_resolver
           DIGEST: ${{ steps.published.outputs.resolver }}
         run: |
-          bash .github/scripts/harvested-packages.sh "$RESOLVER_IMAGE" "$DIGEST" base-diffids.txt > harvested-pkgs.txt
-          echo "harvested: $(tr '\n' ' ' < harvested-pkgs.txt)"
+          set -o pipefail
+          bash .github/scripts/rescan-decide.sh resolver-amd64.json resolver-arm64.json | grep '^status=' | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build a candidate resolver
+        id: resolver_build
+        if: steps.resolver_pre.outputs.status == 'probe'
+        continue-on-error: true
+        run: sh scripts/build.sh unbound-distroless:candidate --no-cache --pull
+
+      - name: 'Trivy: candidate resolver'
+        id: resolver_scan
+        if: steps.resolver_build.outcome == 'success'
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-distroless:candidate
+          format: json
+          output: candidate-resolver.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
 
       - name: Decide (resolver)
         id: resolver
@@ -157,11 +182,51 @@ jobs:
           POLICY: resolver
           STATE_KEY: rescan_resolver
           DIGEST: ${{ steps.published.outputs.resolver }}
-          BASE_DIFFIDS_FILE: base-diffids.txt
-          HARVESTED_PKGS_FILE: harvested-pkgs.txt
+          CANDIDATE: ${{ steps.resolver_scan.outcome == 'success' && 'candidate-resolver.json' || '' }}
+          CANDIDATE_FAILED: ${{ steps.resolver_pre.outputs.status == 'probe' && steps.resolver_scan.outcome != 'success' && '1' || '' }}
         run: |
           set -o pipefail
           bash .github/scripts/rescan-decide.sh resolver-amd64.json resolver-arm64.json | tee -a "$GITHUB_OUTPUT"
+
+      - name: Decide (sidecar), first pass
+        id: updater_pre
+        env:
+          POLICY: updater
+          STATE_KEY: rescan_updater
+          DIGEST: ${{ steps.published.outputs.updater }}
+        run: |
+          set -o pipefail
+          bash .github/scripts/rescan-decide.sh updater-amd64.json updater-arm64.json | grep '^status=' | tee -a "$GITHUB_OUTPUT"
+
+      # Same pins and build arguments as updater.yml's release build.
+      - name: Build a candidate sidecar
+        id: updater_build
+        if: steps.updater_pre.outputs.status == 'probe'
+        continue-on-error: true
+        run: |
+          # shellcheck disable=SC1091
+          . ./versions.env
+          ALPINE=$(python3 -c 'import json; print(json.load(open(".build-state.json"))["alpine"])')
+          COSIGN=$(python3 -c 'import json; print(json.load(open(".build-state.json"))["cosign"])')
+          docker build --no-cache --pull -t unbound-autoupdate:candidate \
+            --build-arg "ALPINE_BASE=alpine:3.24@$ALPINE" \
+            --build-arg "COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.3@$COSIGN" \
+            --build-arg "UPDATER_VERSION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
+            --build-arg "IMAGE_REVISION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
+            updater/
+
+      - name: 'Trivy: candidate sidecar'
+        id: updater_scan
+        if: steps.updater_build.outcome == 'success'
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: unbound-autoupdate:candidate
+          format: json
+          output: candidate-updater.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
 
       - name: Decide (sidecar)
         id: updater
@@ -169,6 +234,8 @@ jobs:
           POLICY: updater
           STATE_KEY: rescan_updater
           DIGEST: ${{ steps.published.outputs.updater }}
+          CANDIDATE: ${{ steps.updater_scan.outcome == 'success' && 'candidate-updater.json' || '' }}
+          CANDIDATE_FAILED: ${{ steps.updater_pre.outputs.status == 'probe' && steps.updater_scan.outcome != 'success' && '1' || '' }}
         run: |
           set -o pipefail
           bash .github/scripts/rescan-decide.sh updater-amd64.json updater-arm64.json | tee -a "$GITHUB_OUTPUT"
@@ -177,41 +244,53 @@ jobs:
         id: verdict
         run: echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      - name: Open an issue when a rebuild cannot or did not fix the findings
-        # stuck: one rebuild was published for exactly these findings and
-        #   they are still there, or the rebuild it asked for was never
-        #   published; blocked: only findings a rebuild cannot change. No
-        #   rebuild is tried for them; a human decides. One issue per image
-        #   and kind, never a comment per hourly run.
-        if: contains(fromJSON('["stuck","blocked"]'), steps.resolver.outputs.status) || contains(fromJSON('["stuck","blocked"]'), steps.updater.outputs.status)
+      - name: Open or close the issues about what is published
+        # unfixed:  a candidate built this hour still has the findings — no
+        #           rebuild can be published yet; the monitor keeps trying.
+        # retrying: an earlier rebuild did not resolve them (release lost or
+        #           failed, or published and still carrying them).
+        # clear:    the published image is clean — both issues are closed.
+        # One issue per image and kind, never a comment per hourly run.
+        # continue-on-error: the verdict above is what publishes a rebuild; a
+        # GitHub Issues outage must not cost it (the job still fails below).
+        id: issues
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          RESOLVER_STATUS: ${{ steps.resolver.outputs.status }}
+          RESOLVER_ALERT: ${{ steps.resolver.outputs.alert }}
           RESOLVER_DIGEST: ${{ steps.published.outputs.resolver }}
           RESOLVER_SUMMARY: ${{ steps.resolver.outputs.summary }}
+          RESOLVER_REMAINING: ${{ steps.resolver.outputs.remaining }}
           RESOLVER_REASON: ${{ steps.resolver.outputs.reason }}
-          UPDATER_STATUS: ${{ steps.updater.outputs.status }}
+          UPDATER_ALERT: ${{ steps.updater.outputs.alert }}
           UPDATER_DIGEST: ${{ steps.published.outputs.updater }}
           UPDATER_SUMMARY: ${{ steps.updater.outputs.summary }}
+          UPDATER_REMAINING: ${{ steps.updater.outputs.remaining }}
           UPDATER_REASON: ${{ steps.updater.outputs.reason }}
         run: |
-          open_once() {  # open_once <image> <status> <digest> <summary> <reason>
-            if [ "$2" = stuck ]; then
-              TITLE="Published $1 image still fails the release gate after a rebuild"
-            else
-              TITLE="Published $1 image has findings a rebuild cannot fix"
-            fi
-            NUM=$(gh issue list --state open --json number,title \
-              -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
-            [ -z "$NUM" ] || { echo "already tracked in #$NUM"; return 0; }
-            gh issue create --title "$TITLE" --assignee euca01 --body "$(printf \
-              'Rescan of the published %s image (%s).\n\n%s\n\nFindings the release gate refuses:\n%s\n\nNo automatic rebuild is attempted for these. Run: %s' \
-              "$1" "$3" "$5" "$4" "$RUN_URL")"
+          report() {  # report <image> <alert> <digest> <summary> <remaining> <reason>
+            local unfixed="Published $1 image has findings a rebuild cannot fix"
+            local retrying="Published $1 image still fails the release gate after a rebuild"
+            local body
+            body=$(printf 'Rescan of the published %s image (%s).\n\n%s\n\nFindings the release gate refuses:\n%s\n' "$1" "$3" "$6" "$4")
+            if [ -n "$5" ]; then body+=$(printf '\n\nStill present in a rebuild:\n%s\n' "$5"); fi
+            body+=$(printf '\n\nThis issue is closed by the monitor once the published image is clean. Run: %s' "$RUN_URL")
+            case "$2" in
+              unfixed)  bash .github/scripts/issue.sh open "$unfixed" "$body" ;;
+              retrying) bash .github/scripts/issue.sh open "$retrying" "$body" ;;
+              clear)
+                bash .github/scripts/issue.sh close "$unfixed" "The published $1 image ($3) is clean under the release gate. Run: $RUN_URL"
+                bash .github/scripts/issue.sh close "$retrying" "The published $1 image ($3) is clean under the release gate. Run: $RUN_URL" ;;
+              none) ;;
+              *) echo "::error::unexpected alert '$2' for the $1"; return 1 ;;
+            esac
           }
-          case "$RESOLVER_STATUS" in stuck|blocked) open_once resolver "$RESOLVER_STATUS" "$RESOLVER_DIGEST" "$RESOLVER_SUMMARY" "$RESOLVER_REASON" ;; esac
-          case "$UPDATER_STATUS" in stuck|blocked) open_once sidecar "$UPDATER_STATUS" "$UPDATER_DIGEST" "$UPDATER_SUMMARY" "$UPDATER_REASON" ;; esac
+          rc=0
+          report resolver "$RESOLVER_ALERT" "$RESOLVER_DIGEST" "$RESOLVER_SUMMARY" "$RESOLVER_REMAINING" "$RESOLVER_REASON" || rc=1
+          report sidecar "$UPDATER_ALERT" "$UPDATER_DIGEST" "$UPDATER_SUMMARY" "$UPDATER_REMAINING" "$UPDATER_REASON" || rc=1
+          exit "$rc"
 
       # The SARIF upload happens in its own job (`code-scanning`): a
       # code-scanning outage must not cost this job its verdict or the issue
@@ -231,6 +310,18 @@ jobs:
           path: '*.sarif'
           if-no-files-found: error
           retention-days: 1
+
+      # Last, so that the verdicts, the issues and the reports above are not
+      # lost: what was continued over still fails the job, and with it the
+      # run (see the end of `check`).
+      - name: Fail the job if a candidate or an issue update failed
+        if: >-
+          steps.resolver_build.outcome == 'failure' || steps.resolver_scan.outcome == 'failure' ||
+          steps.updater_build.outcome == 'failure' || steps.updater_scan.outcome == 'failure' ||
+          steps.issues.outcome == 'failure'
+        run: |
+          echo "::error::a candidate build, its scan, or the issue update failed in this run — see the steps above"
+          exit 1
 
   # Code scanning shows every fixable CRITICAL/HIGH finding in what is
   # published, including the vendored cosign's HIGH ones the sidecar gate
@@ -454,14 +545,16 @@ jobs:
           RESCAN_RESOLVER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.resolver || '' }}
           RESCAN_RESOLVER_DIGEST: ${{ needs.rescan.outputs.resolver_digest }}
           RESCAN_RESOLVER_VULNS: ${{ needs.rescan.outputs.resolver_vulns }}
+          RESCAN_RESOLVER_TRIES: ${{ needs.rescan.outputs.resolver_tries }}
           RESCAN_UPDATER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.updater || '' }}
           RESCAN_UPDATER_DIGEST: ${{ needs.rescan.outputs.updater_digest }}
           RESCAN_UPDATER_VULNS: ${{ needs.rescan.outputs.updater_vulns }}
+          RESCAN_UPDATER_TRIES: ${{ needs.rescan.outputs.updater_tries }}
         run: |
           NOW=$(date +%s); export NOW
           # shellcheck disable=SC1091
           . ./versions.env
-          # Base digests, plus the rescan loop-guard record when this commit
+          # Base digests, plus the rescan attempt record when this commit
           # publishes a rescan-requested rebuild (logic and tests:
           # write-state.sh, tests/monitor.sh).
           bash .github/scripts/write-state.sh
