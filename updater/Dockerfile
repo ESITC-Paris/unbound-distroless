@@ -7,7 +7,7 @@
 # follows a new cosign release, and tests/monitor.sh checks that both agree
 # with versions.env.
 ARG ALPINE_BASE=alpine:3.24
-ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.3
+ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.6
 
 FROM ${COSIGN_IMAGE} AS cosign
 
