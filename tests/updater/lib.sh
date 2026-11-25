@@ -500,6 +500,22 @@ updater_exec() {
     -f "$dir/docker-compose.yml" exec -T updater "$@"
 }
 
+# resolver_answers <dir> — true once the fixture's resolver answers a real
+# recursive query, asked from the sidecar. Retried: a resolver that has just
+# (re)started resolves its first name against a cold cache, root priming and
+# DNSSEC chain included, and on a loaded CI runner that can outlast a single
+# dig's few seconds. One unretried dig made "the resolver still serves"
+# assertions fail on runner speed rather than on the code under test.
+resolver_answers() {
+  local dir="$1" _i
+  for _i in $(seq 1 10); do
+    updater_exec "$dir" dig +time=3 +tries=2 @unbound example.com A 2>/dev/null \
+      | grep -q 'status: NOERROR' && return 0
+    sleep 2
+  done
+  return 1
+}
+
 # running_ref <dir> — the image digest the resolver container actually runs.
 running_ref() {
   local cid
