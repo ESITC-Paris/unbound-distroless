@@ -586,11 +586,37 @@ jobs:
           # mobile notification). Repeated failures add comments to the same
           # issue instead of flooding the tracker.
           TITLE="Upstream check is failing"
-          NUM=$(gh issue list --state open --json number,title \
-            -q ".[] | select(.title==\"$TITLE\") | .number" | head -1)
           BODY="The hourly upstream check (dispatched by deploy/unbound-upstream-check) failed, or its published-image rescan did. Investigate: $RUN_URL"
-          if [ -n "$NUM" ]; then
-            gh issue comment "$NUM" --body "Failed again: $RUN_URL"
-          else
-            gh issue create --title "$TITLE" --assignee euca01 --body "$BODY"
-          fi
+          # Retried, and re-listed on every attempt: the runs that need this
+          # step most are the ones GitHub's own incidents fail, and those break
+          # this API too. On 2026-11-25 a create answered with an error after
+          # having created the issue, unassigned — so nobody was notified. A
+          # retry that re-lists finds that issue instead of opening a second
+          # one, and the assignment is made as its own, repeatable call.
+          notify() {
+            local num
+            num=$(gh issue list --state open --json number,title \
+              -q ".[] | select(.title==\"$TITLE\") | .number" | head -1) || return 1
+            if [ -z "$num" ]; then
+              # No --assignee here: a create that fails half-way is what left
+              # the issue unassigned. Whatever this call reports, the next
+              # attempt's list finds what it actually created.
+              OPENED=1
+              num=$(gh issue create --title "$TITLE" --body "$BODY" | grep -oE '[0-9]+$' | tail -1) || return 1
+              [ -n "$num" ] || return 1
+            elif [ -z "$OPENED" ] && [ -z "$COMMENTED" ]; then
+              # An issue from an earlier run. (One this run opened itself, on
+              # an attempt that then failed, gets no "again".)
+              gh issue comment "$num" --body "Failed again: $RUN_URL" || return 1
+              COMMENTED=1
+            fi
+            gh issue edit "$num" --add-assignee euca01 >/dev/null
+          }
+          OPENED="" COMMENTED=""
+          for attempt in 1 2 3 4 5; do
+            if notify; then exit 0; fi
+            echo "::warning::notification attempt $attempt failed"
+            [ "$attempt" = 5 ] || sleep $(( attempt * 20 ))
+          done
+          echo "::error::could not open, comment on or assign the failure issue"
+          exit 1

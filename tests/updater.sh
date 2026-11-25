@@ -2180,7 +2180,7 @@ LABEL test.intr=\"2\"" "unbound-intr:1"); registry_sign "$dir" "$r"
   [ "$rc" = 1 ] && grep -q 'rollback successful' <<<"$out" || fail "a stopped resolver after an interrupted swap was not recovered (rc=$rc): $out"
   [ $(( $(date +%s) - t0 )) -lt 60 ] || fail "recovery waited for discovery's timeout instead of acting"
   [ "$(service_label "$dir" unbound test.intr)" = 2 ] || fail "the recovered resolver is not the image that was running"
-  updater_exec "$dir" dig +time=3 +tries=2 @unbound example.com A | grep -q 'status: NOERROR' || fail "DNS is not back after the recovery"
+  resolver_answers "$dir" || fail "DNS is not back after the recovery"
   updater_exec "$dir" grep -q '^SWAP_INTENT=$' /var/lib/unbound-autoupdate/state.env || fail "the swap intent was not cleared"
   pass "an interrupted swap is finished by the next cycle: the new image judged, or DNS restored from a stopped resolver"
 }
@@ -2332,7 +2332,7 @@ LABEL test.midrc=\"2\"" "unbound-midrc:1"); registry_sign "$dir" "$r"
     || fail "after recovery the resolver is not running exactly once (rc=$rc): $out"
   [ "$(docker ps -aq --filter "label=com.docker.compose.project=$p" --filter "label=com.docker.compose.service=unbound" | wc -l | tr -d ' ')" = 1 ] \
     || fail "after recovery leftover resolver containers remain"
-  updater_exec "$dir" dig +time=3 +tries=3 @unbound example.com A | grep -q 'status: NOERROR' || fail "DNS is not back after recovery: $out"
+  resolver_answers "$dir" || fail "DNS is not back after recovery: $out"
   updater_exec "$dir" grep -q '^SWAP_INTENT=$' /var/lib/unbound-autoupdate/state.env || fail "the swap intent was not resolved: $out"
   pass "a swap killed inside 'compose up' ($left resolver containers left, none running) is recovered: one running resolver, DNS back, intent resolved"
 }
@@ -2464,8 +2464,7 @@ LABEL test.baseline=\"unsigned\"" "unbound-baseline:1")
   grep -qiE 'no signatures found|no matching signatures' <<<"$out" \
     || fail "baseline: the refusal is not cosign's verdict on the signature: $out"
   [ "$(fixture_service_cid "$dir" unbound)" = "$cid0" ] || fail "baseline: the resolver was touched by a failed verification"
-  updater_exec "$dir" dig +time=3 +tries=2 @unbound example.com A | grep -q 'status: NOERROR' \
-    || fail "baseline: the resolver stopped serving after a failed verification"
+  resolver_answers "$dir" || fail "baseline: the resolver stopped serving after a failed verification"
 
   # A configuration change must not canary or recreate it either.
   printf '\nserver:\n  cache-min-ttl: 77\n' >> "$dir/unbound.conf"
