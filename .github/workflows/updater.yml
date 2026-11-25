@@ -204,13 +204,15 @@ jobs:
       - name: Load pinned versions
         run: cat versions.env >> "$GITHUB_ENV"
 
+      # Versions from versions.env (loaded just above), digests from
+      # .build-state.json: the monitor moves both together.
       - name: Load pinned base image digests
         run: |
           python3 - <<'PY' >> "$GITHUB_ENV"
-          import json
+          import json, os
           state = json.load(open('.build-state.json'))
-          print(f"ALPINE_BASE=alpine:3.24@{state['alpine']}")
-          print(f"COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.3@{state['cosign']}")
+          print(f"ALPINE_BASE=alpine:{os.environ['ALPINE_VERSION']}@{state['alpine']}")
+          print(f"COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v{os.environ['COSIGN_VERSION']}@{state['cosign']}")
           PY
 
       - name: Sanitize platform name
@@ -259,11 +261,11 @@ jobs:
       #     binary. Its findings are in cosign's own Go dependencies: the fix
       #     exists upstream in Go, but only a new cosign build can ship it, so
       #     nothing in this repository can clear them. No cosign release is
-      #     free of them — v3.1.3, the newest, still carries 16 HIGH (0
+      #     free of them — v3.1.3 still carried 16 HIGH in November 2026 (0
       #     CRITICAL). Gating it at HIGH would mean a permanently red pipeline
       #     or a blanket ignore file; instead it is gated at CRITICAL and
-      #     tracked to the newest upstream release (.build-state.json +
-      #     upstream-check.yml).
+      #     tracked to the newest upstream release of its major line
+      #     (versions.env, .build-state.json, upstream-check.yml).
       - name: 'Trivy: OS packages (gate)'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

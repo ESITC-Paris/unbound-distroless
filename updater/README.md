@@ -472,7 +472,8 @@ With a key, the identity and issuer variables are not used. An unreadable
 key file is a refusal. The same key verifies the sidecar's own image: the
 mirror must re-sign `unbound-autoupdate` too, or set `SELF_UPDATE=0`.
 
-The image carries the cosign v3.1.3 CLI (pinned by digest in
+The image carries the cosign v3 CLI: the newest release of the v3 line, which
+the monitor follows (version in `versions.env`, pinned by digest in
 `.build-state.json`); the release workflows sign with cosign v2.6.5.
 `tests/updater.sh` verifies the published releases with it, keyless, and a
 key-signed image in key mode. Verifying by hand:

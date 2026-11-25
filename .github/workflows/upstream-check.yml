@@ -209,8 +209,8 @@ jobs:
           ALPINE=$(python3 -c 'import json; print(json.load(open(".build-state.json"))["alpine"])')
           COSIGN=$(python3 -c 'import json; print(json.load(open(".build-state.json"))["cosign"])')
           docker build --no-cache --pull -t unbound-autoupdate:candidate \
-            --build-arg "ALPINE_BASE=alpine:3.24@$ALPINE" \
-            --build-arg "COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v3.1.3@$COSIGN" \
+            --build-arg "ALPINE_BASE=alpine:${ALPINE_VERSION}@$ALPINE" \
+            --build-arg "COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v${COSIGN_VERSION}@$COSIGN" \
             --build-arg "UPDATER_VERSION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
             --build-arg "IMAGE_REVISION=${UPDATER_VERSION}-r${UPDATER_REVISION}" \
             updater/
@@ -422,8 +422,39 @@ jobs:
           echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
           echo "Current: ${UNBOUND_VERSION:-unset} — Latest: $LATEST"
 
+      # The sidecar vendors the cosign binary of a digest-pinned upstream
+      # image. A version tag never moves, so tracking its digest alone would
+      # keep the sidecar on one cosign release for ever — including through a
+      # CRITICAL finding that only a newer cosign fixes. The newest stable
+      # release of the SAME major line is followed instead
+      # (pick-version.sh); the sidecar's release then runs its whole suite
+      # with it before anything is published.
+      # A listing that fails keeps the current pin: it must not cost this run
+      # its other checks.
+      - name: Check latest cosign release (sidecar)
+        id: cosign
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TARGET=$COSIGN_VERSION
+          if TAGS=$(curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              'https://api.github.com/repos/sigstore/cosign/releases?per_page=50' \
+              | python3 -c 'import json, sys
+          for r in json.load(sys.stdin):
+              if not r.get("draft") and not r.get("prerelease"):
+                  print(r["tag_name"])'); then
+            TARGET=$(bash .github/scripts/pick-version.sh "$COSIGN_VERSION" <<<"$TAGS")
+          else
+            echo "::warning::could not list the cosign releases — keeping v$COSIGN_VERSION"
+          fi
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Current: v$COSIGN_VERSION — Target: v$TARGET"
+
       - name: Check base image digests
         id: digests
+        env:
+          COSIGN_TARGET: ${{ steps.cosign.outputs.target }}
         run: |
           # Registry reads are retried: Docker Hub, gcr.io and ghcr.io
           # occasionally rate-limit or hiccup, and a red run every time would
@@ -438,13 +469,28 @@ jobs:
           }
           DEBIAN=$(resolve debian:trixie) || { echo "debian digest resolution failed"; exit 1; }
           DISTROLESS=$(resolve gcr.io/distroless/base-debian13:nonroot) || { echo "distroless digest resolution failed"; exit 1; }
-          ALPINE=$(resolve alpine:3.24) || { echo "alpine digest resolution failed"; exit 1; }
-          COSIGN=$(resolve ghcr.io/sigstore/cosign/cosign:v3.1.3) || { echo "cosign digest resolution failed"; exit 1; }
+          ALPINE=$(resolve "alpine:$ALPINE_VERSION") || { echo "alpine digest resolution failed"; exit 1; }
+          # A newer cosign is used only once its image can be resolved: a
+          # release whose image is not on the registry yet keeps the current
+          # pin for this run, it does not fail it.
+          COSIGN_USE=$COSIGN_VERSION
+          TARGET=${COSIGN_TARGET:-$COSIGN_VERSION}
+          if [ "$TARGET" != "$COSIGN_VERSION" ]; then
+            if COSIGN=$(resolve "ghcr.io/sigstore/cosign/cosign:v$TARGET"); then
+              COSIGN_USE=$TARGET
+            else
+              echo "::warning::cosign v$TARGET is released but its image does not resolve yet — keeping v$COSIGN_VERSION"
+            fi
+          fi
+          if [ "$COSIGN_USE" = "$COSIGN_VERSION" ]; then
+            COSIGN=$(resolve "ghcr.io/sigstore/cosign/cosign:v$COSIGN_VERSION") || { echo "cosign digest resolution failed"; exit 1; }
+          fi
           {
             echo "debian=$DEBIAN"
             echo "distroless=$DISTROLESS"
             echo "alpine=$ALPINE"
             echo "cosign=$COSIGN"
+            echo "cosign_version=$COSIGN_USE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Decide action
@@ -525,10 +571,27 @@ jobs:
 
       - name: Bump the sidecar revision for base updates
         if: steps.decide.outputs.updater_action == 'revision'
+        env:
+          COSIGN_USE: ${{ steps.digests.outputs.cosign_version }}
         run: |
           NEWREV=$((UPDATER_REVISION + 1))
           sed -i "s/^UPDATER_REVISION=.*/UPDATER_REVISION=$NEWREV/" versions.env
           echo "UPDATER_REVISION=$NEWREV" >> "$GITHUB_ENV"
+          # A newer cosign: the version moves with the digest that
+          # .build-state.json is about to record for it (same commit). The
+          # Dockerfile's default — what a bare `docker build updater/` uses —
+          # follows, so local builds do not drift from the releases
+          # (tests/monitor.sh checks that the two agree).
+          if [ "$COSIGN_USE" != "$COSIGN_VERSION" ]; then
+            [[ "$COSIGN_USE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::cosign version '$COSIGN_USE' is not X.Y.Z"; exit 1; }
+            sed -i "s/^COSIGN_VERSION=.*/COSIGN_VERSION=$COSIGN_USE/" versions.env
+            sed -i "s|^ARG COSIGN_IMAGE=.*|ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v$COSIGN_USE|" updater/Dockerfile
+            if ! grep -qx "COSIGN_VERSION=$COSIGN_USE" versions.env \
+               || ! grep -qx "ARG COSIGN_IMAGE=ghcr.io/sigstore/cosign/cosign:v$COSIGN_USE" updater/Dockerfile; then
+              echo "::error::could not move the cosign pin to v$COSIGN_USE"; exit 1
+            fi
+            echo "cosign: v$COSIGN_VERSION → v$COSIGN_USE"
+          fi
 
       - name: Commit state, tag, and dispatch releases
         # Positive guards only: an empty output (a crashed decision step) must
@@ -577,7 +640,7 @@ jobs:
           [ "${#TAGS[@]}" -gt 0 ] || { echo "::error::no tag to publish despite a non-none decision"; exit 1; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add versions.env .build-state.json
+          git add versions.env .build-state.json updater/Dockerfile
           git commit -m "chore: ${TAGS[*]} (resolver: ${R_LABEL}, sidecar: ${U_LABEL}) [skip ci]"
           for t in "${TAGS[@]}"; do git tag "$t"; done
           # --atomic so a rejected main (someone else pushed first) cannot leave
@@ -663,6 +726,24 @@ jobs:
           if [ "$UPDATER_ACTION" = none ]; then
             health updater.yml updater-v "$UPDATER_VERSION" "$UPDATER_REVISION" esitcparis/unbound-autoupdate ghcr.io/esitc-paris/unbound-autoupdate
           fi
+
+      # The Alpine branch is NOT followed by itself: a new branch brings new
+      # major versions of the Docker CLI and Compose the sidecar drives on the
+      # host, which is a change to make through a pull request and its test
+      # suites. The monitor only says when there is one. Informational:
+      # continue-on-error, it never fails the run.
+      - name: Report a newer Alpine branch (sidecar)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          NEXT="${ALPINE_VERSION%%.*}.$(( ${ALPINE_VERSION##*.} + 1 ))"
+          FOUND=$(bash .github/scripts/registry.sh lookup library/alpine "$NEXT")
+          if [ "$FOUND" = absent ]; then echo "alpine:$NEXT is not published"; exit 0; fi
+          bash .github/scripts/issue.sh open "Alpine $NEXT is available for the sidecar" "$(printf \
+            'The sidecar is built on alpine:%s and alpine:%s is published. The monitor does not change the branch by itself: it brings new versions of the Docker CLI and Compose.\n\nTo move: set ALPINE_VERSION=%s in versions.env and the default of ALPINE_BASE in updater/Dockerfile, in a pull request (its CI runs the sidecar suites on the new branch). The next monitor run then records the digest and publishes a sidecar revision. Close this issue when done.' \
+            "$ALPINE_VERSION" "$NEXT" "$NEXT")"
 
       - name: Fail the run if the rescan or its code-scanning upload did not complete
         # After the commit step on purpose: a version or base update has been
