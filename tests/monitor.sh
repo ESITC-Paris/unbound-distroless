@@ -84,11 +84,11 @@ out=$(decide_rescan 1.26.0 sha256:d1 "" new)
 [ "$out" = $'action=none\nupdater_action=revision' ] || fail "rescan new (sidecar): $out"
 pass "rescan finds a fixable vulnerability → revision of that image only"
 
-for s in "" clean pending stuck; do
+for s in "" clean pending waiting; do
   out=$(decide_rescan 1.26.0 sha256:d1 "$s" "$s")
   [ "$out" = $'action=none\nupdater_action=none' ] || fail "rescan '$s' must not publish: $out"
 done
-pass "rescan clean / pending / stuck / unavailable → none/none"
+pass "rescan clean / pending / waiting / unavailable → none/none"
 
 out=$(decide_rescan 1.27.0 sha256:d1 "" "")
 grep -qx 'action=version' <<<"$out" || fail "a failed rescan must not hold back a new version: $out"
@@ -96,8 +96,10 @@ out=$(decide_rescan 1.27.0 sha256:d1 new "")
 grep -qx 'action=version' <<<"$out" || fail "version must win over a rescan revision: $out"
 pass "a missing rescan never blocks a version update; version wins over rescan"
 
-if out=$(decide_rescan 1.26.0 sha256:d1 vulnerable "" 2>&1); then fail "unknown rescan status was accepted: $out"; fi
-pass "an unknown rescan status is a hard error"
+for s in vulnerable probe stuck blocked; do
+  if out=$(decide_rescan 1.26.0 sha256:d1 "$s" "" 2>&1); then fail "rescan status '$s' was accepted: $out"; fi
+done
+pass "an unknown rescan status is a hard error (probe is a first-pass answer, never a verdict)"
 
 force() {  # force <value>
   ( cd "$tmp" && LATEST=1.26.0 NEW_DEBIAN=sha256:d1 NEW_DISTROLESS=sha256:s1 NEW_ALPINE=sha256:a1 NEW_COSIGN=sha256:c1 \
@@ -109,12 +111,9 @@ force() {  # force <value>
 [ "$(force both)" = $'action=revision\nupdater_action=revision' ] || fail "rebuild=both: $(force both)"
 if out=$(force all 2>&1); then fail "unknown rebuild value accepted: $out"; fi
 out=$( cd "$tmp" && LATEST=1.26.0 NEW_DEBIAN=sha256:d1 NEW_DISTROLESS=sha256:s1 NEW_ALPINE=sha256:a1 NEW_COSIGN=sha256:c1 \
-  FORCE_REBUILD=both RESCAN_RESOLVER=pending RESCAN_UPDATER=stuck bash "$SCRIPT" )
-[ "$out" = $'action=revision\nupdater_action=revision' ] || fail "a forced rebuild must override pending/stuck: $out"
-out=$( cd "$tmp" && LATEST=1.26.0 NEW_DEBIAN=sha256:d1 NEW_DISTROLESS=sha256:s1 NEW_ALPINE=sha256:a1 NEW_COSIGN=sha256:c1 \
-  RESCAN_RESOLVER=blocked RESCAN_UPDATER=blocked bash "$SCRIPT" )
-[ "$out" = $'action=none\nupdater_action=none' ] || fail "blocked must never publish: $out"
-pass "manual rebuild input (recovery path) → revision of the named image(s), also over pending/stuck; blocked never publishes"
+  FORCE_REBUILD=both RESCAN_RESOLVER=pending RESCAN_UPDATER=waiting bash "$SCRIPT" )
+[ "$out" = $'action=revision\nupdater_action=revision' ] || fail "a forced rebuild must override pending/waiting: $out"
+pass "manual rebuild input (recovery path) → revision of the named image(s), also over pending/waiting"
 
 # rescan-decide.sh: same policy as the release gates, loop guard.
 RESCAN="$HERE/.github/scripts/rescan-decide.sh"
@@ -144,35 +143,33 @@ COSIGN_CRIT='[{"Target": "usr/local/bin/cosign", "Class": "lang-pkgs", "Type": "
 APK_HIGH='[{"Target": "img (alpine 3.24.4)", "Class": "os-pkgs", "Type": "alpine", "Vulnerabilities": [
   {"VulnerabilityID": "CVE-2026-4", "PkgName": "krb5-libs", "InstalledVersion": "1.22.2-r0", "FixedVersion": "1.22.3-r0", "Status": "fixed", "Severity": "HIGH"}]}]'
 
-# The resolver's base layers; a finding whose Layer.DiffID is one of them
-# needs a new base digest, not a rebuild.
-BASEL=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-printf '%s\n' "$BASEL" sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc > "$tmp/base.txt"
-export BASE_DIFFIDS_FILE="$tmp/base.txt" NOW=1800000000
-# The packages the build stage harvests over the base's copies: a finding in
-# one of them is fixed by a rebuild even when Trivy places it in a base layer.
-printf '%s\n' libc6 libssl3t64 libzstd1 > "$tmp/harvested.txt"
-export HARVESTED_PKGS_FILE="$tmp/harvested.txt"
-OS_BASE='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
-  {"VulnerabilityID": "CVE-2026-5", "PkgName": "tzdata", "InstalledVersion": "2026f-0", "FixedVersion": "2026g-0", "Status": "fixed", "Severity": "HIGH",
-   "Layer": {"DiffID": "'"$BASEL"'"}}]}]'
-# CVE-2026-124851 as r7 was scanned on 2026-11-25: harvested, still at the
-# base's version, so reported in a base layer.
-OS_BASE_HARVESTED='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
-  {"VulnerabilityID": "CVE-2026-7", "PkgName": "libzstd1", "InstalledVersion": "1.5.7+dfsg-1", "FixedVersion": "1.5.7+dfsg-1+deb13u1", "Status": "fixed", "Severity": "HIGH",
-   "Layer": {"DiffID": "'"$BASEL"'"}}]}]'
+export NOW=1800000000
 NO_ID='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
   {"PkgName": "libssl3t64", "FixedVersion": "3.5.1-2", "Severity": "HIGH"}]}]'
 NASTY='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
   {"VulnerabilityID": "CVE-2026-6\nstatus=new", "PkgName": "lib$(x)`y`", "FixedVersion": "1", "Severity": "HIGH"}]}]'
+# CVE-2026-124851 as r7 was scanned on 2026-11-25: a library the build stage
+# copies over the base's, still at the base's version, so Trivy placed it in
+# a distroless base layer. Where a finding sits no longer matters.
+OS_BASE_LAYER='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "debian", "Vulnerabilities": [
+  {"VulnerabilityID": "CVE-2026-7", "PkgName": "libzstd1", "InstalledVersion": "1.5.7+dfsg-1", "FixedVersion": "1.5.7+dfsg-1+deb13u1", "Status": "fixed", "Severity": "HIGH",
+   "Layer": {"DiffID": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}]'
 
-rescan() {  # rescan <policy> <digest> <amd64-results> [<arm64-results>] → $out, $rc
+# rescan <policy> <digest> <amd64-results> [<arm64-results>] → $out, $rc
+# First pass: the published image only. A candidate report, when given
+# (CAND=<results-json>), is the second pass; CAND_FAILED=1 is a candidate
+# that could not be built or scanned.
+rescan() {
   report a.json amd64 "$2" "$3"
   report b.json arm64 "$2" "${4:-$3}"
+  local cand=""
+  if [ -n "${CAND:-}" ]; then report cand.json amd64 "$D2" "$CAND"; cand=cand.json; fi
   rc=0
-  out=$(cd "$tmp" && POLICY="$1" DIGEST="$2" STATE_KEY="rescan_$1" bash "$RESCAN" a.json b.json 2>&1) || rc=$?
+  out=$(cd "$tmp" && POLICY="$1" DIGEST="$2" STATE_KEY="rescan_$1" CANDIDATE="$cand" CANDIDATE_FAILED="${CAND_FAILED:-}" \
+    bash "$RESCAN" a.json b.json 2>&1) || rc=$?
 }
 st() { sed -n 's/^status=//p' <<<"$out"; }
+val() { sed -n "s/^$1=//p" <<<"$out"; }
 setstate() {  # setstate <python dict literal>: replace the rescan keys of the state
   python3 - "$tmp/.build-state.json" "$1" <<'PY'
 import ast, json, sys
@@ -186,87 +183,125 @@ PY
 rescan resolver "$D1" "$OS_CLEAN"
 [ "$rc" = 0 ] && [ "$(st)" = clean ] || fail "clean resolver: rc=$rc $out"
 grep -qx 'vulns=' <<<"$out" || fail "clean must have an empty fingerprint: $out"
+[ "$(val alert)" = clear ] || fail "clean must close what was opened: $out"
 rescan resolver "$D1" "$OS_UNFIXED"
 [ "$(st)" = clean ] || fail "unfixed CRITICAL and fixed MEDIUM are outside the gate: $out"
 rescan resolver "$D1" 'null'
 [ "$rc" = 0 ] && [ "$(st)" = clean ] || fail "Trivy's \"Results\": null (nothing found) → clean: rc=$rc $out"
-pass "rescan: clean, Results null, unfixed or below-HIGH findings → clean (ignore-unfixed, CRITICAL/HIGH)"
+CAND="$OS_HIGH" rescan resolver "$D1" "$OS_CLEAN"
+[ "$(st)" = clean ] || fail "a clean published image is clean whatever a candidate has: $out"
+pass "rescan: clean, Results null, unfixed or below-HIGH findings → clean (ignore-unfixed, CRITICAL/HIGH), alert=clear"
 
 rescan resolver "$D1" "$OS_CLEAN" "$OS_HIGH"
-[ "$(st)" = new ] || fail "a fixable HIGH on arm64 only must count: $out"
+[ "$(st)" = probe ] || fail "a gate finding on arm64 only, nothing tried yet → probe (build a candidate): $out"
 grep -qx 'count=1' <<<"$out" || fail "count: $out"
 grep -q '^summary=CVE-2026-1 (libssl3t64)$' <<<"$out" || fail "summary: $out"
-FP=$(sed -n 's/^vulns=//p' <<<"$out")
+[ "$(val alert)" = none ] || fail "a first pass alerts nobody: $out"
+FP=$(val vulns)
 [[ "$FP" =~ ^[0-9a-f]{16}$ ]] || fail "fingerprint format: $FP"
 rescan resolver "$D1" "$OS_HIGH"
-[ "$(sed -n 's/^vulns=//p' <<<"$out")" = "$FP" ] || fail "fingerprint must not depend on the platform it was found on"
-pass "rescan: fixable HIGH on either platform → new, stable fingerprint"
+[ "$(val vulns)" = "$FP" ] || fail "fingerprint must not depend on the platform it was found on"
+pass "rescan: a gate finding on either platform → probe on the first pass, stable fingerprint"
+
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = new ] || fail "published has a finding, the candidate is clean → new: $out"
+[ "$(val tries)" = 1 ] && [ "$(val alert)" = none ] || fail "a first attempt is attempt 1 and alerts nobody: $out"
+CAND="$OS_HIGH" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = waiting ] || fail "the candidate still has the finding → waiting, never a release: $out"
+[ "$(val alert)" = unfixed ] || fail "a rebuild that does not fix must be reported: $out"
+grep -q '^remaining=CVE-2026-1 (libssl3t64)$' <<<"$out" && grep -q '^reason=A rebuild does not fix' <<<"$out" || fail "waiting must say what remains and why: $out"
+CAND="$APK_HIGH" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = waiting ] || fail "a candidate with OTHER gate findings would fail the release gate too → waiting: $out"
+grep -q '^remaining=CVE-2026-4 (krb5-libs)$' <<<"$out" || fail "remaining lists the candidate's findings: $out"
+CAND_FAILED=1 rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = waiting ] && [ "$(val alert)" = none ] || fail "a candidate that could not be built → waiting, no issue (the job fails by itself): $out"
+grep -q '^reason=The candidate build or its scan failed' <<<"$out" || fail "a failed candidate must say so: $out"
+pass "rescan: the candidate decides — clean → new; still refused by the gate, or not buildable → waiting (tried again next run)"
+
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_BASE_LAYER"
+[ "$(st)" = new ] || fail "a finding Trivy places in a base layer is rebuilt as soon as a candidate is clean (CVE-2026-124851): $out"
+CAND="$OS_BASE_LAYER" rescan resolver "$D1" "$OS_BASE_LAYER"
+[ "$(st)" = waiting ] || fail "…and waits while the candidate still has it: $out"
+pass "rescan: where Trivy locates a finding is irrelevant — only the candidate's scan counts"
 
 rescan updater "$D1" "$COSIGN_HIGH"
 [ "$(st)" = clean ] || fail "HIGH in the vendored cosign is exempt from the sidecar gate: $out"
 rescan resolver "$D1" "$COSIGN_HIGH"
-[ "$(st)" = new ] || fail "the cosign exemption must apply to the sidecar only: $out"
-rescan updater "$D1" "$APK_HIGH"
-[ "$(st)" = new ] || fail "HIGH in an Alpine package fails the sidecar gate and a rebuild fixes it: $out"
-pass "rescan: sidecar two-level policy (HIGH except vendored cosign, CRITICAL everywhere)"
-
+[ "$(st)" = probe ] || fail "the cosign exemption must apply to the sidecar only: $out"
+CAND="$COSIGN_HIGH" rescan updater "$D1" "$APK_HIGH"
+[ "$(st)" = new ] || fail "the exemption applies to the candidate too: an Alpine fix with cosign's HIGH still there → new: $out"
 rescan updater "$D1" "$COSIGN_CRIT"
-[ "$(st)" = blocked ] || fail "CRITICAL in the vendored cosign: a rebuild cannot fix it → blocked: $out"
-grep -q 'needs a new cosign release' <<<"$out" || fail "blocked must say why: $out"
-rescan resolver "$D1" "$OS_BASE"
-[ "$(st)" = blocked ] || fail "finding in a distroless base layer → blocked: $out"
-grep -q 'needs a new base digest' <<<"$out" && grep -q '^reason=.' <<<"$out" || fail "blocked must say why: $out"
-rescan resolver "$D1" "$OS_BASE" "$OS_HIGH"
-[ "$(st)" = new ] || fail "a rebuild-fixable finding next to a base one → new: $out"
-[ "$(sed -n 's/^vulns=//p' <<<"$out")" = "$FP" ] || fail "the fingerprint must cover the rebuild-fixable findings only"
-grep -qx 'count=2' <<<"$out" || fail "count covers both kinds: $out"
-pass "rescan: findings a rebuild cannot fix (vendored cosign CRITICAL, distroless base layer) → blocked, never a revision"
+[ "$(st)" = probe ] || fail "CRITICAL in the vendored cosign fails the sidecar gate: $out"
+CAND="$COSIGN_CRIT" rescan updater "$D1" "$COSIGN_CRIT"
+[ "$(st)" = waiting ] && [ "$(val alert)" = unfixed ] || fail "a pinned cosign is not fixed by a rebuild → waiting, reported: $out"
+pass "rescan: sidecar two-level policy (HIGH except vendored cosign, CRITICAL everywhere), on the published image and on the candidate"
 
-rescan resolver "$D1" "$OS_BASE_HARVESTED"
-[ "$(st)" = new ] || fail "a harvested package reported in a base layer is fixed by a rebuild → new: $out"
-grep -q '^summary=CVE-2026-7 (libzstd1)$' <<<"$out" || fail "a harvested package must not be labelled as needing a new base digest: $out"
-[[ "$(sed -n 's/^vulns=//p' <<<"$out")" =~ ^[0-9a-f]{16}$ ]] || fail "a harvested finding must be in the fingerprint (loop guard): $out"
-rc=0; out=$(cd "$tmp" && HARVESTED_PKGS_FILE="" POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
-[ "$rc" = 1 ] && grep -q 'HARVESTED_PKGS_FILE is required' <<<"$out" || fail "a resolver verdict without the harvested list must be an error: rc=$rc $out"
-: > "$tmp/empty.txt"
-rc=0; out=$(cd "$tmp" && HARVESTED_PKGS_FILE="$tmp/empty.txt" POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
-[ "$rc" = 1 ] && grep -q 'not a list of package names' <<<"$out" || fail "an empty harvested list must be an error, not \"nothing is harvested\": rc=$rc $out"
-pass "rescan: a harvested library reported in a base layer → new (a rebuild fixes it); the harvested list is mandatory and never empty"
-
-# Loop guard. The record names the digest a rebuild was triggered from, the
-# finding set it was triggered for, and when.
-setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 3600))'}"
-rescan resolver "$D1" "$OS_HIGH"
-[ "$(st)" = pending ] || fail "same digest as the recorded attempt, 1 h ago → pending: $out"
+# Attempt record: the digest a rebuild was triggered from, the finding set it
+# was triggered for, when, and which attempt it was. It spaces attempts out;
+# it never forbids the next one.
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 3600))', 'rescan_resolver_tries': '1'}"
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = pending ] && [ "$(val alert)" = none ] || fail "same digest as the attempt made 1 h ago → pending, even with a clean candidate: $out"
 rescan resolver "$D2" "$OS_HIGH"
-[ "$(st)" = stuck ] || fail "rebuilt (new digest), same findings → stuck: $out"
-grep -q '^reason=One rebuild was published' <<<"$out" || fail "stuck must say why: $out"
+[ "$(st)" = pending ] && [ "$(val alert)" = retrying ] || fail "rebuilt (new digest), same findings, 1 h ago → pending and reported: $out"
+grep -q 'still carries exactly these findings' <<<"$out" || fail "it must say the rebuild did not fix: $out"
 rescan resolver "$D2" "$APK_HIGH"
-[ "$(st)" = new ] || fail "rebuilt, different findings → new attempt: $out"
+[ "$(st)" = probe ] || fail "rebuilt, different findings → a new situation, probe at once: $out"
+CAND="$OS_CLEAN" rescan resolver "$D2" "$APK_HIGH"
+[ "$(st)" = new ] && [ "$(val tries)" = 1 ] || fail "…and its attempt is attempt 1: $out"
 rescan resolver "$D2" "$OS_CLEAN"
 [ "$(st)" = clean ] || fail "rebuilt and clean → clean: $out"
 rescan updater "$D2" "$OS_HIGH"
-[ "$(st)" = new ] || fail "the resolver's record must not guard the sidecar: $out"
-pass "rescan loop guard: pending on the same digest, stuck after one rebuild, new on a new finding set"
+[ "$(st)" = probe ] || fail "the resolver's record must not guard the sidecar: $out"
+pass "rescan attempts: pending while a rebuild is in flight or just failed to fix; a new finding set starts over"
 
-setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 7 * 3600))'}"
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 7 * 3600))', 'rescan_resolver_tries': '1'}"
 rescan resolver "$D1" "$OS_HIGH"
-[ "$(st)" = stuck ] || fail "a triggered rebuild unpublished after 7 h → stuck, not pending forever: $out"
-grep -q 'not been published within 6 h' <<<"$out" || fail "expired pending must say why: $out"
+[ "$(st)" = probe ] || fail "a rebuild unpublished after 7 h must be tried again, not given up on: $out"
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = new ] && [ "$(val tries)" = 2 ] && [ "$(val alert)" = retrying ] || fail "…as attempt 2, reported: $out"
+CAND="$OS_HIGH" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = waiting ] || fail "…but only with a clean candidate: $out"
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 7 * 3600))', 'rescan_resolver_tries': '2'}"
+rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = pending ] && [ "$(val alert)" = retrying ] || fail "after attempt 2 the wait is 12 h: 7 h → pending, reported: $out"
+grep -q 'has not been published' <<<"$out" && grep -q '12 h after' <<<"$out" || fail "it must say what is awaited and until when: $out"
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 13 * 3600))', 'rescan_resolver_tries': '2'}"
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = new ] && [ "$(val tries)" = 3 ] || fail "13 h after attempt 2 → attempt 3: $out"
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 47 * 3600))', 'rescan_resolver_tries': '9'}"
+rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = pending ] || fail "the wait is capped at 48 h: 47 h after attempt 9 → still pending: $out"
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 49 * 3600))', 'rescan_resolver_tries': '9'}"
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = new ] && [ "$(val tries)" = 10 ] || fail "…and 49 h after it the next attempt is made: nothing is ever abandoned: $out"
+pass "rescan attempts: a lost or failed rebuild is retried after 6 h, 12 h, 24 h, then every 48 h — never abandoned, never hourly"
+
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW - 3600))'}"
+rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = pending ] || fail "a record written before attempts were counted is attempt 1: $out"
 setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP'}"
+CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = new ] && [ "$(val tries)" = 2 ] || fail "a record without a time cannot make anything wait: $out"
+setstate "{'rescan_resolver_digest': '$D1', 'rescan_resolver_vulns': '$FP', 'rescan_resolver_at': '$((NOW + 86400))', 'rescan_resolver_tries': 'x'}"
 rescan resolver "$D1" "$OS_HIGH"
-[ "$(st)" = stuck ] || fail "a record without a time cannot be pending forever: $out"
-pass "rescan: pending expires into stuck after PENDING_HOURS (and a record without a time never pends)"
+[ "$(st)" = probe ] || fail "a time in the future or a garbled count must not make anything wait: $out"
+pass "rescan attempts: legacy, timeless or garbled records never block"
 setstate "{}"
 
 rescan resolver "$D1" "$NASTY"
-[ "$(st)" = new ] || fail "nasty names: $out"
-[ "$(wc -l <<<"$out")" -eq 5 ] || fail "summary must stay on one line: $out"
-grep -q '\$\|`' <<<"$(sed -n 's/^summary=//p' <<<"$out")" && fail "shell metacharacters must be stripped: $out"
+[ "$(st)" = probe ] || fail "nasty names: $out"
+[ "$(wc -l <<<"$out")" -eq 8 ] || fail "every value must stay on one line: $out"
+grep -q '\$\|`' <<<"$(val summary)" && fail "shell metacharacters must be stripped: $out"
+CAND="$NASTY" rescan resolver "$D1" "$OS_HIGH"
+[ "$(wc -l <<<"$out")" -eq 8 ] || fail "remaining must stay on one line: $out"
+grep -q '\$\|`' <<<"$(val remaining)" && fail "shell metacharacters must be stripped from remaining: $out"
 pass "rescan: values for \$GITHUB_OUTPUT are one line, metacharacters stripped"
 
 rescan resolver "$D1" "$NO_ID"
 [ "$rc" = 1 ] || fail "a finding without VulnerabilityID must be an error, got rc=$rc: $out"
+CAND="$NO_ID" rescan resolver "$D1" "$OS_HIGH"
+[ "$rc" = 1 ] || fail "a candidate finding without VulnerabilityID must be an error, got rc=$rc: $out"
 cp "$tmp/.build-state.json" "$tmp/state.bak"; printf '{ "debian": ' > "$tmp/.build-state.json"
 rescan resolver "$D1" "$OS_CLEAN"
 [ "$rc" = 1 ] || fail "a corrupt .build-state.json must be an error, got rc=$rc: $out"
@@ -280,14 +315,18 @@ rc=0; out=$(cd "$tmp" && POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver 
 rescan resolver "$D1" "$OS_CLEAN"
 rc=0; out=$(cd "$tmp" && POLICY=resolver DIGEST="$D2" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
 [ "$rc" = 1 ] || fail "a report about another digest must be an error, got rc=$rc: $out"
-rc=0; out=$(cd "$tmp" && BASE_DIFFIDS_FILE="" POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
-[ "$rc" = 1 ] || fail "the resolver policy without base layers must be an error, got rc=$rc: $out"
+rescan resolver "$D1" "$OS_HIGH"
+rc=0; out=$(cd "$tmp" && POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver CANDIDATE="$tmp/missing.json" bash "$RESCAN" a.json b.json 2>&1) || rc=$?
+[ "$rc" = 1 ] || fail "a candidate report that is announced but missing must be an error, never 'clean', got rc=$rc: $out"
+printf '{}\n' > "$tmp/cand.json"
+rc=0; out=$(cd "$tmp" && POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver CANDIDATE=cand.json bash "$RESCAN" a.json b.json 2>&1) || rc=$?
+[ "$rc" = 1 ] || fail "a candidate report that is not a Trivy report must be an error, got rc=$rc: $out"
 printf 'FATAL: DB download failed\n' > "$tmp/a.json"
 rc=0; out=$(cd "$tmp" && POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" a.json b.json 2>&1) || rc=$?
 [ "$rc" = 1 ] || fail "an unreadable report must be an error, got rc=$rc: $out"
 rc=0; out=$(cd "$tmp" && POLICY=resolver DIGEST="$D1" STATE_KEY=rescan_resolver bash "$RESCAN" "$tmp/missing.json" 2>&1) || rc=$?
 [ "$rc" = 1 ] || fail "a missing report must be an error, got rc=$rc: $out"
-pass "rescan: no ID, corrupt state, missing platform or base list, wrong digest, unreadable report → error, never a verdict"
+pass "rescan: no ID, corrupt state, missing platform, wrong digest, unreadable or missing report (published or candidate) → error, never a verdict"
 
 # write-state.sh: the commit step's rewrite of .build-state.json.
 WRITE="$HERE/.github/scripts/write-state.sh"
@@ -298,16 +337,17 @@ write env ACTION=revision UPDATER_ACTION=none
 cmp -s "$tmp/.build-state.json" "$tmp/expected.json" || fail "unchanged state must be byte-identical: $(cat "$tmp/.build-state.json")"
 pass "write-state: same digests, no rescan → byte-identical file"
 
-write env ACTION=revision UPDATER_ACTION=none RESCAN_RESOLVER=new RESCAN_RESOLVER_DIGEST="$D1" RESCAN_RESOLVER_VULNS="$FP" \
-  RESCAN_UPDATER=new RESCAN_UPDATER_DIGEST="$D2" RESCAN_UPDATER_VULNS="$FP"
+write env ACTION=revision UPDATER_ACTION=none RESCAN_RESOLVER=new RESCAN_RESOLVER_DIGEST="$D1" RESCAN_RESOLVER_VULNS="$FP" RESCAN_RESOLVER_TRIES=3 \
+  RESCAN_UPDATER=new RESCAN_UPDATER_DIGEST="$D2" RESCAN_UPDATER_VULNS="$FP" RESCAN_UPDATER_TRIES=1
 python3 - "$tmp/.build-state.json" "$D1" "$FP" <<'PY' || fail "record written for the published image only: $(cat "$tmp/.build-state.json")"
 import json, sys
 s = json.load(open(sys.argv[1]))
 assert s["rescan_resolver_digest"] == sys.argv[2] and s["rescan_resolver_vulns"] == sys.argv[3]
 assert "rescan_updater_digest" not in s, "sidecar not published in this commit: no record"
 assert s["rescan_resolver_at"] == "1800000000", s.get("rescan_resolver_at")
+assert s["rescan_resolver_tries"] == "3", s.get("rescan_resolver_tries")
 PY
-pass "write-state: the loop-guard record is written only for an image this commit publishes"
+pass "write-state: the attempt record (digest, findings, time, attempt number) is written only for an image this commit publishes"
 
 write env ACTION=none UPDATER_ACTION=revision NEW_ALPINE=sha256:a2 RESCAN_RESOLVER=pending
 python3 - "$tmp/.build-state.json" "$D1" <<'PY' || fail "existing keys must survive: $(cat "$tmp/.build-state.json")"
@@ -317,9 +357,14 @@ assert s["alpine"] == "sha256:a2" and s["rescan_resolver_digest"] == sys.argv[2]
 PY
 pass "write-state: unrelated keys (an earlier record) are kept, digests updated"
 
-if out=$(write env ACTION=revision RESCAN_RESOLVER=new RESCAN_RESOLVER_DIGEST="" RESCAN_RESOLVER_VULNS="$FP" 2>&1); then
+if out=$(write env ACTION=revision RESCAN_RESOLVER=new RESCAN_RESOLVER_DIGEST="" RESCAN_RESOLVER_VULNS="$FP" RESCAN_RESOLVER_TRIES=1 2>&1); then
   fail "a record without a digest was accepted: $out"
 fi
+for t in "" 0 x; do
+  if out=$(write env ACTION=revision RESCAN_RESOLVER=new RESCAN_RESOLVER_DIGEST="$D1" RESCAN_RESOLVER_VULNS="$FP" RESCAN_RESOLVER_TRIES="$t" 2>&1); then
+    fail "a record with attempt number '$t' was accepted: $out"
+  fi
+done
 pass "write-state: a malformed record is refused, nothing half-written is committed"
 
 # ---------------------------------------------------------------------------
@@ -469,6 +514,78 @@ health yes no $'completed failure\ncompleted failure\ncompleted cancelled'; [ "$
 health yes no "exploded x";                       [ "$rc" = 1 ] || fail "unknown run status accepted: $out"
 pass "release-health: lost / cancelled / timed-out release → re-dispatched, at most 3 runs, then an issue; running → wait"
 
+# issue.sh: one open issue per title, assigned; survives a GitHub outage in
+# the middle of its own calls. gh is faked.
+ISSUE="$HERE/.github/scripts/issue.sh"
+mkdir -p "$tmp/ghbin"
+cat > "$tmp/ghbin/gh" <<'FAKE'
+#!/usr/bin/env bash
+# Canned GitHub. $GH_DIR: issues (one "number<TAB>title" per open issue),
+# assigned / closed / calls (logs). $GH_FAIL: space-separated failures, each
+# consumed once: create-after (the issue is created, the call errors),
+# edit, list, close — or "down" (every call fails, never consumed).
+T="$GH_DIR"; echo "$*" >> "$T/calls"
+fail_once() { grep -qx "$1" "$T/fail" 2>/dev/null || return 1; grep -vx "$1" "$T/fail" > "$T/fail.new" || true; mv "$T/fail.new" "$T/fail"; }
+grep -qx down "$T/fail" 2>/dev/null && exit 1
+case "$1 $2" in
+  "issue list")
+    fail_once list && exit 1
+    python3 -c 'import json, sys
+print(json.dumps([dict(number=int(n), title=t) for n, t in (l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]))]))' "$T/issues" ;;
+  "issue create")
+    n=$(( $(cat "$T/next" 2>/dev/null || echo 40) + 1 )); echo "$n" > "$T/next"
+    printf '%s\t%s\n' "$n" "$4" >> "$T/issues"
+    fail_once create-after && { echo "GraphQL: Something went wrong" >&2; exit 1; }
+    echo "https://github.com/o/r/issues/$n" ;;
+  "issue edit") fail_once edit && exit 1; echo "$3 $5" >> "$T/assigned" ;;
+  "issue close")
+    fail_once close && exit 1
+    grep -v "^$3	" "$T/issues" > "$T/issues.new" || true; mv "$T/issues.new" "$T/issues"; echo "$3" >> "$T/closed" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 2 ;;
+esac
+FAKE
+chmod +x "$tmp/ghbin/gh"
+issue() {  # issue <failures> <mode> <title> <text> → $rc; state in $tmp/gh
+  printf '%s\n' $1 > "$tmp/gh/fail"
+  rc=0; out=$(GH_DIR="$tmp/gh" ISSUE_RETRY_SLEEP=0 PATH="$tmp/ghbin:$PATH" bash "$ISSUE" "$2" "$3" "$4" 2>&1) || rc=$?
+}
+gh_reset() { rm -rf "$tmp/gh"; mkdir -p "$tmp/gh"; : > "$tmp/gh/issues"; }
+count() { grep -c "$1" "$tmp/gh/$2" 2>/dev/null || true; }
+
+gh_reset
+issue "" open "Image has findings" "body"
+[ "$rc" = 0 ] && [ "$(wc -l < "$tmp/gh/issues" | tr -d ' ')" = 1 ] && grep -qx '41 euca01' "$tmp/gh/assigned" || fail "open: one issue, assigned: rc=$rc $out"
+issue "" open "Image has findings" "body"
+[ "$rc" = 0 ] && [ "$(wc -l < "$tmp/gh/issues" | tr -d ' ')" = 1 ] || fail "open twice must not open a second issue: $out"
+issue "" open "Another title" "body"
+[ "$(wc -l < "$tmp/gh/issues" | tr -d ' ')" = 2 ] || fail "another title is another issue: $out"
+pass "issue.sh: one open issue per title, assigned to the admin"
+
+gh_reset
+issue "create-after" open "Image has findings" "body"
+[ "$rc" = 0 ] && [ "$(wc -l < "$tmp/gh/issues" | tr -d ' ')" = 1 ] && grep -qx '41 euca01' "$tmp/gh/assigned" \
+  || fail "a create that errors after creating (2026-11-25) → the same issue, assigned, no duplicate: rc=$rc $out $(cat "$tmp/gh/issues")"
+gh_reset
+issue "edit list" open "Image has findings" "body"
+[ "$rc" = 0 ] && [ "$(wc -l < "$tmp/gh/issues" | tr -d ' ')" = 1 ] && grep -qx '41 euca01' "$tmp/gh/assigned" \
+  || fail "a failed assignment or listing is retried, without a second issue: rc=$rc $out"
+gh_reset
+issue "down" open "Image has findings" "body"
+[ "$rc" = 1 ] && [ "$(count 'issue list' calls)" = 5 ] || fail "GitHub down → five attempts, then an error: rc=$rc $out"
+pass "issue.sh: a half-finished create, a failed assignment or listing are retried without a duplicate; a real outage is an error"
+
+gh_reset
+printf '7\tImage has findings\n8\tSomething else\n9\tImage has findings\n' > "$tmp/gh/issues"
+issue "" close "Image has findings" "clean again"
+[ "$rc" = 0 ] && [ "$(cat "$tmp/gh/issues")" = $'8\tSomething else' ] || fail "close: every open issue with that title, nothing else: rc=$rc $(cat "$tmp/gh/issues")"
+issue "" close "Image has findings" "clean again"
+[ "$rc" = 0 ] && [ "$(count . closed)" = 2 ] || fail "close with nothing open is a no-op: rc=$rc $out"
+printf '7\tImage has findings\n' > "$tmp/gh/issues"
+issue "close" close "Image has findings" "clean again"
+[ "$rc" = 0 ] && [ ! -s "$tmp/gh/issues" ] || fail "a failed close is retried: rc=$rc $out"
+if issue "" reopen "x" "y" && [ "$rc" = 0 ]; then fail "unknown mode accepted"; fi
+pass "issue.sh: close ends every open issue with the title, is a no-op when none is, and is retried"
+
 # Wiring: every rescan output `check` reads exists, and every step output a
 # job output names comes from a step that exists (a typo would silently read
 # as "" — i.e. "no verdict" — forever).
@@ -484,7 +601,15 @@ for o, step in outs.items():
 used = set(re.findall(r"needs\.rescan\.outputs\.(\w+)", y))
 missing = used - set(outs)
 assert not missing, f"check reads undefined rescan outputs {missing}"
-for k in ("verdict", "resolver", "updater", "resolver_digest", "resolver_vulns", "updater_digest", "updater_vulns"):
+# Every step a rescan expression reads (outputs or outcome) exists too: the
+# candidate's `outcome` decides between "clean candidate" and "no candidate".
+for step in set(re.findall(r"steps\.(\w+)\.(?:outputs|outcome)", rescan)):
+    assert step in ids, f"the rescan job reads missing step {step}"
+for image in ("resolver", "updater"):
+    for step in (f"{image}_pre", f"{image}_build", f"{image}_scan", image):
+        assert step in ids, f"rescan step {step} is missing"
+for k in ("verdict", "resolver", "updater", "resolver_digest", "resolver_vulns", "resolver_tries",
+          "updater_digest", "updater_vulns", "updater_tries"):
     assert k in used, f"rescan output {k} is never read"
 PY
 pass "upstream-check.yml: rescan outputs and their consumers are wired"

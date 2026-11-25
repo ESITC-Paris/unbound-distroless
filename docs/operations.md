@@ -124,7 +124,8 @@ Three layers. Only the first notices runs that do not happen.
    The rescan opens
    `Published <image> image still fails the release gate after a rebuild` or
    `Published <image> image has findings a rebuild cannot fix`
-   ([trust.md](trust.md#vulnerabilities-after-release)). All are assigned to
+   ([trust.md](trust.md#vulnerabilities-after-release)), and closes them
+   itself once the published image is clean. All are assigned to
    `euca01`; GitHub notifies according to that account's settings. A run
    that fails before its first step (startup failure) opens nothing. CI opens
    no issue.
