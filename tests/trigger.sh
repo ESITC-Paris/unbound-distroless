@@ -2,6 +2,8 @@
 # Unit test for the external trigger (deploy/unbound-upstream-check).
 # Runs anywhere: no network, no docker — curl is replaced by a fake that
 # records every call and answers from canned responses.
+# SC2015: `A && B || fail …` is used as if-then-else on purpose — fail exits.
+# shellcheck disable=SC2015
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$HERE/deploy/unbound-upstream-check"
@@ -18,6 +20,9 @@ printf 'ghp_testtoken\n' > "$tmp/token"
 #   id_after       run id returned by the 2nd and later run listings
 #                  (default: same as before → "no run appeared")
 #   expiry         value of the github-authentication-token-expiration header
+#   last_success   created_at of the newest successful run (default: now);
+#                  the word "none" answers with no run at all
+#   success_code   HTTP status of that listing (default 200)
 cat > "$tmp/bin/curl" <<'FAKE'
 #!/usr/bin/env bash
 T="$FAKE_DIR"
@@ -41,6 +46,15 @@ case "$url" in
     code=$(cat "$T/dispatch_code" 2>/dev/null || echo 204)
     [ "$code" = 204 ] && : > "$out" || echo '{"message":"Bad credentials"}' > "$out"
     : > "$hdr"; printf '%s' "$code" ;;
+  */runs\?*status=success*)
+    code=$(cat "$T/success_code" 2>/dev/null || echo 200)
+    at=$(cat "$T/last_success" 2>/dev/null || date -u +%FT%TZ)
+    if [ "$at" = none ]; then
+      printf '{"total_count": 0,\n"workflow_runs": []}\n' > "$out"
+    else
+      printf '{"total_count": 1,\n"workflow_runs": [{"id": 90, "name": "Upstream check", "actor": {"id": 1}, "status": "completed", "conclusion": "success", "created_at": "%s", "updated_at": "2020-01-01T00:00:00Z", "repository": {"id": 2}}]}\n' "$at" > "$out"
+    fi
+    : > "$hdr"; printf '%s' "$code" ;;
   */runs\?*)
     n=$(( $(cat "$T/gets" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/gets"
     id=100; [ "$n" -gt 1 ] && id=$(cat "$T/id_after" 2>/dev/null || echo 100)
@@ -52,12 +66,12 @@ esac
 FAKE
 chmod +x "$tmp/bin/curl"
 
-run() {  # run → stdout+stderr in $out, exit code in $rc; resets the fakes
+run() {  # run [VAR=value...] → stdout+stderr in $out, exit code in $rc; resets the fakes
   rm -f "$tmp/calls" "$tmp/gets"
   rc=0
-  out=$(PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp" UNBOUND_TRIGGER_CONF=/nonexistent \
+  out=$(env PATH="$tmp/bin:$PATH" FAKE_DIR="$tmp" UNBOUND_TRIGGER_CONF=/nonexistent \
         TOKEN_FILE="$tmp/token" HC_URL=https://hc.example/abc REPO=org/repo \
-        STATE_DIR="$tmp/state" POLL_ATTEMPTS=2 POLL_INTERVAL=0 \
+        STATE_DIR="$tmp/state" POLL_ATTEMPTS=2 POLL_INTERVAL=0 "$@" \
         bash "$SCRIPT" 2>&1) || rc=$?
 }
 calls() { cat "$tmp/calls"; }
@@ -122,5 +136,47 @@ grep -q 'token file .* is missing' <<<"$out" || fail "missing token message: $ou
 calls | grep -q 'api.github.com' && fail "API must not be called without a token: $(calls)"
 mv "$tmp/token.gone" "$TOKEN_SAVE"
 pass "missing token file → exit 1, API untouched"
+
+# 7. Runs start but none has succeeded for hours: the monitor does nothing,
+#    and this is the alarm that does not depend on the workflow's own issues.
+date -u -d '-2 hours' +%FT%TZ > "$tmp/last_success"
+run
+[ "$rc" = 0 ] && [ -z "$out" ] || fail "a success 2 h ago is within the default 3 h: rc=$rc $out"
+date -u -d '-200 minutes' +%FT%TZ > "$tmp/last_success"
+run
+[ "$rc" = 1 ] || fail "no success for 3 h must exit 1, got $rc: $out"
+grep -q 'no run of upstream-check.yml has succeeded for 3 h' <<<"$out" || fail "stale-success message: $out"
+calls | grep -q '/dispatches' || fail "the dispatch must still happen before failing on a stale success: $(calls)"
+calls | grep -q '^GET https://hc.example/abc/fail run 101 started, but no run' || fail "no /fail ping on a stale success: $(calls)"
+calls | grep -q '^GET https://hc.example/abc run 101 started' && fail "a success ping was sent despite the stale success: $(calls)"
+run MAX_SUCCESS_AGE_HOURS=6
+[ "$rc" = 0 ] || fail "MAX_SUCCESS_AGE_HOURS=6 must accept a success 3 h 20 ago: rc=$rc $out"
+run MAX_SUCCESS_AGE_HOURS=0
+[ "$rc" = 0 ] || fail "MAX_SUCCESS_AGE_HOURS=0 disables the check: rc=$rc $out"
+calls | grep -q 'status=success' && fail "the check is disabled but the listing was still requested: $(calls)"
+echo none > "$tmp/last_success"
+run
+[ "$rc" = 1 ] && grep -q 'has no successful run at all' <<<"$out" || fail "no successful run at all must exit 1: rc=$rc $out"
+echo 'last tuesday-ish' > "$tmp/last_success"
+run
+[ "$rc" = 1 ] && grep -q 'unreadable' <<<"$out" || fail "an unreadable date must exit 1, not pass: rc=$rc $out"
+rm -f "$tmp/last_success"; echo 502 > "$tmp/success_code"
+run
+[ "$rc" = 1 ] && grep -q 'listing the successful runs failed (HTTP 502)' <<<"$out" || fail "a failed listing must exit 1, not pass: rc=$rc $out"
+rm -f "$tmp/success_code"
+run MAX_SUCCESS_AGE_HOURS=soon
+[ "$rc" = 1 ] && ! calls | grep -q '/dispatches' || fail "a bad MAX_SUCCESS_AGE_HOURS must be refused before anything is done: rc=$rc $out"
+pass "no successful run for MAX_SUCCESS_AGE_HOURS (or none, or an unreadable answer) → dispatch, then exit 1 with /fail"
+
+# 8. No Healthchecks URL: the script works, and says once a day that nothing
+#    watches it.
+rm -rf "$tmp/state"; mkdir "$tmp/state"
+run HC_URL=
+[ "$rc" = 0 ] || fail "an empty HC_URL must not fail the run: rc=$rc $out"
+grep -q 'HC_URL is not set' <<<"$out" || fail "an empty HC_URL must be said on stderr: $out"
+calls | grep -q 'hc.example' && fail "pings were sent without HC_URL: $(calls)"
+run HC_URL=
+[ "$rc" = 0 ] && [ -z "$out" ] || fail "the HC_URL warning must be printed once a day: rc=$rc $out"
+pass "no HC_URL → one stderr warning per day, exit 0"
 
 echo "ALL TRIGGER TESTS PASSED"

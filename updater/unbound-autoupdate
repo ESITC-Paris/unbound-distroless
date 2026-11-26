@@ -473,6 +473,13 @@ if [ "$conf_changed" = 1 ] && config_quarantine_active "$CONF_HASH"; then
 fi
 
 if [ "$image_changed" = 1 ]; then
+  # Verified BEFORE its version label is read: the label of an unsigned image
+  # is whatever its author wrote. An unsigned image labelled with the next
+  # major version used to end the cycle as "major bump not deployed" — a
+  # routine, expected-looking outcome — for as long as it stayed behind the
+  # tag, and the missing signature was never reported. (The verdict is
+  # remembered, so the verification further down is not a second round trip.)
+  verify_image_once "$DECLARED" resolver || refuse_unverified
   # The running version comes from the running CONTAINER's labels: the image
   # record of what runs may have no name left to be inspected by.
   old_v="$RUNNING_VERSION"; new_v=$(image_version_label "$DECLARED")
@@ -487,9 +494,9 @@ fi
 
 # From here on the cycle has something to deploy, and deploying means a
 # canary. A host-networked sidecar can never run one: say so now, before
-# cosign, preflight or any container is started for nothing. Not earlier: the
+# preflight or any container is started for nothing. Not earlier: the
 # up-to-date path above needs no canary and works in host mode, and the
-# quarantine and major-version verdicts are free and keep their exit code.
+# quarantine and major-version verdicts keep their exit code.
 if ! canary_supported; then
   notify blocked "canary could not start" "Image $DECLARED with the declared configuration failed to start in the canary. Production untouched."
   hc_fail "canary start failed"

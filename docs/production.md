@@ -50,18 +50,21 @@ on the host recreates the resolver at its next `up -d` after each update
 ([why](../updater/README.md#what-a-cycle-does)). Older versions than the
 ones above were not tested.
 
-**Port 53.** The reference project publishes `53:53/udp` and `53:53/tcp` on
-every host address. See what already listens:
+**Port 53.** The reference project publishes port 53, UDP and TCP, on one
+address of the host: `DNS_BIND_ADDRESS` in `.env`, the address clients use
+(for example `10.0.0.11`). It has no default and Compose refuses to start
+without it. Not all addresses: behind Docker's port publishing a client from
+anywhere can reach Unbound with the address of the Docker bridge, which
+`access-control` allows ([usage.md](usage.md#docker-run)), so `53:53` on a
+host that has a public address is an open resolver. See what already listens
+on that address:
 
 ```bash
 ss -lntup 'sport = :53'
 ```
 
-If something does (on Ubuntu, usually the `systemd-resolved` stub on
-`127.0.0.53`), the fix is in the README, [Run it](../README.md#run-it).
-Publishing on the host's LAN address only, for example
-`"10.0.0.11:53:53/udp"`, also keeps the source address of clients visible to
-`access-control` ([usage.md](usage.md#docker-run)).
+The `systemd-resolved` stub of Ubuntu listens on `127.0.0.53` and is not in
+the way of a LAN address.
 
 **Socket buffers.** `unbound.conf` asks for 4 MiB receive and send buffers
 (`so-rcvbuf`, `so-sndbuf`). The kernel limits `net.core.rmem_max` and
@@ -110,7 +113,7 @@ monitored.
 /opt/unbound/
 ├── docker-compose.yml   # docs/production/docker-compose.yml
 ├── unbound.conf         # your configuration
-├── .env                 # HC_URL, WEBHOOK_URL; mode 600
+├── .env                 # DNS_BIND_ADDRESS, HC_URL, WEBHOOK_URL; mode 600
 └── tls/                 # optional: certificate and key for DoT/DoH
 ```
 
@@ -160,14 +163,16 @@ reads from the project directory:
 ```bash
 cd /opt/unbound
 cat > .env <<'EOF'
+DNS_BIND_ADDRESS=10.0.0.11
 HC_URL=https://hc-ping.com/<uuid>
 EOF
 chmod 600 .env
 ```
 
-The compose file reads `${HC_URL:?set HC_URL in .env}`: without a value,
+The compose file reads `${HC_URL:?set HC_URL in .env}` and
+`${DNS_BIND_ADDRESS:?set DNS_BIND_ADDRESS in .env}`: without a value,
 every `docker compose` command fails with that message instead of starting a
-sidecar that alerts nobody. The values are visible in `docker inspect` of the
+sidecar that alerts nobody, or a resolver on every address of the host. The values are visible in `docker inspect` of the
 container and in `docker compose config`.
 
 ## Bring-up
@@ -209,8 +214,10 @@ minutes later, with its own `NOTIFY_HOST` and `HC_URL`.
 Load [`observability/prometheus.yml`](observability/prometheus.yml) and
 [`observability/alerts.yml`](observability/alerts.yml). The reference project
 publishes `/metrics` on `127.0.0.1:9167`; for a Prometheus on another host,
-publish it on the host's monitoring address instead (never on a public one:
-the endpoint uses the Docker socket). The metrics themselves:
+publish it on the host's monitoring address instead (not on a public one).
+The metrics service has no Docker socket and runs unprivileged: it serves
+what the loop container reads from the resolver every
+`METRICS_COLLECT_INTERVAL`. The metrics themselves:
 [updater/README.md](../updater/README.md#metrics).
 
 | Alert | First action |
@@ -463,7 +470,7 @@ the swap, does not restore `tls.old`: runbook (a), step 3.
 - [ ] Port 53 free on the published address; socket buffer limits of at
       least 4194304; clock synchronised; egress open.
 - [ ] `unbound.conf` accepted by `unbound-checkconf` of the declared image.
-- [ ] `.env` with one `HC_URL` per host, mode 600; `NOTIFY_HOST` per host.
+- [ ] `.env` with `DNS_BIND_ADDRESS` (the host's address clients use, never all addresses) and one `HC_URL` per host, mode 600; `NOTIFY_HOST` per host.
 - [ ] The same resolver tag mode on both hosts.
 - [ ] Both resolvers `healthy`, `ad` in `dig … . SOA +dnssec`.
 - [ ] `docker compose run --rm unbound-autoupdate check` exits 0 on both.

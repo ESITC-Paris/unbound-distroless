@@ -20,9 +20,9 @@
 #        `dig @127.0.0.1 …`               -> `dig @127.0.0.1 -p <port> …`.
 #
 # Port 53 of the host is never bound: the override replaces the published
-# "53:53" with 127.0.0.1:<ephemeral>:53, so a CI runner's systemd-resolved
+# "127.0.0.1:53:53" with 127.0.0.1:<ephemeral>:53, so a CI runner's systemd-resolved
 # (127.0.0.53:53) and anything else on the host's :53 are left alone. The
-# file's own ports are asserted to be 53:53/udp and 53:53/tcp, and the
+# file's own ports are asserted to be 127.0.0.1:53:53/udp and /tcp, and the
 # running container's hardening (capabilities, no-new-privileges, read-only
 # root) is asserted from `docker inspect`, so the README's description of the
 # file is tested too.
@@ -170,8 +170,12 @@ pass "run: the Compose file in README.md is the shipped docker-compose.yml"
 
 # The shipped file, before any override: the README says port 53, hardened.
 grep -qE "^[[:space:]]*image: $PUBLISHED:" "$F" || fail "docker-compose.yml: image is not $PUBLISHED:<tag>"
-grep -qF -- '- "53:53/udp"' "$F" || fail "docker-compose.yml: does not publish 53:53/udp"
-grep -qF -- '- "53:53/tcp"' "$F" || fail "docker-compose.yml: does not publish 53:53/tcp"
+grep -qF -- '- "127.0.0.1:53:53/udp"' "$F" || fail "docker-compose.yml: does not publish 127.0.0.1:53:53/udp"
+grep -qF -- '- "127.0.0.1:53:53/tcp"' "$F" || fail "docker-compose.yml: does not publish 127.0.0.1:53:53/tcp"
+# Never on every address of the host: behind Docker's port publishing that is
+# an open resolver on a host with a public address (README, "Serving your
+# network").
+if grep -qE -- '^[[:space:]]*- "53:53' "$F"; then fail "docker-compose.yml publishes port 53 on every address of the host"; fi
 
 OVERRIDE="$WORK/override.yml"
 cat > "$OVERRIDE" <<EOF

@@ -20,7 +20,9 @@
 #      the Docker socket; a named volume on the resolver's /var/lib/unbound;
 #      exactly one service the sidecar's discovery would pick as the
 #      resolver; the loop and the metrics services on the same image (self-
-#      update moves both); /metrics published on 127.0.0.1 only.
+#      update moves both); /metrics published on 127.0.0.1 only, by a
+#      service with no Docker socket and no privilege; port 53 published on
+#      a named address.
 #   4. Every environment variable in the "Variables" table of
 #      updater/README.md is read by the sidecar's code, every variable the
 #      code reads from its environment is in the table, and each default in
@@ -73,10 +75,26 @@ check_project() {
       <<<"$cfg" >/dev/null \
     || fail "$label: the project directory $dir is not mounted read-only at the same path in the sidecar"
   local s
+  jq -e '.services["unbound-autoupdate"].volumes[]
+      | select(.type == "bind" and .source == "/var/run/docker.sock" and .target == "/var/run/docker.sock")' \
+      <<<"$cfg" >/dev/null || fail "$label: unbound-autoupdate does not mount the Docker socket"
+  # The metrics service is the one that listens on the network: no Docker
+  # socket (root on the host), no privilege, nothing writable but /tmp — and
+  # the loop collects the statistics it serves.
+  jq -e '[.services["unbound-metrics"].volumes[] | select(.source == "/var/run/docker.sock" or .target == "/var/run/docker.sock")] | length == 0' \
+      <<<"$cfg" >/dev/null || fail "$label: unbound-metrics mounts the Docker socket"
+  jq -e '.services["unbound-metrics"] | (.user // "" | test("^[1-9][0-9]*(:[1-9][0-9]*)?$")) and .read_only == true
+         and .cap_drop == ["ALL"] and .security_opt == ["no-new-privileges:true"]' <<<"$cfg" >/dev/null \
+    || fail "$label: unbound-metrics is not unprivileged (user, read_only, cap_drop ALL, no-new-privileges)"
+  jq -e '[.services["unbound-metrics"].volumes[] | select(.read_only != true)] | length == 0' <<<"$cfg" >/dev/null \
+    || fail "$label: unbound-metrics has a writable mount"
+  s=$(jq -r '.services["unbound-autoupdate"].environment.METRICS_COLLECT_INTERVAL // "0"' <<<"$cfg")
+  case "$s" in 0|"") fail "$label: unbound-metrics has no Docker socket and unbound-autoupdate does not collect for it (METRICS_COLLECT_INTERVAL)" ;; esac
+  # Port 53 on a named address, never on all of them (open resolver behind
+  # Docker's port publishing).
+  jq -e '[.services.unbound.ports[] | select((.host_ip // "") == "" or .host_ip == "0.0.0.0" or .host_ip == "::")] | length == 0' \
+      <<<"$cfg" >/dev/null || fail "$label: the resolver's port 53 is published on every address of the host"
   for s in unbound-autoupdate unbound-metrics; do
-    jq -e --arg s "$s" '.services[$s].volumes[]
-        | select(.type == "bind" and .source == "/var/run/docker.sock" and .target == "/var/run/docker.sock")' \
-        <<<"$cfg" >/dev/null || fail "$label: $s does not mount the Docker socket"
     jq -e --arg s "$s" '.services[$s].volumes[]
         | select(.type == "volume" and .source == "autoupdate-state" and .target == "/var/lib/unbound-autoupdate")' \
         <<<"$cfg" >/dev/null || fail "$label: $s does not mount the autoupdate-state volume"
@@ -150,12 +168,17 @@ fi
 
 # ── 2. The reference production project ───────────────────────────────────────
 prod="$ROOT/docs/production/docker-compose.yml"
-if err=$(env -u HC_URL docker compose -f "$prod" --project-directory /opt/unbound config --quiet 2>&1); then
+if err=$(env -u DNS_BIND_ADDRESS HC_URL=https://hc.example/ping docker compose -f "$prod" --project-directory /opt/unbound config --quiet 2>&1); then
+  fail "production: docker compose config accepted the file without DNS_BIND_ADDRESS"
+else
+  grep -q 'set DNS_BIND_ADDRESS in .env' <<<"$err" || fail "production: missing DNS_BIND_ADDRESS fails with an unexpected message: $err"
+fi
+if err=$(env -u HC_URL DNS_BIND_ADDRESS=192.0.2.10 docker compose -f "$prod" --project-directory /opt/unbound config --quiet 2>&1); then
   fail "production: docker compose config accepted the file without HC_URL"
 else
   grep -q 'set HC_URL in .env' <<<"$err" || fail "production: missing HC_URL fails with an unexpected message: $err"
 fi
-if cfg=$(HC_URL=https://hc.example/ping docker compose -f "$prod" --project-directory /opt/unbound config --format json 2>"$WORK/err"); then
+if cfg=$(DNS_BIND_ADDRESS=192.0.2.10 HC_URL=https://hc.example/ping docker compose -f "$prod" --project-directory /opt/unbound config --format json 2>"$WORK/err"); then
   check_project "docs/production/docker-compose.yml" /opt/unbound "$cfg"
   [ "$(jq -r .name <<<"$cfg")" = unbound ] || fail "production: the project is not named unbound (volume names in docs/production.md)"
   jq -e '.services.unbound | .read_only == true and (.cap_drop == ["ALL"]) and (.cap_add == ["NET_BIND_SERVICE"])
@@ -163,7 +186,7 @@ if cfg=$(HC_URL=https://hc.example/ping docker compose -f "$prod" --project-dire
     || fail "production: the resolver's hardening differs from docs/production.md"
   jq -e '.services.unbound.volumes[] | select(.type == "bind" and .source == "/opt/unbound/unbound.conf")' \
       <<<"$cfg" >/dev/null || fail "production: unbound.conf is not mounted from the project directory"
-  pass "docs/production/docker-compose.yml: refused without HC_URL, valid with it, meets the sidecar's requirements"
+  pass "docs/production/docker-compose.yml: refused without HC_URL or DNS_BIND_ADDRESS, valid with both, meets the sidecar's requirements"
 else
   fail "production: docker compose config failed: $(cat "$WORK/err")"
 fi

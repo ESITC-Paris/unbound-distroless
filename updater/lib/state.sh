@@ -31,12 +31,34 @@ state_get() {
   printf '%s\n' "${line#*=}"
 }
 
-# state_set <key> <value> — atomic replace-or-append.
+# state_set <key> <value> — replace-or-append, atomically or not at all.
+#
+# The new file is checked before it replaces the old one: it must hold every
+# other line of the current state plus this key's, complete. On a full volume
+# the copy used to come out short or empty, went unnoticed (the write's status
+# was discarded), and was then moved over state.env — taking the quarantines,
+# the deployed image and configuration fingerprints and an unfinished swap's
+# intent with it, so the next cycle adopted whatever was running as its
+# baseline without a canary. Now a write that cannot be completed leaves
+# state.env exactly as it was and returns 1: under the cycle's `set -e` that
+# ends the cycle as an error, before anything is deployed on a state that
+# could not be recorded.
 state_set() {
-  local key="$1" value="$2" tmp
-  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX")
-  grep -v "^$key=" "$STATE_FILE" 2>/dev/null > "$tmp" || true
-  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  local key="$1" value="$2" tmp kept=0 written
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX" 2>/dev/null) \
+    || { log_error "state: cannot create a file in $STATE_DIR (volume full or read-only?) — $key not recorded, previous state kept"; return 1; }
+  if [ -s "$STATE_FILE" ]; then
+    # grep -c prints the count and exits 1 when it is 0: not an error here.
+    kept=$(grep -vc "^$key=" "$STATE_FILE" 2>/dev/null) || true
+    grep -v "^$key=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp" 2>/dev/null || true
+  written=$(wc -l < "$tmp" 2>/dev/null) || written=""
+  if [ "${written:-x}" != "$(( ${kept:-0} + 1 ))" ] || [ "$(tail -n 1 "$tmp" 2>/dev/null)" != "$key=$value" ]; then
+    rm -f "$tmp"
+    log_error "state: could not write $STATE_FILE completely (volume full?) — $key not recorded, previous state kept"
+    return 1
+  fi
   mv -f "$tmp" "$STATE_FILE"
 }
 

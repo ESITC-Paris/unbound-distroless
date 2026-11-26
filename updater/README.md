@@ -64,16 +64,19 @@ In this order (`updater/unbound-autoupdate`):
    not tried again before `RETRY_AFTER`, unless it changes. Either quarantine
    ends the cycle, including when the other axis carries a change that is not
    quarantined.
-10. **Major version.** The leading number of the
-    `org.opencontainers.image.version` labels of the running container and the
-    new image must be equal, unless `ALLOW_MAJOR=1`. A new label without a
-    leading number is refused the same way; a running label without one, or a
-    missing label, skips this check with a warning in the log.
+10. **Signature, then major version.** A new image is verified with cosign
+    first (once per digest and verification settings): the version label of
+    an image that is not signed is its author's word, and is not read. Then
+    the leading number of the `org.opencontainers.image.version` labels of
+    the running container and the new image must be equal, unless
+    `ALLOW_MAJOR=1`. A new label without a leading number is refused the
+    same way; a running label without one, or a missing label, skips this
+    check with a warning in the log.
 11. **Host network.** A sidecar with `network_mode: host` cannot join the
     canary's network: a cycle with a change stops here.
-12. **Verify, downgrade, preflight, canary.** The image to deploy (also the
-    unchanged image of a configuration-only change) is verified with cosign,
-    once per digest and verification settings. A new image whose version
+12. **Verify, downgrade, preflight, canary.** The unchanged image of a
+    configuration-only change is verified with cosign here (a new image was
+    in step 10). A new image whose version
     label (`X.Y.Z` or `X.Y.Z-rN`) is older than the running one is then
     refused, unless `ALLOW_DOWNGRADE=1`; revisions are compared only when
     both labels carry one, and a label of another form skips this check with
@@ -157,8 +160,11 @@ root-equivalent component, and runs as root. Through the socket it:
 - runs containers: `unbound-checkconf`, the copy of the state volume, the
   canary (with its network and volume), and the self-update helper;
 - runs `unbound-control` in the resolver (`docker exec`: statistics at every
-  scrape, cache export and import around a swap) and copies its
-  `/var/lib/unbound/root.key` out at every scrape (`docker cp`).
+  collection or scrape, cache export and import around a swap) and copies
+  its `/var/lib/unbound/root.key` out at the same times (`docker cp`).
+
+Only the loop service needs the socket. The metrics service works without it
+and should run without it ([Metrics](#metrics)).
 
 A socket proxy that allows these calls allows creating containers with
 arbitrary mounts, so it does not reduce what the sidecar can do. Not using the
@@ -265,6 +271,8 @@ seconds.
 | `COSIGN_ISSUER` | `https://token.actions.githubusercontent.com` | Keyless mode: the OIDC issuer of the signing certificate. |
 | `COSIGN_IGNORE_TLOG` | `0` | Key mode: `1` accepts a signature that is not in the public Rekor log. |
 | `METRICS_PORT` | `9167` | Port of `/metrics` in `metrics` mode. |
+| `METRICS_COLLECT_INTERVAL` | `0` | `loop` mode: how often the resolver's statistics and trust anchor are read into the state volume, for a metrics service that has no Docker socket. `0`: never. See [Metrics](#metrics). |
+| `METRICS_STALE_AFTER` | `120` | `metrics` mode without the Docker socket: statistics collected longer ago than this are not served, and `unbound_exporter_scrape_success` is 0. Keep it above `METRICS_COLLECT_INTERVAL`. |
 | `STATE_DIR` | `/var/lib/unbound-autoupdate` | Directory of the state files. Must survive the container: a named volume. |
 | `DOCKER_CONFIG` | unset | Directory of a Docker client `config.json` whose static `auths` entries are used for the registry (default `$HOME/.docker`). Credential helpers are not supported. |
 | `SIGSTORE_ROOT_FILE` | unset | cosign's own variable (`cosign env --show-descriptions`): Fulcio root CA file. Its content is part of the verification settings ([State](#state)). |
@@ -300,7 +308,7 @@ is a log line `level=notice event=<event> subject="<subject>"` and, with
 | Signature refused (new image, or the running one) | 1 | `/fail` signature verification failed | `blocked`: signature verification FAILED | `blocked` |
 | Signature could not be checked: a network or registry error only (connection failure, timeout, rate limit, HTTP 5xx); any sign that a signature was evaluated counts as refused | 1 | `/fail` signature check unavailable | `blocked`: signature could not be checked | `blocked` |
 | Quarantined image or configuration | 2 | `/fail` | `skipped`: update skipped (quarantine) | `skipped` |
-| Major version refused | 2 | `/fail` major bump refused | `skipped`: major version bump not deployed | `skipped` |
+| Major version refused (after verification) | 2 | `/fail` major bump refused | `skipped`: major version bump not deployed | `skipped` |
 | Older version refused (after verification) | 2 | `/fail` downgrade refused | `skipped`: downgrade not deployed | `skipped` |
 | Host-networked sidecar with a change | 1 | `/fail` canary start failed | `blocked`: canary could not start | `blocked` |
 | Preflight rejected the configuration | 1 | `/fail` preflight failed | `blocked`: configuration rejected in preflight | `blocked` |
@@ -324,7 +332,7 @@ Self-update, at the end of an `up_to_date` or `updated` cycle:
 | Outcome | Cycle exit | Notification | Effect on the cycle |
 |---|---|---|---|
 | Skipped (`SELF_UPDATE=0`, a helper still running, a compose file unreadable, the declared image unchanged or not resolvable, a quarantine, no state volume found) | unchanged | none (log line) | none |
-| Major version refused | unchanged | `skipped`: sidecar major version bump not applied | none |
+| Major version refused (after verification) | unchanged | `skipped`: sidecar major version bump not applied | none |
 | Older version refused (after verification) | unchanged | `skipped`: sidecar downgrade not applied | none |
 | Signature refused | 1 | `blocked`: sidecar signature verification FAILED | `blocked`, `/fail` sidecar self-update refused |
 | Signature could not be checked | 1 | `blocked`: sidecar signature could not be checked | same |
@@ -350,9 +358,9 @@ With `SELF_UPDATE=1` (the default), after a cycle that ended `up_to_date` or
    pins the sidecar is therefore taken into account.
 2. That tag is resolved to its registry digest and pulled by digest, as for
    the resolver. Same image ID as the running sidecar: nothing to do.
-3. The self quarantine (`RETRY_AFTER`) and the major-version rule apply,
-   then cosign verification against the sidecar's identity, then the
-   downgrade rule. There is no canary.
+3. The self quarantine (`RETRY_AFTER`) applies, then cosign verification
+   against the sidecar's identity, then the major-version and downgrade
+   rules, read from the labels of the verified image. There is no canary.
 4. A helper container is started from the new image, labelled
    `unbound-autoupdate.helper=1`, removed when it exits. It first waits for
    the cycle that launched it to end (the cycle lock is free), since that
@@ -379,7 +387,8 @@ out the helper logs an error and goes ahead without the lock.
 | File | Content |
 |---|---|
 | `state.env` | The keys below, `KEY=value` per line |
-| `metrics.prom` | The sidecar's metrics, rewritten at the end of each cycle and by the self-update helper |
+| `metrics.prom` | The sidecar's metrics, rewritten at the end of each cycle and by the self-update helper. Mode 644, like the next two: an unprivileged metrics service reads them |
+| `resolver-stats`, `resolver-anchor` | With `METRICS_COLLECT_INTERVAL`: the resolver's `unbound-control stats_noreset` output and trust-anchor file as last read; removed when a read fails |
 | `lock` | The cycle lock |
 | `rollback.yml`, `self-rollback.yml` | Written by a rollback of a service declared by digest or by another repository; used for that `compose up` only, and ignored when found in a compose file list |
 
@@ -400,14 +409,41 @@ A quarantine is active while its value equals the value being considered and
 `RETRY_AFTER` has not elapsed since its timestamp. Emptying both keys of an
 axis lifts it.
 
+`state.env` is replaced as a whole at each write, and only by a complete
+copy: when the volume is full or read-only the write fails, the file keeps
+its previous content, the log says `previous state kept` and the cycle ends
+`error` before anything is deployed.
+
 Local images: `<repository>:autoupdate-<project>-<service>` (characters
 outside `A-Za-z0-9_.-` replaced by `-`) names what each service runs, and the digest references in `PULLED_REFS` are untagged
 records.
 
 ## Metrics
 
-`metrics` mode serves `/metrics` on `METRICS_PORT` with busybox `httpd`. Every
-scrape answers 200, within about 15 s, with:
+`metrics` mode serves `/metrics` on `METRICS_PORT` with busybox `httpd`.
+
+**Without the Docker socket** — what the install recipe and the reference
+project set up. The metrics service is the one container of the project that
+listens on the network, so it is given nothing: no socket, an unprivileged
+user, a read-only root, the state volume read-only. The loop container, which
+has the socket in any case, reads the resolver's statistics and trust anchor
+every `METRICS_COLLECT_INTERVAL` into `resolver-stats` and `resolver-anchor`
+in the state volume, and the endpoint serves them: counters are at most that
+interval old, plus the scrape interval. Statistics older than
+`METRICS_STALE_AFTER`, or that the collector could not read (it then removes
+the file), are not served and `unbound_exporter_scrape_success` is 0.
+
+**With the Docker socket** mounted in the metrics service (the layout before
+this was possible, still supported), the endpoint reads the statistics from
+the resolver at each scrape, and `METRICS_COLLECT_INTERVAL` is not needed.
+Whoever can make that container run code is then root on the host. To move
+an existing project off it: add `METRICS_COLLECT_INTERVAL: 30s` to the loop
+service, and in the metrics service remove the socket line and add the
+`user`, `read_only`, `cap_drop`, `security_opt` and `tmpfs` lines of
+[`compose.snippet.yml`](compose.snippet.yml); then
+`docker compose up -d --no-deps unbound-autoupdate unbound-metrics`.
+
+Every scrape answers 200, within about 15 s, with:
 
 - **Resolver statistics**: `unbound-control stats_noreset`, run in the
   resolver container, converted by `stats_to_prometheus`
@@ -444,12 +480,14 @@ scrape answers 200, within about 15 s, with:
   These change only when the file is rewritten: a quarantine series stays 1
   after `RETRY_AFTER` until the next cycle ends.
 - **The scrape**: `unbound_exporter_scrape_success` (0 when the statistics
-  could not be collected) and `unbound_exporter_scrape_duration_seconds`.
+  could not be collected), `unbound_exporter_stats_age_seconds` (0 when read
+  through the socket at this scrape, else the time since the collector read
+  them) and `unbound_exporter_scrape_duration_seconds`.
 
 The output passes `promtool check metrics` (`tests/updater.sh`,
 `tests/observability.sh`). Scrape configuration and alert rules:
 [docs/observability/](../docs/observability/). Publish the port on loopback
-or a monitoring network only: the endpoint uses the Docker socket.
+or a monitoring network only.
 
 ## Verifying with your own key
 

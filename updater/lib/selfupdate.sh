@@ -115,6 +115,14 @@ self_update() {
     return 0
   fi
 
+  # Verified BEFORE its version label is read: an unsigned image labelled
+  # with the next major version used to be a quiet "major bump not applied"
+  # and a green cycle, every hour, and the missing signature on the image
+  # that would run with the Docker socket was never reported.
+  if ! verify_image "$declared" sidecar; then
+    _self_report_unverified "$declared" "$running"
+    return 1
+  fi
   local old_v new_v
   old_v=$(container_version "$SELF_ID"); new_v=$(image_version_label "$declared")
   if major_bump "$old_v" "$new_v" && [ "${ALLOW_MAJOR:-0}" != 1 ]; then
@@ -123,13 +131,8 @@ self_update() {
     return 0
   fi
   [ -z "$MAJOR_NOTE" ] || log_warn "self-update: $MAJOR_NOTE"
-
-  if ! verify_image "$declared" sidecar; then
-    _self_report_unverified "$declared" "$running"
-    return 1
-  fi
-  # Downgrade guard, after verification (the labels are the pipeline's own):
-  # see the resolver's in unbound-autoupdate.
+  # Downgrade guard, after verification too (the labels are the pipeline's
+  # own): see the resolver's in unbound-autoupdate.
   if version_downgrade "$old_v" "$new_v" && [ "${ALLOW_DOWNGRADE:-0}" != 1 ]; then
     log_warn "self-update: downgrade $old_v -> $new_v refused (set ALLOW_DOWNGRADE=1 to accept)"
     notify skipped "sidecar downgrade not applied" "The declared sidecar image $declared is unbound-autoupdate $new_v, OLDER than the running $old_v. A downgrade is a deliberate human decision; set ALLOW_DOWNGRADE=1 to allow it."

@@ -115,6 +115,37 @@ out=$( cd "$tmp" && LATEST=1.26.0 NEW_DEBIAN=sha256:d1 NEW_DISTROLESS=sha256:s1 
 [ "$out" = $'action=revision\nupdater_action=revision' ] || fail "a forced rebuild must override pending/waiting: $out"
 pass "manual rebuild input (recovery path) → revision of the named image(s), also over pending/waiting"
 
+# Hold (.github/monitor-hold): nothing automatic publishes a held image; the
+# maintainer's rebuild request still does, as a revision of what is pinned.
+hold() {  # hold <hold> <force> [<latest> [<rescan>]] — every base digest moved
+  ( cd "$tmp" && LATEST="${3:-1.26.0}" NEW_DEBIAN=sha256:d2 NEW_DISTROLESS=sha256:s2 NEW_ALPINE=sha256:a2 NEW_COSIGN=sha256:c2 \
+      HOLD="$1" FORCE_REBUILD="$2" RESCAN_RESOLVER="${4:-}" RESCAN_UPDATER="${4:-}" bash "$SCRIPT" 2>/dev/null )
+}
+[ "$(hold none none)" = $'action=revision\nupdater_action=revision' ] || fail "no hold: $(hold none none)"
+[ "$(hold resolver none)" = $'action=none\nupdater_action=revision' ] || fail "resolver held, bases moved: $(hold resolver none)"
+[ "$(hold sidecar none)" = $'action=revision\nupdater_action=none' ] || fail "sidecar held, bases moved: $(hold sidecar none)"
+[ "$(hold both none 1.27.0 new)" = $'action=none\nupdater_action=none' ] || fail "both held: a new version and a rescan publish nothing: $(hold both none 1.27.0 new)"
+[ "$(hold resolver none 1.27.0)" = $'action=none\nupdater_action=revision' ] || fail "a held resolver does not follow a new Unbound version: $(hold resolver none 1.27.0)"
+[ "$(hold resolver resolver 1.27.0)" = $'action=revision\nupdater_action=revision' ] || fail "a forced rebuild of a held resolver is a revision of the pins, never a new version: $(hold resolver resolver 1.27.0)"
+[ "$(hold both sidecar)" = $'action=none\nupdater_action=revision' ] || fail "forcing one held image publishes that one only: $(hold both sidecar)"
+if out=$(hold all none 2>&1); then fail "unknown hold value accepted: $out"; fi
+pass "hold: a held image is published by nothing automatic (version, bases, rescan); a requested rebuild publishes a revision of the pins"
+
+# hold.sh: the file behind HOLD.
+HOLDSH="$HERE/.github/scripts/hold.sh"
+[ "$(bash "$HOLDSH" "$tmp/no-such-file")" = hold=none ] || fail "hold.sh: a missing file holds nothing"
+printf '# only comments\n\n   # indented\n' > "$tmp/hold"
+[ "$(bash "$HOLDSH" "$tmp/hold")" = hold=none ] || fail "hold.sh: comments hold nothing"
+printf 'resolver   # CVE in r9\n' > "$tmp/hold"; [ "$(bash "$HOLDSH" "$tmp/hold")" = hold=resolver ] || fail "hold.sh: resolver"
+printf '  sidecar' > "$tmp/hold";                [ "$(bash "$HOLDSH" "$tmp/hold")" = hold=sidecar ] || fail "hold.sh: sidecar, no final newline"
+printf 'sidecar\nresolver\nsidecar\n' > "$tmp/hold"; [ "$(bash "$HOLDSH" "$tmp/hold")" = hold=both ] || fail "hold.sh: both"
+for bad in 'resolvr' 'resolver sidecar' 'both' 'Resolver'; do
+  printf '%s\n' "$bad" > "$tmp/hold"
+  if out=$(bash "$HOLDSH" "$tmp/hold" 2>&1); then fail "hold.sh accepted '$bad': $out"; fi
+done
+[ "$(bash "$HOLDSH" "$HERE/.github/monitor-hold")" = hold=none ] || fail "the committed .github/monitor-hold must hold nothing"
+pass "hold.sh: resolver / sidecar / both from the file, comments ignored, a typo is an error; the committed file holds nothing"
+
 # rescan-decide.sh: same policy as the release gates, loop guard.
 RESCAN="$HERE/.github/scripts/rescan-decide.sh"
 D1=sha256:1111111111111111111111111111111111111111111111111111111111111111
@@ -156,14 +187,19 @@ OS_BASE_LAYER='[{"Target": "img (debian 13.7)", "Class": "os-pkgs", "Type": "deb
    "Layer": {"DiffID": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}]'
 
 # rescan <policy> <digest> <amd64-results> [<arm64-results>] → $out, $rc
-# First pass: the published image only. A candidate report, when given
-# (CAND=<results-json>), is the second pass; CAND_FAILED=1 is a candidate
-# that could not be built or scanned.
+# First pass: the published image only. Candidate reports, when given
+# (CAND=<amd64 results-json>, CAND_ARM=<arm64 results-json>, default the
+# same), are the second pass; CAND_FAILED=1 is a candidate that could not be
+# built or scanned. CAND_FILES overrides the list passed to the script.
 rescan() {
   report a.json amd64 "$2" "$3"
   report b.json arm64 "$2" "${4:-$3}"
   local cand=""
-  if [ -n "${CAND:-}" ]; then report cand.json amd64 "$D2" "$CAND"; cand=cand.json; fi
+  if [ -n "${CAND:-}" ]; then
+    report cand-amd64.json amd64 "$D2" "$CAND"
+    report cand-arm64.json arm64 "$D2" "${CAND_ARM:-$CAND}"
+    cand=${CAND_FILES:-cand-amd64.json cand-arm64.json}
+  fi
   rc=0
   out=$(cd "$tmp" && POLICY="$1" DIGEST="$2" STATE_KEY="rescan_$1" CANDIDATE="$cand" CANDIDATE_FAILED="${CAND_FAILED:-}" \
     bash "$RESCAN" a.json b.json 2>&1) || rc=$?
@@ -223,6 +259,21 @@ CAND="$OS_CLEAN" rescan resolver "$D1" "$OS_BASE_LAYER"
 CAND="$OS_BASE_LAYER" rescan resolver "$D1" "$OS_BASE_LAYER"
 [ "$(st)" = waiting ] || fail "…and waits while the candidate still has it: $out"
 pass "rescan: where Trivy locates a finding is irrelevant — only the candidate's scan counts"
+
+# The release gate scans both platforms natively: a candidate is clean only
+# when it is clean on both. An amd64-only candidate used to answer `new` for a
+# fix that arm64 did not have yet; the release then failed its arm64 scan
+# after pushing its immutable tag.
+CAND="$OS_CLEAN" CAND_ARM="$OS_HIGH" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = waiting ] && [ "$(val alert)" = unfixed ] && [ "$(val remaining)" = "CVE-2026-1 (libssl3t64)" ] \
+  || fail "a candidate still refused on arm64 only must wait: $out"
+CAND="$OS_HIGH" CAND_ARM="$OS_CLEAN" rescan resolver "$D1" "$OS_HIGH"
+[ "$(st)" = waiting ] || fail "a candidate still refused on amd64 only must wait: $out"
+CAND="$OS_CLEAN" CAND_FILES="cand-amd64.json" rescan resolver "$D1" "$OS_HIGH"
+[ "$rc" = 1 ] && grep -q "candidate reports cover \['amd64'\]" <<<"$out" || fail "a candidate scanned on one platform only is not a verdict: rc=$rc $out"
+CAND="$OS_CLEAN" CAND_FILES="cand-amd64.json cand-amd64.json" rescan resolver "$D1" "$OS_HIGH"
+[ "$rc" = 1 ] || fail "the same platform twice is not both platforms: rc=$rc $out"
+pass "rescan: the candidate must be clean on every platform the release gate scans; a partial candidate is an error"
 
 rescan updater "$D1" "$COSIGN_HIGH"
 [ "$(st)" = clean ] || fail "HIGH in the vendored cosign is exempt from the sidecar gate: $out"
@@ -356,6 +407,24 @@ s = json.load(open(sys.argv[1]))
 assert s["alpine"] == "sha256:a2" and s["rescan_resolver_digest"] == sys.argv[2]
 PY
 pass "write-state: unrelated keys (an earlier record) are kept, digests updated"
+
+cp "$tmp/.build-state.json" "$tmp/before-hold.json"
+write env ACTION=revision UPDATER_ACTION=revision HOLD=resolver NEW_DEBIAN=sha256:d9 NEW_DISTROLESS=sha256:s9 NEW_ALPINE=sha256:a9 NEW_COSIGN=sha256:c9
+python3 - "$tmp/.build-state.json" <<'PY' || fail "held resolver: its digests must stay: $(cat "$tmp/.build-state.json")"
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert (s["debian"], s["distroless"]) == ("sha256:d1", "sha256:s1"), "a held image's base digests were moved"
+assert (s["alpine"], s["cosign"]) == ("sha256:a9", "sha256:c9"), "the other image's digests must still follow"
+PY
+write env ACTION=revision UPDATER_ACTION=revision HOLD=both NEW_DEBIAN=sha256:d8 NEW_DISTROLESS=sha256:s8 NEW_ALPINE=sha256:a8 NEW_COSIGN=sha256:c8
+python3 - "$tmp/.build-state.json" <<'PY' || fail "both held: no digest moves: $(cat "$tmp/.build-state.json")"
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert [s[k] for k in ("debian", "distroless", "alpine", "cosign")] == ["sha256:d1", "sha256:s1", "sha256:a9", "sha256:c9"]
+PY
+if out=$(write env ACTION=revision HOLD=everything 2>&1); then fail "write-state accepted an unknown HOLD: $out"; fi
+cp "$tmp/before-hold.json" "$tmp/.build-state.json"
+pass "write-state: the base digests of an image on hold are left as recorded (a rollback revision builds from them)"
 
 if out=$(write env ACTION=revision RESCAN_RESOLVER=new RESCAN_RESOLVER_DIGEST="" RESCAN_RESOLVER_VULNS="$FP" RESCAN_RESOLVER_TRIES=1 2>&1); then
   fail "a record without a digest was accepted: $out"
@@ -498,7 +567,12 @@ mode "$DA" "$DA" no yes no no;        [ "$rc" = 1 ] && grep -q 'rebuild=resolver
 mode "$DA" absent yes yes no no;      [ "$rc" = 1 ] || fail "one registry only → refused: $out"
 mode "$DA" "$DB" yes yes no no;       [ "$rc" = 1 ] || fail "different digests → refused: $out"
 mode "$DA" "$DA" maybe yes no no;     [ "$rc" = 1 ] || fail "bad input accepted: $out"
-pass "release-mode: never resumes an old tag (latest would move back), an unsigned one, or a split one"
+# A tag that was never published and is no longer main's revision (its
+# release failed early, or a newer revision was cut while it was queued):
+# building it now would put an old tree behind `latest`.
+mode absent absent no no no no;       [ "$rc" = 1 ] && grep -q 'move latest backwards' <<<"$out" && grep -q 'rebuild=resolver' <<<"$out" && ! grep -q '^mode=' <<<"$out" || fail "a never-published old tag must not be built: $out"
+mode absent absent no no no yes;      [ "$rc" = 1 ] || fail "a never-published old tag with a stray GitHub Release must not be built: $out"
+pass "release-mode: never builds or resumes an old tag (latest would move back), an unsigned one, or a split one"
 
 # release-health.sh: is the current release really out?
 HEALTH="$HERE/.github/scripts/release-health.sh"
@@ -525,6 +599,31 @@ pick() { printf '%s\n' "${@:2}" | bash "$PICK" "$1"; }
 [ "$(pick 3.1.3)" = 3.1.3 ] || fail "an empty listing keeps the pin"
 if out=$(pick v3.1 v3.1.5 2>&1); then fail "a current version that is not X.Y.Z was accepted: $out"; fi
 pass "pick-version: newest stable release of the same major, never older, never another major, never a pre-release"
+
+# settled-releases.sh: only releases that have been out for a while.
+SETTLED="$HERE/.github/scripts/settled-releases.sh"
+T0=1795694400   # 2026-11-26T12:00:00Z
+LIST='[{"tag_name":"v3.1.7","published_at":"2026-11-26T11:30:00Z"},
+       {"tag_name":"v3.1.6","published_at":"2026-11-23T12:00:00Z"},
+       {"tag_name":"v3.1.5","published_at":"2026-11-23T12:00:01Z"},
+       {"tag_name":"v3.2.0-rc.1","published_at":"2026-01-01T00:00:00Z","prerelease":true},
+       {"tag_name":"v3.3.0","published_at":"2026-01-01T00:00:00Z","draft":true},
+       {"tag_name":"v3.4.0","published_at":null},
+       {"tag_name":"v3.5.0"},
+       {"tag_name":"v3.6.0","published_at":"yesterday"},
+       "junk"]'
+settled() { NOW=$T0 MIN_AGE_HOURS="${1:-}" bash "$SETTLED" <<<"$LIST" | tr '\n' ' '; }
+[ "$(settled)" = "v3.1.6 " ] || fail "default: only what has been out 72 h, to the second: $(settled)"
+[ "$(settled 1)" = "v3.1.6 v3.1.5 " ] || fail "MIN_AGE_HOURS=1: $(settled 1)"
+[ "$(settled 0)" = "v3.1.7 v3.1.6 v3.1.5 " ] || fail "MIN_AGE_HOURS=0 takes every dated stable release: $(settled 0)"
+for bad in '{"message":"API rate limit exceeded"}' 'not json' ''; do
+  if out=$(NOW=$T0 bash "$SETTLED" <<<"$bad" 2>&1); then fail "settled-releases accepted a listing that is not one: '$bad' → $out"; fi
+done
+if out=$(NOW=$T0 MIN_AGE_HOURS=soon bash "$SETTLED" <<<"$LIST" 2>&1); then fail "MIN_AGE_HOURS=soon accepted: $out"; fi
+# The two together, as the workflow chains them: a release published an hour
+# ago is not what the sidecar is built with.
+[ "$(NOW=$T0 bash "$SETTLED" <<<"$LIST" | bash "$PICK" 3.1.5)" = 3.1.6 ] || fail "settled | pick must stop at the newest settled release"
+pass "settled-releases: stable releases out for MIN_AGE_HOURS only; drafts, pre-releases and undated ones never; an unreadable listing is an error"
 
 # One source for the sidecar's third-party versions: versions.env. The
 # workflows read it; the Dockerfile's defaults (a bare `docker build`) agree.
@@ -617,32 +716,50 @@ issue "close" close "Image has findings" "clean again"
 if issue "" reopen "x" "y" && [ "$rc" = 0 ]; then fail "unknown mode accepted"; fi
 pass "issue.sh: close ends every open issue with the title, is a no-op when none is, and is retried"
 
-# Wiring: every rescan output `check` reads exists, and every step output a
+# Wiring: every job output another job reads exists, and every step output a
 # job output names comes from a step that exists (a typo would silently read
 # as "" — i.e. "no verdict" — forever).
 python3 - "$HERE/.github/workflows/upstream-check.yml" <<'PY' || fail "upstream-check.yml wiring"
 import re, sys
 y = open(sys.argv[1]).read()
-rescan = y[y.index("\n  rescan:\n"):y.index("\n  code-scanning:\n")]
-outs = dict(re.findall(r"^      (\w+): \$\{\{ steps\.(\w+)\.outputs\.\w+ \}\}$", rescan, re.M))
-ids = set(re.findall(r"^        id: (\w+)$", rescan, re.M))
-assert outs, "no rescan outputs found"
-for o, step in outs.items():
-    assert step in ids, f"rescan output {o} reads missing step {step}"
-used = set(re.findall(r"needs\.rescan\.outputs\.(\w+)", y))
-missing = used - set(outs)
-assert not missing, f"check reads undefined rescan outputs {missing}"
-# Every step a rescan expression reads (outputs or outcome) exists too: the
-# candidate's `outcome` decides between "clean candidate" and "no candidate".
-for step in set(re.findall(r"steps\.(\w+)\.(?:outputs|outcome)", rescan)):
-    assert step in ids, f"the rescan job reads missing step {step}"
+order = ["rescan", "candidate", "verdict", "code-scanning", "check"]
+start = {j: y.index(f"\n  {j}:\n") for j in order}
+assert [start[j] for j in order] == sorted(start.values()), "jobs are not in the expected order"
+body = {j: y[start[j]:(start[order[i + 1]] if i + 1 < len(order) else len(y))] for i, j in enumerate(order)}
+for job in order:
+    ids = set(re.findall(r"^        id: (\w+)$", body[job], re.M))
+    outs = dict(re.findall(r"^      (\w+): \$\{\{ steps\.(\w+)\.outputs\.\w+ \}\}$", body[job], re.M))
+    for o, step in outs.items():
+        assert step in ids, f"{job} output {o} reads missing step {step}"
+    # Every step an expression of the job reads (outputs or outcome) exists:
+    # a candidate's `outcome` decides between "report" and "no report", the
+    # new-version step's between "adopted" and "carry on without it".
+    for step in set(re.findall(r"steps\.(\w+)\.(?:outputs|outcome)", body[job])):
+        assert step in ids, f"the {job} job reads missing step {step}"
+    used = set(re.findall(rf"needs\.{job}\.outputs\.(\w+)", y))
+    assert not used - set(outs), f"undefined {job} outputs are read: {used - set(outs)}"
+    assert not set(outs) - used, f"{job} outputs nobody reads: {set(outs) - used}"
+    # A job may only read the outputs and results of jobs it `needs`.
+    needs = set(re.findall(r"[\w-]+", (re.search(r"^    needs: (.+)$", body[job], re.M) or [None, ""])[1]))
+    for other in set(re.findall(r"needs\.([\w-]+)\.", body[job])):
+        assert other in needs, f"{job} reads needs.{other} without needing it"
+for step in ("resolver_pre", "updater_pre", "scanned", "published"):
+    assert f"        id: {step}\n" in body["rescan"], f"rescan step {step} is missing"
 for image in ("resolver", "updater"):
-    for step in (f"{image}_pre", f"{image}_build", f"{image}_scan", image):
-        assert step in ids, f"rescan step {step} is missing"
-for k in ("verdict", "resolver", "updater", "resolver_digest", "resolver_vulns", "resolver_tries",
-          "updater_digest", "updater_vulns", "updater_tries"):
-    assert k in used, f"rescan output {k} is never read"
+    for step in (f"{image}_build", f"{image}_scan"):
+        assert f"        id: {step}\n" in body["candidate"], f"candidate step {step} is missing"
+    assert f"        id: {image}\n" in body["verdict"], f"verdict step {image} is missing"
+    # Both platforms, natively, and the verdict asks for both reports.
+    for arch in ("amd64", "arm64"):
+        assert f"candidate-{image}-{arch}.json" in body["verdict"], f"the verdict does not read the {arch} candidate of the {image}"
+assert "runner: ubuntu-24.04-arm" in body["candidate"] and "runner: ubuntu-latest" in body["candidate"], "candidates are not built on both platforms"
+# The decision that publishes is `plan`, not the raw `decide` (which does not
+# know that a new version could not be adopted).
+tail = body["check"][body["check"].index("        id: plan\n"):]
+assert "steps.decide.outputs" not in tail.split("      - name:", 1)[1], "a step after `plan` still reads steps.decide.outputs"
+# The cosign image that is pinned is the verified one.
+assert "steps.digests.outputs.cosign }}" not in body["check"].split("        id: cosign_pin\n", 1)[1].split("      - name:", 1)[1], "a step after the verification reads the unverified cosign digest"
 PY
-pass "upstream-check.yml: rescan outputs and their consumers are wired"
+pass "upstream-check.yml: job outputs, step ids and their consumers are wired; candidates on both platforms; only the plan and the verified cosign pin are published"
 
 echo "ALL MONITOR TESTS PASSED"
