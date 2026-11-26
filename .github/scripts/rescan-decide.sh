@@ -39,8 +39,14 @@
 #                     (rescan_resolver | rescan_updater)
 #   EXPECT_ARCHS      architectures the published reports must all cover
 #                     (default "amd64 arm64": the release gate scans both)
-#   CANDIDATE         Trivy JSON report of the candidate image (pass 2)
-#   CANDIDATE_FAILED  1 when the candidate build or its scan failed (pass 2)
+#   CANDIDATE         Trivy JSON reports of the candidate image, one per
+#                     platform, space-separated (pass 2). They must cover
+#                     EXPECT_ARCHS exactly, like the published ones: a fix
+#                     that is installable on one architecture only would
+#                     otherwise read as a clean candidate, and the release
+#                     would then fail at its own scan of the other one —
+#                     after its immutable tag was pushed.
+#   CANDIDATE_FAILED  1 when a candidate build or its scan failed (pass 2)
 #   NOW               epoch seconds (default: the current time)
 #   PENDING_HOURS     how long a triggered rebuild may take to be published
 #                     before another may be tried (default 6; a release takes
@@ -69,7 +75,8 @@
 #                   clear:    clean — close what was opened
 #   count=<n>       number of distinct published findings
 #   summary=<text>  the published findings, "ID (package)", truncated
-#   remaining=<text> the findings the candidate still carries (waiting)
+#   remaining=<text> the findings the candidate still carries on any
+#                   platform (waiting)
 #   reason=<text>   one sentence for the issue body or the log
 #
 # Attempt record (<STATE_KEY>_digest/_vulns/_at/_tries, written by
@@ -210,11 +217,21 @@ elif candidate_failed:
 elif not candidate:
     status, alert = "probe", "none"
 else:
-    remaining = sorted(refused(load(candidate), candidate))
+    found, cand_archs = set(), set()
+    for path in candidate.split():
+        report = load(path)
+        arch = ((report.get("Metadata") or {}).get("ImageConfig") or {}).get("architecture")
+        if not arch:
+            fail(f"{path}: no architecture in the candidate report")
+        cand_archs.add(arch)
+        found |= refused(report, path)
+    if cand_archs != expect:
+        fail(f"candidate reports cover {sorted(cand_archs)}, expected {sorted(expect)}")
+    remaining = sorted(found)
     if remaining:
         status, alert = "waiting", "unfixed"
         reason = ("A rebuild does not fix this yet: an image built in this run from the current pins "
-                  "still carries the findings listed as remaining. The fix is not installable yet, or it "
+                  "still carries the findings listed as remaining, on at least one platform. The fix is not installable yet, or it "
                   "needs a newer base image or a newer pinned component. A candidate is built again every "
                   "hour and a new revision is published by itself as soon as one is clean.")
     else:

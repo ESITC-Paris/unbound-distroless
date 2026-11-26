@@ -22,9 +22,9 @@ dig @127.0.0.1 example.com +dnssec   # status: NOERROR, and "ad" in the flags: v
 dig @127.0.0.1 dnssec-failed.org     # status: SERVFAIL: a broken signature is refused
 ```
 
-The resolver listens on port 53 of the host and answers clients from loopback
-and private ranges (RFC 1918, IPv6 ULA and link-local) only. If the first
-`dig` times out, the resolver is still starting: run it again.
+The resolver listens on `127.0.0.1:53`: it serves this host and nothing else
+until you [give it an address of your network](#serving-your-network). If the
+first `dig` times out, the resolver is still starting: run it again.
 
 ### Resolver only
 
@@ -47,8 +47,8 @@ services:
     tmpfs:
       - "/run/unbound:uid=65532,gid=65532"
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
+      - "127.0.0.1:53:53/udp"   # this host only: see "Serving your network"
+      - "127.0.0.1:53:53/tcp"
     volumes:
       - unbound-data:/var/lib/unbound
       # - ./unbound.conf:/etc/unbound/unbound.conf:ro   # your own configuration
@@ -81,8 +81,8 @@ services:
     tmpfs:
       - "/run/unbound:uid=65532,gid=65532"
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
+      - "127.0.0.1:53:53/udp"   # this host only: see "Serving your network"
+      - "127.0.0.1:53:53/tcp"
     volumes:
       - unbound-data:/var/lib/unbound
       # - ./unbound.conf:/etc/unbound/unbound.conf:ro   # your own configuration
@@ -95,6 +95,7 @@ services:
     stop_grace_period: 2m
     environment:
       INTERVAL: 1h
+      METRICS_COLLECT_INTERVAL: 30s   # statistics for unbound-metrics, which has no Docker socket
       # HC_URL: https://hc-ping.com/<uuid>   # be alerted when an update fails
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -105,10 +106,15 @@ services:
     image: esitcparis/unbound-autoupdate:1
     command: ["metrics"]
     restart: unless-stopped
+    # No Docker socket here: it serves what unbound-autoupdate collects.
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
     ports:
       - "127.0.0.1:9167:9167"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - autoupdate-state:/var/lib/unbound-autoupdate:ro
 
 volumes:
@@ -127,17 +133,28 @@ Three things to know before you start it:
 - **The sidecar mounts the Docker socket, which is root on the host.** What it
   does with it: [updater/README.md](updater/README.md#the-docker-socket-is-root-on-the-host).
 
+### Serving your network
+
+To answer other machines, replace `127.0.0.1` in the two `ports:` lines with
+the address of the host on the network to serve, for example
+`"192.0.2.10:53:53/udp"` and `"192.0.2.10:53:53/tcp"`, then
+`docker compose up -d`.
+
+Name an address; do not publish on all of them (`"53:53/udp"`). The shipped
+configuration answers loopback and private ranges only (RFC 1918, IPv6 ULA
+and link-local), but behind Docker's port publishing a client from anywhere
+can reach Unbound with the address of the Docker bridge, which is in those
+ranges ([usage.md](docs/usage.md#docker-run)): on a host with a public
+address, `"53:53"` is an open resolver, usable to amplify attacks on others.
+
 ### Port 53 already in use?
 
 If `docker compose up -d` fails with `address already in use`, something on
-the host already listens on port 53 — on Ubuntu and other systemd
-distributions usually the `systemd-resolved` stub on `127.0.0.53`. Either
-publish on one address of the host instead of all of them, by changing the
-two `ports:` lines to, for example, `"192.0.2.10:53:53/udp"` and
-`"192.0.2.10:53:53/tcp"` (your LAN address); or turn the stub off
-(`DNSStubListener=no` in `/etc/systemd/resolved.conf`, then restart
-`systemd-resolved`) and point the host's `/etc/resolv.conf` at a resolver
-that still exists.
+the host already listens on that address and port. Publishing on one address
+avoids the usual case, the `systemd-resolved` stub of Ubuntu and other
+systemd distributions, which listens on `127.0.0.53` and not on `127.0.0.1`
+or your LAN address. For anything else, `ss -lntup 'sport = :53'` shows what
+listens.
 
 ## Try it
 

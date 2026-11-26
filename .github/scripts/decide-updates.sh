@@ -8,7 +8,10 @@
 # rescan, see rescan-decide.sh — empty when the rescan did not complete);
 # optional FORCE_REBUILD=none|resolver|sidecar|both (manual dispatch input:
 # the recovery path for a release that failed after pushing its immutable
-# tag, which release.yml/updater.yml then refuse to re-run).
+# tag, which release.yml/updater.yml then refuse to re-run);
+# optional HOLD=none|resolver|sidecar|both (.github/monitor-hold, read by
+# hold.sh): a held image is published by nothing but FORCE_REBUILD, and then
+# as a revision of what the repository pins — never as a new version.
 # Files: versions.env, .build-state.json in the current directory.
 # Output (stdout): action=version|revision|none  (resolver)
 #                  updater_action=revision|none  (sidecar)
@@ -29,6 +32,10 @@ done
 case "${FORCE_REBUILD:-none}" in
   none|resolver|sidecar|both) ;;
   *) echo "::error::FORCE_REBUILD has unexpected value '$FORCE_REBUILD'" >&2; exit 1 ;;
+esac
+case "${HOLD:-none}" in
+  none|resolver|sidecar|both) ;;
+  *) echo "::error::HOLD has unexpected value '$HOLD'" >&2; exit 1 ;;
 esac
 for v in RESCAN_RESOLVER RESCAN_UPDATER; do
   case "${!v:-}" in
@@ -76,6 +83,21 @@ if [ "$NEW_ALPINE" != "$OLD_ALPINE" ] || [ "$NEW_COSIGN" != "$OLD_COSIGN" ] \
   updater_action=revision
 else
   updater_action=none
+fi
+
+# A hold wins over everything automatic. The maintainer's own rebuild request
+# is the one way to publish a held image: it is how the rollback revision is
+# cut (docs/operations.md), from the pins as they are in the repository
+# (write-state.sh leaves a held image's base digests alone).
+held() { [ "${HOLD:-none}" = "$1" ] || [ "${HOLD:-none}" = both ]; }
+forced() { [ "${FORCE_REBUILD:-none}" = "$1" ] || [ "${FORCE_REBUILD:-none}" = both ]; }
+if held resolver; then
+  [ "$action" = none ] || echo "::notice::resolver on hold (.github/monitor-hold): '$action' not published by itself" >&2
+  if forced resolver; then action=revision; else action=none; fi
+fi
+if held sidecar; then
+  [ "$updater_action" = none ] || echo "::notice::sidecar on hold (.github/monitor-hold): '$updater_action' not published by itself" >&2
+  if forced sidecar; then updater_action=revision; else updater_action=none; fi
 fi
 
 printf 'action=%s\nupdater_action=%s\n' "$action" "$updater_action"

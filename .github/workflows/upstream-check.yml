@@ -30,42 +30,40 @@ concurrency:
 env:
   RESOLVER_IMAGE: ghcr.io/esitc-paris/unbound-distroless
   UPDATER_IMAGE: ghcr.io/esitc-paris/unbound-autoupdate
+  # How long a cosign release must have been out before the sidecar is built
+  # with it, and who must have signed its image (see the `check` job).
+  COSIGN_MIN_AGE_HOURS: '72'
+  COSIGN_UPSTREAM_IDENTITY: keyless@projectsigstore.iam.gserviceaccount.com
+  COSIGN_UPSTREAM_ISSUER: https://accounts.google.com
 
 jobs:
   # The monitor below reacts to a new Unbound version or a moved base digest.
   # Neither happens when a fix lands in trixie-security or Alpine without a
   # base rebuild, so the published images are rescanned here with the release
   # gates' own Trivy policy (.github/scripts/rescan-decide.sh); when that
-  # policy refuses one, a candidate is built and scanned to learn whether a
-  # rebuild fixes it. Only the
+  # policy refuses one, a candidate is built and scanned on each platform to
+  # learn whether a rebuild fixes it (`candidate`, then `verdict`). Only the
   # images behind `latest` are rescanned: the pipeline builds one line
   # (versions.env), older X.Y tags are frozen.
   #
-  # A separate job so that a scanner or registry outage fails the run (and
+  # Separate jobs so that a scanner or registry outage fails the run (and
   # opens the usual issue, see the end of `check`) without holding back a
   # version or base update: `check` runs regardless and ignores the outputs
-  # of a rescan that did not succeed.
+  # of a rescan that did not reach its verdict.
   rescan:
     runs-on: ubuntu-latest
-    # Normally a few minutes; up to two candidate builds (Unbound compiled
-    # from source) when a published image has findings.
-    timeout-minutes: 45
+    timeout-minutes: 15
     permissions:
       contents: read
-      issues: write
-      security-events: write
-    # `verdict` is set right after both decisions; `check` uses the statuses
-    # only when it is there.
+    # `scanned` is set once the four reports and both first-pass answers
+    # exist; `verdict` and `code-scanning` run only when it is there.
     outputs:
-      verdict: ${{ steps.verdict.outputs.ok }}
-      resolver: ${{ steps.resolver.outputs.status }}
+      scanned: ${{ steps.scanned.outputs.ok }}
+      now: ${{ steps.published.outputs.now }}
+      resolver_pre: ${{ steps.resolver_pre.outputs.status }}
       resolver_digest: ${{ steps.published.outputs.resolver }}
-      resolver_vulns: ${{ steps.resolver.outputs.vulns }}
-      resolver_tries: ${{ steps.resolver.outputs.tries }}
-      updater: ${{ steps.updater.outputs.status }}
+      updater_pre: ${{ steps.updater_pre.outputs.status }}
       updater_digest: ${{ steps.published.outputs.updater }}
-      updater_vulns: ${{ steps.updater.outputs.vulns }}
-      updater_tries: ${{ steps.updater.outputs.tries }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,6 +79,11 @@ jobs:
           {
             echo "resolver=$RESOLVER"
             echo "updater=$UPDATER"
+            # One clock for both passes of rescan-decide.sh: the second runs
+            # in another job, minutes later, and must not see a waiting
+            # period end in between (its answer would be a second `probe`,
+            # which is not a verdict).
+            echo "now=$(date +%s)"
           } >> "$GITHUB_OUTPUT"
 
       # One JSON report per image and platform, both platforms because the
@@ -137,29 +140,103 @@ jobs:
           ignore-unfixed: true
           exit-code: '0'
 
-      # Would a rebuild fix what the gate refuses? Not deduced: tried. When a
-      # published image has findings and no attempt is in flight
-      # (rescan-decide.sh, first pass → `probe`), a candidate is built here
-      # from the current pins — no cache, so its package upgrade is today's —
-      # and scanned with the same policy. Clean candidate → `new`, a revision
-      # is published; otherwise → `waiting`, and the same is tried again next
-      # hour. Nothing is pushed anywhere by these steps.
-      # continue-on-error: a candidate that cannot be built or scanned costs
-      # this image its rebuild for one hour (`waiting`), not the other image
-      # its verdict; the job still fails at its end so that it is seen.
+      # First pass of rescan-decide.sh: `clean`, `pending` (an attempt is in
+      # flight) or `probe` — findings and nothing in flight, so candidates
+      # are built (next job).
       - name: Decide (resolver), first pass
         id: resolver_pre
         env:
           POLICY: resolver
           STATE_KEY: rescan_resolver
           DIGEST: ${{ steps.published.outputs.resolver }}
+          NOW: ${{ steps.published.outputs.now }}
         run: |
           set -o pipefail
           bash .github/scripts/rescan-decide.sh resolver-amd64.json resolver-arm64.json | grep '^status=' | tee -a "$GITHUB_OUTPUT"
 
+      - name: Decide (sidecar), first pass
+        id: updater_pre
+        env:
+          POLICY: updater
+          STATE_KEY: rescan_updater
+          DIGEST: ${{ steps.published.outputs.updater }}
+          NOW: ${{ steps.published.outputs.now }}
+        run: |
+          set -o pipefail
+          bash .github/scripts/rescan-decide.sh updater-amd64.json updater-arm64.json | grep '^status=' | tee -a "$GITHUB_OUTPUT"
+
+      - name: Keep the reports for the verdict
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rescan-reports
+          path: |
+            resolver-amd64.json
+            resolver-arm64.json
+            updater-amd64.json
+            updater-arm64.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Record that the scans and first-pass answers exist
+        id: scanned
+        run: echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      # The SARIF upload happens in its own job (`code-scanning`): a
+      # code-scanning outage must not cost the verdict. continue-on-error: a
+      # missing artifact fails that job instead.
+      - name: Convert the reports to SARIF
+        continue-on-error: true
+        run: |
+          for f in resolver-amd64 resolver-arm64 updater-amd64 updater-arm64; do
+            trivy convert --format sarif --output "$f.sarif" "$f.json"
+          done
+
+      - name: Keep the SARIF reports for code scanning
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rescan-sarif
+          path: '*.sarif'
+          if-no-files-found: error
+          retention-days: 1
+
+  # Would a rebuild fix what the gate refuses? Not deduced: tried. When a
+  # published image has findings and no attempt is in flight (first pass →
+  # `probe`), a candidate is built here from the current pins — no cache, so
+  # its package upgrade is today's — and scanned with the same policy, on
+  # each platform natively, exactly as the release gate will. A fix can be
+  # installable for one architecture before the other: a candidate checked on
+  # amd64 alone would start a release that then fails its arm64 scan, after
+  # its immutable tag was pushed. Nothing is pushed anywhere by this job.
+  # continue-on-error on the steps: a candidate that cannot be built or
+  # scanned costs that image its rebuild for one hour (`waiting`), not the
+  # other image its verdict; the job still fails at its end so that it is
+  # seen (and with it the run, see the end of `check`).
+  candidate:
+    name: candidate (${{ matrix.arch }})
+    needs: rescan
+    if: needs.rescan.outputs.resolver_pre == 'probe' || needs.rescan.outputs.updater_pre == 'probe'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # Unbound compiled from source, plus the sidecar, in the worst case.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Build a candidate resolver
         id: resolver_build
-        if: steps.resolver_pre.outputs.status == 'probe'
+        if: needs.rescan.outputs.resolver_pre == 'probe'
         continue-on-error: true
         run: sh scripts/build.sh unbound-distroless:candidate --no-cache --pull
 
@@ -171,37 +248,15 @@ jobs:
         with:
           image-ref: unbound-distroless:candidate
           format: json
-          output: candidate-resolver.json
+          output: candidate-resolver-${{ matrix.arch }}.json
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: '0'
 
-      - name: Decide (resolver)
-        id: resolver
-        env:
-          POLICY: resolver
-          STATE_KEY: rescan_resolver
-          DIGEST: ${{ steps.published.outputs.resolver }}
-          CANDIDATE: ${{ steps.resolver_scan.outcome == 'success' && 'candidate-resolver.json' || '' }}
-          CANDIDATE_FAILED: ${{ steps.resolver_pre.outputs.status == 'probe' && steps.resolver_scan.outcome != 'success' && '1' || '' }}
-        run: |
-          set -o pipefail
-          bash .github/scripts/rescan-decide.sh resolver-amd64.json resolver-arm64.json | tee -a "$GITHUB_OUTPUT"
-
-      - name: Decide (sidecar), first pass
-        id: updater_pre
-        env:
-          POLICY: updater
-          STATE_KEY: rescan_updater
-          DIGEST: ${{ steps.published.outputs.updater }}
-        run: |
-          set -o pipefail
-          bash .github/scripts/rescan-decide.sh updater-amd64.json updater-arm64.json | grep '^status=' | tee -a "$GITHUB_OUTPUT"
-
       # Same pins and build arguments as updater.yml's release build.
       - name: Build a candidate sidecar
         id: updater_build
-        if: steps.updater_pre.outputs.status == 'probe'
+        if: needs.rescan.outputs.updater_pre == 'probe'
         continue-on-error: true
         run: |
           # shellcheck disable=SC1091
@@ -223,21 +278,128 @@ jobs:
         with:
           image-ref: unbound-autoupdate:candidate
           format: json
-          output: candidate-updater.json
+          output: candidate-updater-${{ matrix.arch }}.json
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: '0'
+
+      # Only the report of a scan that succeeded is a report: whatever a
+      # failed one left behind must not reach the verdict as one (a missing
+      # report reads as "candidate failed", which is what it is).
+      - name: Drop the reports of scans that did not succeed
+        env:
+          ARCH: ${{ matrix.arch }}
+          RESOLVER_SCAN: ${{ steps.resolver_scan.outcome }}
+          UPDATER_SCAN: ${{ steps.updater_scan.outcome }}
+        run: |
+          [ "$RESOLVER_SCAN" = success ] || rm -f "candidate-resolver-$ARCH.json"
+          [ "$UPDATER_SCAN" = success ] || rm -f "candidate-updater-$ARCH.json"
+          ls -l candidate-*.json 2>/dev/null || echo "no candidate report on $ARCH"
+
+      - name: Keep the candidate reports for the verdict
+        id: keep
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-${{ matrix.arch }}
+          path: candidate-*.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Fail the job if a candidate could not be built, scanned or kept
+        if: >-
+          steps.resolver_build.outcome == 'failure' || steps.resolver_scan.outcome == 'failure' ||
+          steps.updater_build.outcome == 'failure' || steps.updater_scan.outcome == 'failure' ||
+          steps.keep.outcome == 'failure'
+        run: |
+          echo "::error::a candidate build, its scan or its upload failed on this platform — see the steps above"
+          exit 1
+
+  # Second pass of rescan-decide.sh, with the candidates' reports: `new`
+  # (clean on every platform — a revision is published), `waiting` (still
+  # refused somewhere, or a candidate is missing — tried again next hour), or
+  # the first pass's own `clean` / `pending`.
+  verdict:
+    needs: [rescan, candidate]
+    # Whatever became of the candidates (skipped when nothing was to probe,
+    # failed when one could not be built), but only on complete scans.
+    if: ${{ !cancelled() && needs.rescan.outputs.scanned == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    # `verdict` is set right after both decisions; `check` uses the statuses
+    # only when it is there.
+    outputs:
+      verdict: ${{ steps.verdict.outputs.ok }}
+      resolver: ${{ steps.resolver.outputs.status }}
+      resolver_vulns: ${{ steps.resolver.outputs.vulns }}
+      resolver_tries: ${{ steps.resolver.outputs.tries }}
+      updater: ${{ steps.updater.outputs.status }}
+      updater_vulns: ${{ steps.updater.outputs.vulns }}
+      updater_tries: ${{ steps.updater.outputs.tries }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the published images' reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rescan-reports
+
+      # continue-on-error: a candidate report that cannot be fetched is a
+      # missing candidate (`waiting`), not a missing verdict.
+      - name: Fetch the candidates' reports
+        if: needs.candidate.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: candidate-*
+          merge-multiple: true
+
+      - name: Decide (resolver)
+        id: resolver
+        env:
+          POLICY: resolver
+          STATE_KEY: rescan_resolver
+          DIGEST: ${{ needs.rescan.outputs.resolver_digest }}
+          NOW: ${{ needs.rescan.outputs.now }}
+          PRE: ${{ needs.rescan.outputs.resolver_pre }}
+        run: |
+          set -o pipefail
+          # A candidate counts only when both platforms were built and scanned.
+          CANDIDATE="" CANDIDATE_FAILED=""
+          if [ "$PRE" = probe ]; then
+            if [ -s candidate-resolver-amd64.json ] && [ -s candidate-resolver-arm64.json ]; then
+              CANDIDATE="candidate-resolver-amd64.json candidate-resolver-arm64.json"
+            else
+              CANDIDATE_FAILED=1
+            fi
+          fi
+          export CANDIDATE CANDIDATE_FAILED
+          bash .github/scripts/rescan-decide.sh resolver-amd64.json resolver-arm64.json | tee -a "$GITHUB_OUTPUT"
 
       - name: Decide (sidecar)
         id: updater
         env:
           POLICY: updater
           STATE_KEY: rescan_updater
-          DIGEST: ${{ steps.published.outputs.updater }}
-          CANDIDATE: ${{ steps.updater_scan.outcome == 'success' && 'candidate-updater.json' || '' }}
-          CANDIDATE_FAILED: ${{ steps.updater_pre.outputs.status == 'probe' && steps.updater_scan.outcome != 'success' && '1' || '' }}
+          DIGEST: ${{ needs.rescan.outputs.updater_digest }}
+          NOW: ${{ needs.rescan.outputs.now }}
+          PRE: ${{ needs.rescan.outputs.updater_pre }}
         run: |
           set -o pipefail
+          CANDIDATE="" CANDIDATE_FAILED=""
+          if [ "$PRE" = probe ]; then
+            if [ -s candidate-updater-amd64.json ] && [ -s candidate-updater-arm64.json ]; then
+              CANDIDATE="candidate-updater-amd64.json candidate-updater-arm64.json"
+            else
+              CANDIDATE_FAILED=1
+            fi
+          fi
+          export CANDIDATE CANDIDATE_FAILED
           bash .github/scripts/rescan-decide.sh updater-amd64.json updater-arm64.json | tee -a "$GITHUB_OUTPUT"
 
       - name: Record that both verdicts exist
@@ -251,21 +413,20 @@ jobs:
         #           failed, or published and still carrying them).
         # clear:    the published image is clean — both issues are closed.
         # One issue per image and kind, never a comment per hourly run.
-        # continue-on-error: the verdict above is what publishes a rebuild; a
-        # GitHub Issues outage must not cost it (the job still fails below).
-        id: issues
-        continue-on-error: true
+        # No continue-on-error needed: the verdict above is already recorded,
+        # so a GitHub Issues outage fails this job (and the run) without
+        # costing the rebuild.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RESOLVER_ALERT: ${{ steps.resolver.outputs.alert }}
-          RESOLVER_DIGEST: ${{ steps.published.outputs.resolver }}
+          RESOLVER_DIGEST: ${{ needs.rescan.outputs.resolver_digest }}
           RESOLVER_SUMMARY: ${{ steps.resolver.outputs.summary }}
           RESOLVER_REMAINING: ${{ steps.resolver.outputs.remaining }}
           RESOLVER_REASON: ${{ steps.resolver.outputs.reason }}
           UPDATER_ALERT: ${{ steps.updater.outputs.alert }}
-          UPDATER_DIGEST: ${{ steps.published.outputs.updater }}
+          UPDATER_DIGEST: ${{ needs.rescan.outputs.updater_digest }}
           UPDATER_SUMMARY: ${{ steps.updater.outputs.summary }}
           UPDATER_REMAINING: ${{ steps.updater.outputs.remaining }}
           UPDATER_REASON: ${{ steps.updater.outputs.reason }}
@@ -292,46 +453,15 @@ jobs:
           report sidecar "$UPDATER_ALERT" "$UPDATER_DIGEST" "$UPDATER_SUMMARY" "$UPDATER_REMAINING" "$UPDATER_REASON" || rc=1
           exit "$rc"
 
-      # The SARIF upload happens in its own job (`code-scanning`): a
-      # code-scanning outage must not cost this job its verdict or the issue
-      # above. continue-on-error: a missing artifact fails that job instead.
-      - name: Convert the reports to SARIF
-        continue-on-error: true
-        run: |
-          for f in resolver-amd64 resolver-arm64 updater-amd64 updater-arm64; do
-            trivy convert --format sarif --output "$f.sarif" "$f.json"
-          done
-
-      - name: Keep the SARIF reports for code scanning
-        continue-on-error: true
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: rescan-sarif
-          path: '*.sarif'
-          if-no-files-found: error
-          retention-days: 1
-
-      # Last, so that the verdicts, the issues and the reports above are not
-      # lost: what was continued over still fails the job, and with it the
-      # run (see the end of `check`).
-      - name: Fail the job if a candidate or an issue update failed
-        if: >-
-          steps.resolver_build.outcome == 'failure' || steps.resolver_scan.outcome == 'failure' ||
-          steps.updater_build.outcome == 'failure' || steps.updater_scan.outcome == 'failure' ||
-          steps.issues.outcome == 'failure'
-        run: |
-          echo "::error::a candidate build, its scan, or the issue update failed in this run — see the steps above"
-          exit 1
-
   # Code scanning shows every fixable CRITICAL/HIGH finding in what is
   # published, including the vendored cosign's HIGH ones the sidecar gate
   # deliberately lets through: visibility is not the gate. One category per
   # image and platform, so an alert closes when a later scan of the same image
   # no longer reports it. A failure here fails the run (see the end of
-  # `check`) without touching the rescan's verdict.
+  # `check`) without touching the rescan's verdict (the `verdict` job).
   code-scanning:
     needs: rescan
-    if: ${{ !cancelled() && needs.rescan.outputs.verdict == 'true' }}
+    if: ${{ !cancelled() && needs.rescan.outputs.scanned == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -367,7 +497,7 @@ jobs:
           category: published-updater-arm64
 
   check:
-    needs: [rescan, code-scanning]
+    needs: [rescan, candidate, verdict, code-scanning]
     # Runs whatever the rescan's outcome (see above), but not when the run
     # itself was cancelled.
     if: ${{ !cancelled() }}
@@ -404,6 +534,15 @@ jobs:
       - name: Load current pins
         run: cat versions.env >> "$GITHUB_ENV"
 
+      # .github/monitor-hold: images a maintainer froze (a bad release being
+      # investigated or rolled back — docs/operations.md). A held image is
+      # published by nothing below except the `rebuild` input.
+      - name: Images on hold
+        id: hold
+        run: |
+          set -o pipefail
+          bash .github/scripts/hold.sh | tee -a "$GITHUB_OUTPUT"
+
       - name: Check latest Unbound release
         id: upstream
         env:
@@ -427,29 +566,42 @@ jobs:
       # keep the sidecar on one cosign release for ever — including through a
       # CRITICAL finding that only a newer cosign fixes. The newest stable
       # release of the SAME major line is followed instead
-      # (pick-version.sh); the sidecar's release then runs its whole suite
-      # with it before anything is published.
+      # (pick-version.sh), once it has been out for COSIGN_MIN_AGE_HOURS
+      # (settled-releases.sh: a release pulled back in its first days is
+      # never built into the sidecar) and its image verifies with Sigstore's
+      # release identity (below). The sidecar's release then runs its whole
+      # suite with it before anything is published.
+      # The wait is dropped while the published sidecar fails the release
+      # gate and a rebuild does not fix it (`waiting`): a newer cosign may be
+      # the fix, and the signature check still applies.
       # A listing that fails keeps the current pin: it must not cost this run
       # its other checks.
       - name: Check latest cosign release (sidecar)
         id: cosign
         env:
           GH_TOKEN: ${{ github.token }}
+          HOLD: ${{ steps.hold.outputs.hold }}
+          RESCAN_UPDATER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.updater || '' }}
         run: |
           TARGET=$COSIGN_VERSION
-          if TAGS=$(curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
+          MIN_AGE_HOURS=$COSIGN_MIN_AGE_HOURS
+          if [ "$RESCAN_UPDATER" = waiting ]; then
+            echo "the published sidecar fails the gate and a rebuild does not fix it: no waiting period for a newer cosign"
+            MIN_AGE_HOURS=0
+          fi
+          export MIN_AGE_HOURS
+          if [ "$HOLD" = sidecar ] || [ "$HOLD" = both ]; then
+            echo "sidecar on hold: cosign stays at v$COSIGN_VERSION"
+          elif TAGS=$(set -o pipefail; curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
               -H "Authorization: Bearer $GH_TOKEN" \
               'https://api.github.com/repos/sigstore/cosign/releases?per_page=50' \
-              | python3 -c 'import json, sys
-          for r in json.load(sys.stdin):
-              if not r.get("draft") and not r.get("prerelease"):
-                  print(r["tag_name"])'); then
+              | bash .github/scripts/settled-releases.sh); then
             TARGET=$(bash .github/scripts/pick-version.sh "$COSIGN_VERSION" <<<"$TAGS")
           else
             echo "::warning::could not list the cosign releases — keeping v$COSIGN_VERSION"
           fi
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "Current: v$COSIGN_VERSION — Target: v$TARGET"
+          echo "Current: v$COSIGN_VERSION — Target: v$TARGET (releases out for at least $MIN_AGE_HOURS h)"
 
       - name: Check base image digests
         id: digests
@@ -485,12 +637,78 @@ jobs:
           if [ "$COSIGN_USE" = "$COSIGN_VERSION" ]; then
             COSIGN=$(resolve "ghcr.io/sigstore/cosign/cosign:v$COSIGN_VERSION") || { echo "cosign digest resolution failed"; exit 1; }
           fi
+          # A cosign image this repository has not recorded yet (a newer
+          # version, or a digest that moved under the same tag) is used only
+          # once its signature is verified: next two steps.
+          RECORDED=$(python3 -c 'import json; print(json.load(open(".build-state.json")).get("cosign", ""))')
+          CHANGED=no; [ "$COSIGN" = "$RECORDED" ] || CHANGED=yes
           {
             echo "debian=$DEBIAN"
             echo "distroless=$DISTROLESS"
             echo "alpine=$ALPINE"
             echo "cosign=$COSIGN"
             echo "cosign_version=$COSIGN_USE"
+            echo "cosign_recorded=$RECORDED"
+            echo "cosign_changed=$CHANGED"
+          } >> "$GITHUB_OUTPUT"
+
+      # The installer's own default cosign release (pinned with the action's
+      # SHA). continue-on-error: without it the next step keeps the recorded
+      # cosign image, which is the safe answer.
+      - name: Install cosign (a cosign image to verify)
+        if: steps.digests.outputs.cosign_changed == 'yes'
+        continue-on-error: true
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # What the sidecar is built with: the resolved cosign image when it is
+      # the recorded one or when its signature verifies, the recorded one
+      # otherwise (fail-closed: nothing unverified is ever pinned, and the
+      # run goes on with its other checks). Sigstore signs its release images
+      # keyless with the identity below (checked on v3.1.6, 2026-11-26); if
+      # upstream changes how it signs, this refuses every newer image and
+      # the issue opened at the end of the job says so.
+      - name: Verify the cosign image and settle its pin
+        id: cosign_pin
+        env:
+          CANDIDATE: ${{ steps.digests.outputs.cosign }}
+          CANDIDATE_VERSION: ${{ steps.digests.outputs.cosign_version }}
+          RECORDED: ${{ steps.digests.outputs.cosign_recorded }}
+          HOLD: ${{ steps.hold.outputs.hold }}
+        run: |
+          sha() { [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; }
+          sha "$CANDIDATE" || { echo "::error::cosign digest '$CANDIDATE' is not a sha256 digest"; exit 1; }
+          DIGEST=$CANDIDATE VERSION=$CANDIDATE_VERSION UNVERIFIED=""
+          if [ "$CANDIDATE" != "$RECORDED" ] && [ "$HOLD" != sidecar ] && [ "$HOLD" != both ]; then
+            ok=0
+            if command -v cosign >/dev/null; then
+              for attempt in 1 2 3; do
+                if cosign verify "ghcr.io/sigstore/cosign/cosign@$CANDIDATE" \
+                    --certificate-identity "$COSIGN_UPSTREAM_IDENTITY" \
+                    --certificate-oidc-issuer "$COSIGN_UPSTREAM_ISSUER" >/dev/null; then ok=1; break; fi
+                [ "$attempt" = 3 ] || sleep 20
+              done
+            else
+              echo "::warning::cosign is not installed in this run"
+            fi
+            if [ "$ok" = 1 ]; then
+              echo "cosign v$VERSION@$CANDIDATE: signature verified ($COSIGN_UPSTREAM_IDENTITY)"
+            else
+              UNVERIFIED="v$VERSION@$CANDIDATE"
+              # Without a recorded image there is nothing verified to fall
+              # back on: stop rather than pin an unverified one.
+              sha "$RECORDED" || { echo "::error::cosign $UNVERIFIED does not verify and no cosign image is recorded"; exit 1; }
+              echo "::warning::cosign $UNVERIFIED does not verify with Sigstore's release identity — keeping v$COSIGN_VERSION@$RECORDED"
+              DIGEST=$RECORDED VERSION=$COSIGN_VERSION
+            fi
+          elif [ "$CANDIDATE" != "$RECORDED" ]; then
+            # On hold: nothing moves, and write-state.sh keeps the record.
+            sha "$RECORDED" && DIGEST=$RECORDED
+            VERSION=$COSIGN_VERSION
+          fi
+          {
+            echo "digest=$DIGEST"
+            echo "version=$VERSION"
+            echo "unverified=$UNVERIFIED"
           } >> "$GITHUB_OUTPUT"
 
       - name: Decide action
@@ -500,11 +718,12 @@ jobs:
           NEW_DEBIAN: ${{ steps.digests.outputs.debian }}
           NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
           NEW_ALPINE: ${{ steps.digests.outputs.alpine }}
-          NEW_COSIGN: ${{ steps.digests.outputs.cosign }}
+          NEW_COSIGN: ${{ steps.cosign_pin.outputs.digest }}
+          HOLD: ${{ steps.hold.outputs.hold }}
           # Empty unless both rescan verdicts exist: a partial rescan must not
           # publish anything (decide-updates.sh reads empty as "no verdict").
-          RESCAN_RESOLVER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.resolver || '' }}
-          RESCAN_UPDATER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.updater || '' }}
+          RESCAN_RESOLVER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.resolver || '' }}
+          RESCAN_UPDATER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.updater || '' }}
           FORCE_REBUILD: ${{ inputs.rebuild || 'none' }}
         run: |
           # The logic lives in a script so tests/monitor.sh can exercise it.
@@ -514,8 +733,16 @@ jobs:
           set -o pipefail
           bash .github/scripts/decide-updates.sh | tee -a "$GITHUB_OUTPUT"
 
+      # continue-on-error: a new version that cannot be adopted in this run
+      # (its tarball or signature is not online yet, or it is signed with a
+      # key this repository does not pin) must not cost the base-image and
+      # rescan rebuilds of BOTH images, which share this job's commit. The
+      # next step then plans the run as if no new version existed, and the
+      # end of the job opens an issue about it.
       - name: Update pins for a new Unbound version
+        id: newversion
         if: steps.decide.outputs.action == 'version'
+        continue-on-error: true
         env:
           LATEST: ${{ steps.upstream.outputs.latest }}
           # "NLnet Labs releases signing key G2 <releases@nlnetlabs.nl>" — the key
@@ -562,17 +789,50 @@ jobs:
                  -e "s/^REVISION=.*/REVISION=0/" versions.env
           cat versions.env >> "$GITHUB_ENV"
 
+      # What this run really publishes. The decision above, unless the new
+      # version could not be adopted: then versions.env is put back and the
+      # decision is taken again with the pinned version as the latest one —
+      # a moved base or a clean rescan candidate still gets its revision.
+      - name: Settle what this run publishes
+        id: plan
+        env:
+          DECIDED: ${{ steps.decide.outputs.action }}
+          DECIDED_UPDATER: ${{ steps.decide.outputs.updater_action }}
+          NEWVERSION: ${{ steps.newversion.outcome }}
+          TRIED: ${{ steps.upstream.outputs.latest }}
+          NEW_DEBIAN: ${{ steps.digests.outputs.debian }}
+          NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
+          NEW_ALPINE: ${{ steps.digests.outputs.alpine }}
+          NEW_COSIGN: ${{ steps.cosign_pin.outputs.digest }}
+          HOLD: ${{ steps.hold.outputs.hold }}
+          RESCAN_RESOLVER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.resolver || '' }}
+          RESCAN_UPDATER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.updater || '' }}
+          FORCE_REBUILD: ${{ inputs.rebuild || 'none' }}
+        run: |
+          set -o pipefail
+          if [ "$NEWVERSION" = failure ]; then
+            echo "::warning::Unbound $TRIED could not be adopted in this run (see the previous step) — carrying on with $UNBOUND_VERSION"
+            git checkout -- versions.env
+            LATEST=$UNBOUND_VERSION bash .github/scripts/decide-updates.sh | tee -a "$GITHUB_OUTPUT"
+          else
+            case "$DECIDED/$DECIDED_UPDATER" in
+              version/none|version/revision|revision/none|revision/revision|none/none|none/revision) ;;
+              *) echo "::error::unexpected decision '$DECIDED/$DECIDED_UPDATER'"; exit 1 ;;
+            esac
+            printf 'action=%s\nupdater_action=%s\n' "$DECIDED" "$DECIDED_UPDATER" | tee -a "$GITHUB_OUTPUT"
+          fi
+
       - name: Bump revision for dependency updates
-        if: steps.decide.outputs.action == 'revision'
+        if: steps.plan.outputs.action == 'revision'
         run: |
           NEWREV=$((REVISION + 1))
           sed -i "s/^REVISION=.*/REVISION=$NEWREV/" versions.env
           echo "REVISION=$NEWREV" >> "$GITHUB_ENV"
 
       - name: Bump the sidecar revision for base updates
-        if: steps.decide.outputs.updater_action == 'revision'
+        if: steps.plan.outputs.updater_action == 'revision'
         env:
-          COSIGN_USE: ${{ steps.digests.outputs.cosign_version }}
+          COSIGN_USE: ${{ steps.cosign_pin.outputs.version }}
         run: |
           NEWREV=$((UPDATER_REVISION + 1))
           sed -i "s/^UPDATER_REVISION=.*/UPDATER_REVISION=$NEWREV/" versions.env
@@ -596,28 +856,29 @@ jobs:
       - name: Commit state, tag, and dispatch releases
         # Positive guards only: an empty output (a crashed decision step) must
         # never be read as "something to publish".
-        if: steps.decide.outputs.action == 'version' || steps.decide.outputs.action == 'revision' || steps.decide.outputs.updater_action == 'revision'
+        if: steps.plan.outputs.action == 'version' || steps.plan.outputs.action == 'revision' || steps.plan.outputs.updater_action == 'revision'
         env:
           GH_TOKEN: ${{ github.token }}
-          ACTION: ${{ steps.decide.outputs.action }}
-          UPDATER_ACTION: ${{ steps.decide.outputs.updater_action }}
+          ACTION: ${{ steps.plan.outputs.action }}
+          UPDATER_ACTION: ${{ steps.plan.outputs.updater_action }}
           NEW_DEBIAN: ${{ steps.digests.outputs.debian }}
           NEW_DISTROLESS: ${{ steps.digests.outputs.distroless }}
           NEW_ALPINE: ${{ steps.digests.outputs.alpine }}
-          NEW_COSIGN: ${{ steps.digests.outputs.cosign }}
-          RESCAN_RESOLVER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.resolver || '' }}
+          NEW_COSIGN: ${{ steps.cosign_pin.outputs.digest }}
+          HOLD: ${{ steps.hold.outputs.hold }}
+          RESCAN_RESOLVER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.resolver || '' }}
           RESCAN_RESOLVER_DIGEST: ${{ needs.rescan.outputs.resolver_digest }}
-          RESCAN_RESOLVER_VULNS: ${{ needs.rescan.outputs.resolver_vulns }}
-          RESCAN_RESOLVER_TRIES: ${{ needs.rescan.outputs.resolver_tries }}
-          RESCAN_UPDATER: ${{ needs.rescan.outputs.verdict == 'true' && needs.rescan.outputs.updater || '' }}
+          RESCAN_RESOLVER_VULNS: ${{ needs.verdict.outputs.resolver_vulns }}
+          RESCAN_RESOLVER_TRIES: ${{ needs.verdict.outputs.resolver_tries }}
+          RESCAN_UPDATER: ${{ needs.verdict.outputs.verdict == 'true' && needs.verdict.outputs.updater || '' }}
           RESCAN_UPDATER_DIGEST: ${{ needs.rescan.outputs.updater_digest }}
-          RESCAN_UPDATER_VULNS: ${{ needs.rescan.outputs.updater_vulns }}
-          RESCAN_UPDATER_TRIES: ${{ needs.rescan.outputs.updater_tries }}
+          RESCAN_UPDATER_VULNS: ${{ needs.verdict.outputs.updater_vulns }}
+          RESCAN_UPDATER_TRIES: ${{ needs.verdict.outputs.updater_tries }}
         run: |
           NOW=$(date +%s); export NOW
           # shellcheck disable=SC1091
           . ./versions.env
-          # Base digests, plus the rescan attempt record when this commit
+          # Base digests (not those of an image on hold), plus the rescan attempt record when this commit
           # publishes a rescan-requested rebuild (logic and tests:
           # write-state.sh, tests/monitor.sh).
           bash .github/scripts/write-state.sh
@@ -680,12 +941,13 @@ jobs:
       # (release-health.sh) — then open an issue. A re-dispatch builds what
       # is absent or resumes what is published but unfinished (release-mode.sh).
       - name: Check that the current releases are really out
-        if: steps.decide.outcome == 'success'
+        if: steps.plan.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          ACTION: ${{ steps.decide.outputs.action }}
-          UPDATER_ACTION: ${{ steps.decide.outputs.updater_action }}
+          ACTION: ${{ steps.plan.outputs.action }}
+          UPDATER_ACTION: ${{ steps.plan.outputs.updater_action }}
+          HOLD: ${{ steps.hold.outputs.hold }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           health() {  # health <workflow> <tag-prefix> <version> <revision> <hub-image> <ghcr-image>
@@ -718,12 +980,16 @@ jobs:
           }
           # The pins as checked out: an image being re-released by this run
           # (action != none) is skipped — its new tag supersedes the old one.
+          # An image on hold is skipped too: while a release is being rolled
+          # back its `latest` may have been moved by hand, and repairing it
+          # here would undo that within the hour.
+          held() { [ "$HOLD" = "$1" ] || [ "$HOLD" = both ]; }
           # shellcheck disable=SC1091
           . ./versions.env
-          if [ "$ACTION" = none ]; then
+          if [ "$ACTION" = none ] && ! held resolver; then
             health release.yml v "$UNBOUND_VERSION" "$REVISION" esitcparis/unbound-distroless ghcr.io/esitc-paris/unbound-distroless
           fi
-          if [ "$UPDATER_ACTION" = none ]; then
+          if [ "$UPDATER_ACTION" = none ] && ! held sidecar; then
             health updater.yml updater-v "$UPDATER_VERSION" "$UPDATER_REVISION" esitcparis/unbound-autoupdate ghcr.io/esitc-paris/unbound-autoupdate
           fi
 
@@ -745,17 +1011,74 @@ jobs:
             'The sidecar is built on alpine:%s and alpine:%s is published. The monitor does not change the branch by itself: it brings new versions of the Docker CLI and Compose.\n\nTo move: set ALPINE_VERSION=%s in versions.env and the default of ALPINE_BASE in updater/Dockerfile, in a pull request (its CI runs the sidecar suites on the new branch). The next monitor run then records the digest and publishes a sidecar revision. Close this issue when done.' \
             "$ALPINE_VERSION" "$NEXT" "$NEXT")"
 
-      - name: Fail the run if the rescan or its code-scanning upload did not complete
+      # Three conditions a maintainer has to know about, none of which stops
+      # the monitor: each has ONE issue, opened when it starts and closed by
+      # the run that sees it over (issue.sh) — never a comment per hour.
+      #   * a new Unbound version that cannot be adopted (the run went on
+      #     without it, see `plan`);
+      #   * a cosign image that does not verify (the recorded one is kept);
+      #   * images on hold (a reminder: nothing is published for them).
+      # continue-on-error: these are reports; the step after next still fails
+      # the run when they could not be made.
+      - name: Open or close the monitor's own issues
+        id: own_issues
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEWVERSION: ${{ steps.newversion.outcome }}
+          TRIED: ${{ steps.upstream.outputs.latest }}
+          UNVERIFIED: ${{ steps.cosign_pin.outputs.unverified }}
+          HOLD: ${{ steps.hold.outputs.hold }}
+        run: |
+          rc=0
+          T="A new Unbound version cannot be adopted"
+          if [ "$NEWVERSION" = failure ]; then
+            bash .github/scripts/issue.sh open "$T" "$(printf \
+              'Unbound %s is released, and the monitor could not adopt it: the download, its OpenPGP verification against the pinned NLnet Labs key (.github/keys/), or the published checksum failed — see the step "Update pins for a new Unbound version" of the run below.\n\nThe resolver stays on %s; base-image and rescan rebuilds of both images are not affected. It is tried again every hour, and this issue is closed by the run that adopts the version. If upstream signs with a new key, the key and its fingerprint have to be updated in a pull request (docs/operations.md).\n\nRun: %s' \
+              "$TRIED" "$UNBOUND_VERSION" "$RUN_URL")" || rc=1
+          else
+            bash .github/scripts/issue.sh close "$T" "No new version is waiting to be adopted. Run: $RUN_URL" || rc=1
+          fi
+          T="The cosign image for the sidecar does not verify"
+          if [ -n "$UNVERIFIED" ]; then
+            bash .github/scripts/issue.sh open "$T" "$(printf \
+              'ghcr.io/sigstore/cosign/cosign %s does not verify with the identity Sigstore signs its releases with (%s, issuer %s), or Sigstore could not be reached in three attempts.\n\nThe sidecar stays on cosign v%s. It is tried again every hour, and this issue is closed by the run in which the image verifies. If it persists: check upstream'"'"'s release notes for a withdrawn release or a changed signing identity (COSIGN_UPSTREAM_IDENTITY in upstream-check.yml).\n\nRun: %s' \
+              "$UNVERIFIED" "$COSIGN_UPSTREAM_IDENTITY" "$COSIGN_UPSTREAM_ISSUER" "$COSIGN_VERSION" "$RUN_URL")" || rc=1
+          else
+            bash .github/scripts/issue.sh close "$T" "The cosign image in use verifies. Run: $RUN_URL" || rc=1
+          fi
+          T="Automatic releases are on hold"
+          if [ "$HOLD" != none ]; then
+            bash .github/scripts/issue.sh open "$T" "$(printf \
+              'On hold (.github/monitor-hold): %s.\n\nFor a held image the monitor publishes nothing by itself — no new Unbound version, no base-image update, no rebuild for a fixed vulnerability — and does not repair its current release. Only "gh workflow run upstream-check.yml -f rebuild=<image>" publishes a revision, from the pins as they are in the repository.\n\nRemove the line from .github/monitor-hold (pull request) to resume; this issue is then closed by the next run. Procedure: docs/operations.md, "Rolling back a release".\n\nRun: %s' \
+              "$HOLD" "$RUN_URL")" || rc=1
+          else
+            bash .github/scripts/issue.sh close "$T" "Nothing is on hold. Run: $RUN_URL" || rc=1
+          fi
+          exit "$rc"
+
+      - name: Fail the run if the rescan, its candidates or its code-scanning upload did not complete
         # After the commit step on purpose: a version or base update has been
-        # published by now; only the rescan's verdict or its upload is
-        # missing, and the failure (and the issue below) is how that becomes
-        # visible.
-        if: needs.rescan.result != 'success' || needs.code-scanning.result != 'success'
+        # published by now; only the rescan's verdict, a candidate or the
+        # upload is missing, and the failure (and the issue below) is how
+        # that becomes visible. A skipped `candidate` is the normal case:
+        # nothing was to probe.
+        if: >-
+          needs.rescan.result != 'success' || needs.verdict.result != 'success' ||
+          needs.code-scanning.result != 'success' ||
+          (needs.candidate.result != 'success' && needs.candidate.result != 'skipped') ||
+          steps.own_issues.outcome == 'failure'
         env:
           RESCAN_RESULT: ${{ needs.rescan.result }}
+          CANDIDATE_RESULT: ${{ needs.candidate.result }}
+          VERDICT_RESULT: ${{ needs.verdict.result }}
           UPLOAD_RESULT: ${{ needs.code-scanning.result }}
+          OWN_ISSUES: ${{ steps.own_issues.outcome }}
         run: |
-          echo "::error::published-image rescan: '$RESCAN_RESULT', code-scanning upload: '$UPLOAD_RESULT' — see those jobs"
+          echo "::error::published-image rescan: '$RESCAN_RESULT', candidates: '$CANDIDATE_RESULT', verdict: '$VERDICT_RESULT', code-scanning upload: '$UPLOAD_RESULT', the monitor's own issues: '$OWN_ISSUES' — see those jobs and steps"
           exit 1
 
       - name: Notify admin on failure

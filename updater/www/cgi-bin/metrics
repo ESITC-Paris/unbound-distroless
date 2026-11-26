@@ -20,43 +20,53 @@ LIB=/usr/local/lib/unbound-autoupdate
 printf 'Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\r\n'
 start=$(date +%s.%N)
 ok=0
+age=0
 
-# Collection runs in a child of its own, under ONE timeout that covers all of
-# it: discover_target_container dies (exit) when it cannot find the resolver,
-# and that must not end the scrape — and its own calls to the Docker socket
-# have to be bounded just as the exec is, or a wedged daemon hangs the scrape
-# in the step before the one that was bounded. A separate `bash -c` rather
-# than a subshell because a subshell cannot be the child `timeout` signals.
-if stats=$(timeout 10 bash -c '
-    set -uo pipefail
-    LIB=/usr/local/lib/unbound-autoupdate
-    . "$LIB/log.sh"
-    . "$LIB/state.sh"
-    . "$LIB/discover.sh"
-    . "$LIB/metrics.sh"
-    _collect_stats' 2>/dev/null); then
-  if [ -n "$stats" ]; then
-    stats_to_prometheus <<<"$stats"
-    ok=1
+if [ -S /var/run/docker.sock ]; then
+  # With the Docker socket: collected now, in the resolver.
+  #
+  # Collection runs in a child of its own, under ONE timeout that covers all
+  # of it: discover_target_container dies (exit) when it cannot find the
+  # resolver, and that must not end the scrape — and its own calls to the
+  # Docker socket have to be bounded just as the exec is, or a wedged daemon
+  # hangs the scrape in the step before the one that was bounded
+  # (_bounded_collect, lib/metrics.sh).
+  if stats=$(_bounded_collect 10 _collect_stats); then
+    if [ -n "$stats" ]; then
+      stats_to_prometheus <<<"$stats"
+      ok=1
+    fi
   fi
-fi
-
-# Trust-anchor state, same bounded-child contract. Absent (not an error) when
-# the resolver cannot be reached or the file is not there.
-if anchor=$(timeout 5 bash -c '
-    set -uo pipefail
-    LIB=/usr/local/lib/unbound-autoupdate
-    . "$LIB/log.sh"
-    . "$LIB/state.sh"
-    . "$LIB/discover.sh"
-    . "$LIB/metrics.sh"
-    _collect_anchor' 2>/dev/null); then
-  [ -n "$anchor" ] && anchor_to_prometheus <<<"$anchor"
+  # Trust-anchor state, same bounded-child contract. Absent (not an error)
+  # when the resolver cannot be reached or the file is not there.
+  if anchor=$(_bounded_collect 5 _collect_anchor); then
+    [ -n "$anchor" ] && anchor_to_prometheus <<<"$anchor"
+  fi
+else
+  # Without it — the recommended way to run this service: it cannot ask the
+  # resolver anything, and serves what the loop container's collector last
+  # read (METRICS_COLLECT_INTERVAL there). Whoever reaches this endpoint, or
+  # breaks into this container, then has a read-only view of a few files and
+  # not a root-equivalent socket. Statistics older than METRICS_STALE_AFTER
+  # are not served: a collector that has stopped must look like a failed
+  # scrape, not like a resolver whose counters no longer move.
+  now=$(date +%s)
+  if mtime=$(stat -c %Y "$METRICS_STATS_FILE" 2>/dev/null); then
+    age=$(( now - mtime )); [ "$age" -ge 0 ] || age=0
+    if [ "$age" -le "$(to_seconds "${METRICS_STALE_AFTER:-120}" 2>/dev/null || echo 120)" ] \
+       && stats=$(cat "$METRICS_STATS_FILE" 2>/dev/null) && [ -n "$stats" ]; then
+      stats_to_prometheus <<<"$stats"
+      ok=1
+      anchor=$(cat "$METRICS_ANCHOR_FILE" 2>/dev/null) && [ -n "$anchor" ] && anchor_to_prometheus <<<"$anchor"
+    fi
+  fi
 fi
 
 [ -r "$METRICS_FILE" ] && cat "$METRICS_FILE"
 
 printf '# HELP unbound_exporter_scrape_success 1 when unbound-control stats were collected on this scrape.\n# TYPE unbound_exporter_scrape_success gauge\n'
 printf 'unbound_exporter_scrape_success %d\n' "$ok"
+printf '# HELP unbound_exporter_stats_age_seconds Age of the resolver statistics served on this scrape: 0 when this service read them itself through the Docker socket, else the time since the collector of the loop container last did.\n# TYPE unbound_exporter_stats_age_seconds gauge\n'
+printf 'unbound_exporter_stats_age_seconds %d\n' "$age"
 printf '# HELP unbound_exporter_scrape_duration_seconds Time spent collecting this scrape.\n# TYPE unbound_exporter_scrape_duration_seconds gauge\n'
 printf 'unbound_exporter_scrape_duration_seconds %s\n' "$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.3f", b - a }')"

@@ -8,7 +8,8 @@
 # (updater/README.md, "The same-absolute-path rule"). Elsewhere, change
 # /opt/unbound on both sides.
 #
-# HC_URL (and WEBHOOK_URL if used) come from a .env file next to this one.
+# DNS_BIND_ADDRESS, HC_URL (and WEBHOOK_URL if used) come from a .env file
+# next to this one.
 name: unbound
 
 services:
@@ -31,10 +32,13 @@ services:
     tmpfs:
       - "/run/unbound:uid=65532,gid=65532"
 
-    # All host addresses. Port 53 already in use: README.md, "Run it".
+    # One address of this host, the one clients use — never all of them:
+    # behind Docker's port publishing any client can appear to Unbound as the
+    # Docker bridge, which access-control allows, so "53:53" on a host with a
+    # public address is an open resolver (../production.md, "Port 53").
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
+      - "${DNS_BIND_ADDRESS:?set DNS_BIND_ADDRESS in .env}:53:53/udp"
+      - "${DNS_BIND_ADDRESS:?set DNS_BIND_ADDRESS in .env}:53:53/tcp"
 
     volumes:
       # Named volume, required by the sidecar: it holds the DNSSEC trust
@@ -74,6 +78,8 @@ services:
     environment:
       INTERVAL: 1h
       SPLAY: 10%
+      # Statistics for unbound-metrics, which has no Docker socket of its own.
+      METRICS_COLLECT_INTERVAL: 30s
       NOTIFY_HOST: resolver-1.example
       HC_URL: ${HC_URL:?set HC_URL in .env}
       # WEBHOOK_URL: ${WEBHOOK_URL:?set WEBHOOK_URL in .env}
@@ -91,13 +97,18 @@ services:
     image: esitcparis/unbound-autoupdate:1
     command: ["metrics"]
     restart: unless-stopped
+    # No Docker socket: it serves what unbound-autoupdate collects into the
+    # state volume (METRICS_COLLECT_INTERVAL above), read-only, unprivileged.
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
     ports:
       # Loopback only. For a Prometheus on another host, replace 127.0.0.1
-      # with this host's address on the monitoring network: /metrics uses the
-      # Docker socket and must not be reachable from anywhere else.
+      # with this host's address on the monitoring network.
       - "127.0.0.1:9167:9167"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - autoupdate-state:/var/lib/unbound-autoupdate:ro
     logging:
       driver: json-file

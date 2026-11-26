@@ -18,7 +18,8 @@ The decisions live in scripts tested by [`tests/monitor.sh`](../tests/monitor.sh
 [`release-health.sh`](../.github/scripts/release-health.sh) (is the current
 release out), [`release-mode.sh`](../.github/scripts/release-mode.sh) and
 [`release-facts.sh`](../.github/scripts/release-facts.sh) (what a release run
-may do). Only stable Unbound versions are
+may do), [`hold.sh`](../.github/scripts/hold.sh) (what is frozen:
+[Rolling back a release](#rolling-back-a-release)). Only stable Unbound versions are
 picked up (`release-X.Y.Z` tags; release candidates do not match), and the
 version only ever moves up.
 
@@ -45,18 +46,25 @@ Each run of `deploy/unbound-upstream-check` (covered by
    `POLL_INTERVAL`, 90 s by default): an accepted request is not a started
    run, and a workflow disabled on GitHub accepts dispatches and starts
    nothing;
-4. reads the token's expiry date from the API response headers: when 14 or
+4. asks GitHub for the newest run of the monitor that **succeeded**, and
+   fails when it started `MAX_SUCCESS_AGE_HOURS` (3) or more hours ago, or
+   when there is none, or when the answer cannot be read — after the
+   dispatch, so the monitor still runs. Runs that start and then fail, time
+   out or are cancelled every hour are a monitor that does nothing;
+5. reads the token's expiry date from the API response headers: when 14 or
    fewer whole days remain (less than 15 days), it warns on stderr, at most
    once a day; when 3 or fewer remain (less than 4 days), the run fails —
-   after the dispatch, so the monitor still runs;
-5. pings the check with `run <id> started` on success, or `/fail` with the
+   also after the dispatch;
+6. pings the check with `run <id> started` on success, or `/fail` with the
    reason.
 
-It does not wait for the run to finish or read its result: a monitor run that
-fails is reported by the monitor itself (see Supervision). It prints nothing
-on success (with `VERBOSE=1`, the `run <id> started` line), and on failure
-exits 1 with the reason on stderr. A Healthchecks ping that fails prints a
-warning and does not fail the run.
+It does not wait for the run it started to finish: that run's own failure is
+reported by the monitor itself (see Supervision), and by step 4 of the
+following hours if it lasts. It prints nothing on success (with `VERBOSE=1`,
+the `run <id> started` line), and on failure exits 1 with the reason on
+stderr. A Healthchecks ping that fails prints a warning and does not fail the
+run. With `HC_URL` empty it says so on stderr once a day: nothing would then
+report a host that stops.
 
 Settings, read from `/etc/unbound-distroless/trigger.conf` (`KEY=VALUE`
 lines, sourced; another path with `UNBOUND_TRIGGER_CONF`):
@@ -68,7 +76,8 @@ lines, sourced; another path with `UNBOUND_TRIGGER_CONF`):
 | `REPO` | `ESITC-Paris/unbound-distroless` | |
 | `WORKFLOW` | `upstream-check.yml` | |
 | `REF` | `main` | |
-| `STATE_DIR` | `/var/lib/unbound-distroless` | Remembers the day the expiry warning was last printed |
+| `STATE_DIR` | `/var/lib/unbound-distroless` | Remembers the day each once-a-day warning was last printed |
+| `MAX_SUCCESS_AGE_HOURS` | `3` | Fail when the newest successful run of the monitor started this many hours ago or more. `0` disables the check |
 | `EXPIRY_WARN_DAYS` | `14` | Warn when this many whole days or fewer remain |
 | `EXPIRY_FAIL_DAYS` | `3` | Fail when this many whole days or fewer remain |
 | `POLL_ATTEMPTS` | `9` | Checks for the new run… |
@@ -109,12 +118,17 @@ changes.
 
 ## Supervision
 
-Three layers. Only the first notices runs that do not happen.
+Three layers. Only the first notices runs that do not happen, and it is also
+the one that does not depend on GitHub to say that GitHub's side is broken.
 
 1. **Trigger (Healthchecks.io and cron mail).** The check alerts 4 hours
    after the last successful dispatch, whatever the cause — dead host, cron,
    token, GitHub API, disabled workflow — and immediately when the script
-   fails. A dead host mails nothing; that is what this layer is for.
+   fails. A dead host mails nothing; that is what this layer is for. The
+   script also fails when no run of the monitor has **succeeded** for 3
+   hours: the issues of layer 2 are opened by the workflow that is failing,
+   with its own token, and reach the maintainer through GitHub's
+   notifications; this alarm needs none of that.
 2. **Workflows (GitHub issues).** A monitor run that fails or times out —
    including a failed rescan — opens or comments on
    `Upstream check is failing`. A release that fails, is cancelled or times
@@ -125,7 +139,13 @@ Three layers. Only the first notices runs that do not happen.
    `Published <image> image still fails the release gate after a rebuild` or
    `Published <image> image has findings a rebuild cannot fix`
    ([trust.md](trust.md#vulnerabilities-after-release)), and closes them
-   itself once the published image is clean. All are assigned to
+   itself once the published image is clean. The monitor also opens, and
+   closes by itself, `A new Unbound version cannot be adopted` (the release
+   could not be verified or pinned; base updates and rescan rebuilds of the
+   current version go on meanwhile), `The cosign image for the sidecar does
+   not verify` (the sidecar keeps the cosign it has) and `Automatic releases
+   are on hold` (for as long as [`.github/monitor-hold`](../.github/monitor-hold)
+   lists an image). All are assigned to
    `euca01`; GitHub notifies according to that account's settings. A run
    that fails before its first step (startup failure) opens nothing. CI opens
    no issue.
@@ -138,7 +158,9 @@ Three layers. Only the first notices runs that do not happen.
 1. On the trigger host, `sudo VERBOSE=1 /usr/local/bin/unbound-upstream-check`
    prints the reason: HTTP 401 is an expired or revoked token; "no new run …
    appeared" means the workflow is disabled on GitHub (re-enable it in the
-   Actions tab).
+   Actions tab); "no run … has succeeded for N h" means the runs start and
+   fail — open the newest one in the Actions tab, and the issue
+   `Upstream check is failing` if it exists.
 2. Catch up with one run by hand (below). A single run sees everything that
    was missed: the newest Unbound version, every base digest change, and the
    current findings of the published images.
@@ -166,7 +188,8 @@ published ([`release-mode.sh`](../.github/scripts/release-mode.sh)):
 
 | Already published | The run |
 |---|---|
-| Nothing | Builds, tests and publishes everything |
+| Nothing, and the tag is the revision `main` holds now | Builds, tests and publishes everything |
+| Nothing, and the tag is an older revision | Refuses: publishing it would move `latest` and the other mutable tags back to an old build |
 | The immutable tag on both registries, same digest, signed by this tag's run; not all of the rest; the tag is the revision `main` holds now | Finishes on that digest without rebuilding or re-signing: verifies the signatures, attests, moves the mutable tags, creates the GitHub Release and updates the Docker Hub page |
 | All of it (or, for an older revision, signed and with its GitHub Release) | Nothing; the run succeeds with "already published … duplicate dispatch?" |
 | Anything else: the tag on one registry only, different digests, no valid signature from this tag's run, or an older revision without its GitHub Release | Refuses, and names the fix below |
@@ -194,6 +217,53 @@ gh workflow run upstream-check.yml --repo ESITC-Paris/unbound-distroless \
 
 If the monitor pushed tags but could not dispatch a release, it tries five
 times, then fails the run; the next hour's release check dispatches it.
+
+### Rolling back a release
+
+A release that passed every gate and is still wrong: the resolvers that run
+the sidecar took it within the hour, after their own canary. There is no
+"unpublish". An `X.Y.Z-rN` tag is never pushed twice, an older revision is
+never finished or republished, and the sidecar refuses an image whose
+version is older than the one it runs (`ALLOW_DOWNGRADE`). The way back is
+forward: a new revision that does not have the fault.
+
+1. **Stop the monitor from publishing that image.** Add `resolver` or
+   `sidecar` to [`.github/monitor-hold`](../.github/monitor-hold) through a
+   pull request. From the next run, no new Unbound version, base digest or
+   rescan result publishes that image, its recorded base digests stay as
+   they are, and its current release is not repaired or dispatched again.
+   The other image is not affected. The monitor opens
+   `Automatic releases are on hold` and keeps it open.
+2. **On the hosts, if the fault cannot wait** for step 4: pin the last good
+   image by digest ([production.md](production.md), runbooks; the digest is
+   in the release notes of the previous revision). A host pinned by digest
+   no longer follows the tag.
+3. **Fix `main`**: revert or correct the change, through a pull request like
+   any other. When the fault came with a base image or a package and not
+   with a commit here, there is nothing to revert: the hold of step 1 is
+   what keeps the previous base digests in `.build-state.json`.
+4. **Publish the next revision** from what `main` now pins. `rebuild` works
+   on a held image, and is the only thing that does:
+
+   ```bash
+   gh workflow run upstream-check.yml --repo ESITC-Paris/unbound-distroless \
+     -f rebuild=resolver          # or sidecar
+   ```
+
+   It is a normal release: same tests, same gates, signed, and the mutable
+   tags move to it. The sidecars deploy it as an update. A base image named
+   by a moving tag is built by the digest the repository records, so a
+   rebuild under a hold gets the base of the last good build; the packages
+   installed on top of it (`apt-get upgrade`, `apk upgrade`) are the current
+   ones.
+5. **Lift the hold** once the cause is understood: remove the line, through
+   a pull request. The monitor then picks up everything it skipped, in one
+   run, and closes the issue.
+
+Going back to an older **Unbound version** (not revision) is not something
+the pipeline does: versions only move up, here and in the sidecar. Hold the
+resolver, pin the hosts to the last release of the previous version by
+digest, and wait for the upstream fix.
 
 ## Repository settings
 

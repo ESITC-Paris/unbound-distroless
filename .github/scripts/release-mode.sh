@@ -15,16 +15,20 @@
 #   RELEASE_EXISTS  yes | no — the GitHub Release for the tag exists
 #   REBUILD_TARGET  resolver | sidecar (named in the recovery hint)
 # Output (stdout): mode=full|resume|done and digest=<sha256:…|empty>.
-#   full    nothing published: build, test, publish everything
+#   full    nothing published, and the tag is the revision main holds now:
+#           build, test, publish everything
 #   resume  the immutable index is published and signed, the tail is not
 #           (mutable tags, attestation, GitHub Release, Docker Hub page):
 #           finish it without rebuilding
 #   done    fully published already (a duplicate dispatch): do nothing
 # Exit 1 with the reason on stderr when the run must not proceed.
 #
-# Why resume is restricted to the CURRENT revision: finishing an old tag
-# would move `latest` back to it — the very hole the published-tag guard
-# closes. Only the revision main holds now can be the newest one.
+# Why full and resume are restricted to the CURRENT revision: publishing or
+# finishing an old tag would move `latest` back to it — the very hole the
+# published-tag guard closes. Only the revision main holds now can be the
+# newest one. A tag that was never published (its release failed before the
+# push, or was superseded while queued) stays unpublished: the revision that
+# replaced it carries the same tree or a newer one.
 set -euo pipefail
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -37,6 +41,8 @@ for v in SIGNED CURRENT MUTABLE_OK RELEASE_EXISTS; do
 done
 
 if [ "$HUB_DIGEST" = absent ] && [ "$GHCR_DIGEST" = absent ]; then
+  [ "$CURRENT" = yes ] \
+    || die "the tag was never published and it is not the revision main holds now: publishing it would move latest backwards. Nothing to do for this tag — a newer revision has replaced it. To publish the current tree again, $hint"
   printf 'mode=full\ndigest=\n'; exit 0
 fi
 [ "$HUB_DIGEST" != absent ] && [ "$GHCR_DIGEST" != absent ] \

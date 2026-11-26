@@ -78,6 +78,28 @@ must_have '^var/lib/dpkg/status.d/'
 must_have '^var/lib/dpkg/status.d/libprotobuf-c1$'
 pass "expected files present"
 
+# Compiler hardening of what this project builds (Dockerfile: Debian's
+# dpkg-buildflags set). The image has no tool to inspect itself, so the
+# extracted binaries are read with the host's readelf. The build already
+# refuses a binary without these; this is the same check on what ships.
+READELF=""
+for c in readelf greadelf llvm-readelf; do
+  if command -v "$c" >/dev/null 2>&1; then READELF=$c; break; fi
+done
+[ -n "$READELF" ] || fail "readelf (binutils) is needed to check the binaries' hardening"
+for f in usr/local/sbin/unbound usr/local/sbin/unbound-control usr/local/sbin/unbound-anchor \
+         usr/local/sbin/unbound-checkconf usr/local/sbin/unbound-host usr/local/lib/libunbound.so.8; do
+  [ -f "$ROOTFS/$f" ] || fail "missing from the extracted image: $f"
+  syms=$("$READELF" -W --dyn-syms "$ROOTFS/$f"); hdr=$("$READELF" -W -d -l -h "$ROOTFS/$f")
+  grep -q '__stack_chk_fail' <<<"$syms" || fail "$f is built without a stack protector"
+  grep -Eq '__[a-z_]+_chk' <<<"$syms" || fail "$f has no fortified libc call (_FORTIFY_SOURCE)"
+  grep -q 'BIND_NOW' <<<"$hdr" || fail "$f is not linked with immediate binding (full RELRO)"
+  grep -q 'GNU_RELRO' <<<"$hdr" || fail "$f has no RELRO segment"
+  grep -Eq 'Type:[[:space:]]+DYN' <<<"$hdr" || fail "$f is not position-independent"
+  grep -Eq 'GNU_STACK.* RW +0x' <<<"$hdr" || fail "$f has an executable stack"
+done
+pass "unbound binaries and libunbound: stack protector, fortified calls, full RELRO, PIE, non-executable stack"
+
 # No stale flat copies shadowed by / shadowing the triplet dir, and no dpkg
 # diversion junk. (usr/lib/ld-linux-* may legitimately exist as the base's
 # symlink into the triplet dir on arm64, so it is not checked here.)

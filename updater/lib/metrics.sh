@@ -4,6 +4,11 @@
 # (promtool) is what the tests hold this output to.
 
 METRICS_FILE="${STATE_DIR:-/var/lib/unbound-autoupdate}/metrics.prom"
+# What the loop's collector leaves for a metrics service that has no Docker
+# socket (metrics_collect_once): the raw `unbound-control stats_noreset`
+# output and the trust-anchor file, as last read from the resolver.
+METRICS_STATS_FILE="${STATE_DIR:-/var/lib/unbound-autoupdate}/resolver-stats"
+METRICS_ANCHOR_FILE="${STATE_DIR:-/var/lib/unbound-autoupdate}/resolver-anchor"
 _LIB_DIR=/usr/local/lib/unbound-autoupdate
 CYCLE_STATUSES="up_to_date updated check_ok skipped blocked rollback critical error"
 
@@ -265,6 +270,10 @@ write_cycle_metrics() {
     printf '# HELP unbound_autoupdate_self_update_last_timestamp_seconds Last successful self-update, unix time (0 = never).\n# TYPE unbound_autoupdate_self_update_last_timestamp_seconds gauge\n'
     printf 'unbound_autoupdate_self_update_last_timestamp_seconds %s\n' "$ts"
   } > "$tmp"
+  # World-readable: a metrics service without the Docker socket runs as an
+  # unprivileged user and only reads this volume. Nothing in the file is
+  # secret — it is what /metrics publishes. state.env stays 0600.
+  chmod 0644 "$tmp"
   mv -f "$tmp" "$METRICS_FILE"
 }
 
@@ -301,6 +310,61 @@ _collect_stats() {
   discover_target_container
   exec docker exec "$TARGET_CONTAINER" \
     /usr/local/sbin/unbound-control -c /etc/unbound/unbound.conf stats_noreset
+}
+
+# _bounded_collect <seconds> <function> — run one of the two collectors above
+# in a child of its own under one timeout (see _collect_stats for why a
+# separate `bash -c` and not a subshell). stdout: what was collected.
+_bounded_collect() {
+  timeout "$1" bash -c '
+    set -uo pipefail
+    LIB=/usr/local/lib/unbound-autoupdate
+    . "$LIB/log.sh"
+    . "$LIB/state.sh"
+    . "$LIB/discover.sh"
+    . "$LIB/metrics.sh"
+    "$1"' _ "$2" 2>/dev/null
+}
+
+# metrics_collect_once — read the resolver's statistics and trust anchor and
+# leave them in the state volume for a metrics service that has no Docker
+# socket. Run by the loop container, which has the socket anyway, every
+# METRICS_COLLECT_INTERVAL. A collection that fails REMOVES the file: the
+# endpoint then says scrape_success 0 at once, as it does when it collects by
+# itself, instead of serving the numbers of a resolver that has stopped.
+# Returns 1 when the statistics could not be read.
+metrics_collect_once() {
+  local tmp rc=0
+  tmp=$(mktemp "$STATE_DIR/.collect.XXXXXX" 2>/dev/null) || { rm -f "$METRICS_STATS_FILE" "$METRICS_ANCHOR_FILE"; return 1; }
+  if _bounded_collect 10 _collect_stats > "$tmp" && grep -q '^total\.num\.queries=' "$tmp" && chmod 0644 "$tmp"; then
+    mv -f "$tmp" "$METRICS_STATS_FILE"
+  else
+    rm -f "$tmp" "$METRICS_STATS_FILE"; rc=1
+  fi
+  tmp=$(mktemp "$STATE_DIR/.collect.XXXXXX" 2>/dev/null) || { rm -f "$METRICS_ANCHOR_FILE"; return 1; }
+  if _bounded_collect 5 _collect_anchor > "$tmp" && [ -s "$tmp" ] && chmod 0644 "$tmp"; then
+    mv -f "$tmp" "$METRICS_ANCHOR_FILE"
+  else
+    rm -f "$tmp" "$METRICS_ANCHOR_FILE"
+  fi
+  return "$rc"
+}
+
+# metrics_collector_loop <seconds> — metrics_collect_once for ever. One log
+# line when collection starts failing and one when it works again, not one
+# per attempt.
+metrics_collector_loop() {
+  local every="$1" was=""
+  while true; do
+    if metrics_collect_once; then
+      [ "$was" != fail ] || log_info "metrics collector: resolver statistics are being read again"
+      was=ok
+    else
+      [ "$was" = fail ] || log_warn "metrics collector: cannot read the resolver's statistics — /metrics reports unbound_exporter_scrape_success 0 until it can"
+      was=fail
+    fi
+    sleep "$every"
+  done
 }
 
 # exec_metrics_server — busybox httpd in the foreground, docroot www/, with

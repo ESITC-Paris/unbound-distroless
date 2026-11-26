@@ -102,10 +102,25 @@ WORKDIR /build
 # it cannot run), and it only generates TLS keys for a TCP control channel,
 # which this image does not use (control-interface is a unix socket).
 # tests/structure.sh asserts every shipped executable actually runs.
+#
+# Compiler hardening: Debian's own flag set for this release and this
+# architecture (dpkg-buildflags, hardening=+all) — stack protector, stack
+# clash protection, _FORTIFY_SOURCE, format-security, control-flow protection
+# (CET on amd64, BTI/PAC on arm64), full RELRO and immediate binding. Unbound's
+# configure adds none of these by itself (--enable-pie and --enable-relro-now
+# only cover PIE and the linker half), so without them the binaries were less
+# protected than Debian's unbound package. Taking the flags from
+# dpkg-buildflags rather than spelling them out keeps them right on both
+# architectures and current with the distribution. The readelf lines after
+# `make install` stop the build if the result does not carry them
+# (tests/structure.sh checks the shipped image again).
 RUN curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSION}.tar.gz" \
  && echo "${UNBOUND_SHA256}  unbound-${UNBOUND_VERSION}.tar.gz" | sha256sum -c - \
  && tar xzf "unbound-${UNBOUND_VERSION}.tar.gz" \
  && cd "unbound-${UNBOUND_VERSION}" \
+ && export DEB_BUILD_MAINT_OPTIONS=hardening=+all \
+ && eval "$(dpkg-buildflags --export=sh)" \
+ && echo "CFLAGS=$CFLAGS" && echo "CPPFLAGS=$CPPFLAGS" && echo "LDFLAGS=$LDFLAGS" \
  && ./configure \
       --prefix=/opt/unbound \
       --with-libevent=/usr \
@@ -121,6 +136,14 @@ RUN curl -fsSLO "https://nlnetlabs.nl/downloads/unbound/unbound-${UNBOUND_VERSIO
       --enable-relro-now \
  && make -j"$(nproc)" \
  && make install \
+ && for f in /opt/unbound/sbin/unbound /opt/unbound/sbin/unbound-control /opt/unbound/lib/libunbound.so.8; do \
+      readelf -W --dyn-syms "$f" > /tmp/elf.syms; readelf -W -d -l -h "$f" > /tmp/elf.hdr; \
+      grep -q '__stack_chk_fail' /tmp/elf.syms || { echo "$f: no stack protector" >&2; exit 1; }; \
+      grep -Eq '__[a-z_]+_chk' /tmp/elf.syms || { echo "$f: no fortified libc call" >&2; exit 1; }; \
+      grep -q 'BIND_NOW' /tmp/elf.hdr || { echo "$f: not linked with immediate binding" >&2; exit 1; }; \
+      grep -q 'GNU_RELRO' /tmp/elf.hdr || { echo "$f: no RELRO segment" >&2; exit 1; }; \
+      grep -Eq 'Type:[[:space:]]+DYN' /tmp/elf.hdr || { echo "$f: not position-independent" >&2; exit 1; }; \
+    done \
  && rm /opt/unbound/sbin/unbound-control-setup \
  && install -D -m 0644 LICENSE /deps/doc/unbound/LICENSE
 

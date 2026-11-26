@@ -55,6 +55,8 @@ RUN chmod 0755 /usr/local/bin/unbound-autoupdate /usr/local/bin/entrypoint.sh \
 
 EXPOSE 9167
 
-# The container runs as root on purpose: it needs the Docker socket, which is
-# root-equivalent anyway. Documented in updater/README.md rather than hidden.
+# The image's default user is root on purpose: the update loop needs the
+# Docker socket, which is root-equivalent anyway. Documented in
+# updater/README.md rather than hidden. The metrics service needs neither and
+# is run with `user:` and without the socket (compose.snippet.yml).
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]

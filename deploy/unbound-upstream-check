@@ -4,13 +4,19 @@
 # `schedule:` on purpose (see docs/operations.md); this script is the
 # scheduler, run from cron on an ESITC host.
 #
-# It does three things and fails loudly if any of them does not happen:
+# It does four things and fails loudly if any of them does not happen:
 #   1. dispatches the workflow through the GitHub API;
 #   2. confirms a run actually started — a 204 only means "request accepted";
-#   3. reports to a Healthchecks.io check, so that this script NOT running
+#   3. checks that a run of the monitor SUCCEEDED recently. Runs that start
+#      and then fail, time out or are cancelled every hour are a monitor
+#      that does nothing; the workflow reports its own failures through
+#      GitHub issues, and this is the second, independent channel for the
+#      day those do not arrive (they are sent by the very thing that fails);
+#   4. reports to a Healthchecks.io check, so that this script NOT running
 #      (dead host, lost crontab, stopped cron daemon) raises an alert too.
 #      Without HC_URL, a silent host is a silent failure: that is exactly
-#      how 1.26.2 went unbuilt for six weeks in autumn 2026.
+#      how 1.26.2 went unbuilt for six weeks in autumn 2026. The script says
+#      so on stderr once a day for as long as HC_URL is empty.
 #
 # Silent on success (cron therefore mails only on failure). Exit 1 on any
 # failure, with the reason on stderr and in the Healthchecks /fail body.
@@ -29,6 +35,11 @@
 #   EXPIRY_WARN_DAYS  warn on stderr when the token expires within N days (14)
 #   EXPIRY_FAIL_DAYS  fail the run when the token expires within N days (3):
 #                the dispatch still happens first, the failure is the alarm
+#   MAX_SUCCESS_AGE_HOURS  fail the run when the newest SUCCESSFUL run of the
+#                monitor started more than N hours ago (3; 0 disables the
+#                check). One failed run is noise — the next hour's usually
+#                passes; three hours without a success is an outage. The
+#                dispatch still happens first.
 set -euo pipefail
 
 CONF="${UNBOUND_TRIGGER_CONF:-/etc/unbound-distroless/trigger.conf}"
@@ -44,6 +55,7 @@ fi
 : "${STATE_DIR:=/var/lib/unbound-distroless}"
 : "${EXPIRY_WARN_DAYS:=14}"
 : "${EXPIRY_FAIL_DAYS:=3}"
+: "${MAX_SUCCESS_AGE_HOURS:=3}"
 # How long to wait for the dispatched run to appear (attempts × seconds).
 : "${POLL_ATTEMPTS:=9}"
 : "${POLL_INTERVAL:=10}"
@@ -88,6 +100,21 @@ latest_run_id() {
   grep -oE '"id": *[0-9]+' "$TMP/body" | head -1 | grep -oE '[0-9]+' || true
 }
 
+# once_a_day <name> <message>: print on stderr (cron mails it) at most once
+# per UTC day. A stamp that cannot be written means the message is printed
+# every hour: louder, never silent.
+once_a_day() {
+  local today stamp="$STATE_DIR/$1"
+  today=$(date -u +%F)
+  if [ "$(cat "$stamp" 2>/dev/null || true)" != "$today" ]; then
+    echo "unbound-upstream-check: $2" >&2
+    { mkdir -p "$STATE_DIR" && printf '%s\n' "$today" > "$stamp"; } 2>/dev/null || true
+  fi
+}
+
+[[ "$MAX_SUCCESS_AGE_HOURS" =~ ^[0-9]+$ ]] || die "MAX_SUCCESS_AGE_HOURS must be a whole number of hours, got '$MAX_SUCCESS_AGE_HOURS'"
+[ -n "$HC_URL" ] || once_a_day hc-missing-warned-on "HC_URL is not set in $CONF: if this host, its cron or this script stops, nothing will say so (docs/operations.md, \"Setting it up\")"
+
 hc /start
 
 BEFORE=$(latest_run_id)
@@ -107,6 +134,20 @@ for _ in $(seq 1 "$POLL_ATTEMPTS"); do
 done
 [ -n "$RUN" ] || die "dispatch was accepted (HTTP 204) but no new run of $WORKFLOW appeared within $((POLL_ATTEMPTS * POLL_INTERVAL))s — is the workflow disabled? https://github.com/$REPO/actions/workflows/$WORKFLOW"
 
+# Started is not succeeded: when did a run of the monitor last succeed?
+# created_at of the newest successful run is the first one in the answer (the
+# objects nested before it — actor, pull_requests — carry none).
+if [ "$MAX_SUCCESS_AGE_HOURS" -gt 0 ]; then
+  CODE=$(api GET "$API/runs?event=workflow_dispatch&status=success&per_page=1")
+  [ "$CODE" = 200 ] || die "run $RUN started, but listing the successful runs failed (HTTP $CODE): $(head -c 300 "$TMP/body")"
+  LAST_OK=$(grep -oE '"created_at": *"[^"]+"' "$TMP/body" | head -1 | cut -d'"' -f4 || true)
+  [ -n "$LAST_OK" ] || die "run $RUN started, but $WORKFLOW has no successful run at all — see https://github.com/$REPO/actions/workflows/$WORKFLOW"
+  LAST_OK_TS=$(date -d "$LAST_OK" +%s 2>/dev/null) || die "run $RUN started, but the date of the last successful run is unreadable: $LAST_OK"
+  AGE_H=$(( ($(date +%s) - LAST_OK_TS) / 3600 ))
+  [ "$AGE_H" -lt "$MAX_SUCCESS_AGE_HOURS" ] \
+    || die "run $RUN started, but no run of $WORKFLOW has succeeded for $AGE_H h (last success: $LAST_OK) — the monitor is running without doing its job: https://github.com/$REPO/actions/workflows/$WORKFLOW"
+fi
+
 NOTE="run $RUN started"
 if [ -n "$EXPIRES" ]; then
   if EXP_TS=$(date -d "$EXPIRES" +%s 2>/dev/null); then
@@ -116,11 +157,7 @@ if [ -n "$EXPIRES" ]; then
     elif [ "$DAYS_LEFT" -le "$EXPIRY_WARN_DAYS" ]; then
       NOTE="$NOTE; token expires in $DAYS_LEFT day(s) ($EXPIRES)"
       # Once a day on stderr (cron mails it), not every hour.
-      TODAY=$(date -u +%F); STAMP="$STATE_DIR/expiry-warned-on"
-      if [ "$(cat "$STAMP" 2>/dev/null || true)" != "$TODAY" ]; then
-        echo "unbound-upstream-check: the GitHub token expires in $DAYS_LEFT day(s) ($EXPIRES) — renew it before then (docs/operations.md)" >&2
-        { mkdir -p "$STATE_DIR" && printf '%s\n' "$TODAY" > "$STAMP"; } 2>/dev/null || true
-      fi
+      once_a_day expiry-warned-on "the GitHub token expires in $DAYS_LEFT day(s) ($EXPIRES) — renew it before then (docs/operations.md)"
     fi
   else
     NOTE="$NOTE; unparseable token expiry header: $EXPIRES"

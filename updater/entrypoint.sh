@@ -69,13 +69,28 @@ case "$MODE" in
     # Validate the schedule once, up front: a typo must stop the container
     # now, not after the first cycle has run.
     _delay >/dev/null
+    COLLECT=$(to_seconds "${METRICS_COLLECT_INTERVAL:-0}")
     log_info "unbound-autoupdate $VERSION starting: interval=$INTERVAL splay=$SPLAY"
+    # The collector for a metrics service that runs without the Docker socket
+    # (lib/metrics.sh, metrics_collect_once). In this container because this
+    # one has the socket whatever happens; off unless asked for.
+    COLLECTOR_PID=""
+    if [ "$COLLECT" -gt 0 ]; then
+      # shellcheck source=updater/lib/discover.sh
+      . "$LIB/discover.sh"
+      # shellcheck source=updater/lib/metrics.sh
+      . "$LIB/metrics.sh"
+      state_init
+      log_info "metrics collector: resolver statistics every ${COLLECT}s, for a metrics service without the Docker socket"
+      metrics_collector_loop "$COLLECT" & COLLECTOR_PID=$!
+    fi
     # SIGTERM (docker stop) is forwarded to a running cycle, which ends at a
     # consistent point — at once outside a swap, after it inside one — and
     # the loop then exits. Without this the cycle never saw the signal and
     # was simply killed at the end of the grace period, mid-swap or not.
     CYCLE_PID=""
     _forward_term() {
+      [ -z "$COLLECTOR_PID" ] || kill "$COLLECTOR_PID" 2>/dev/null || true
       if [ -n "$CYCLE_PID" ]; then kill -TERM "$CYCLE_PID" 2>/dev/null || true; wait "$CYCLE_PID" 2>/dev/null || true; fi
       exit 143
     }

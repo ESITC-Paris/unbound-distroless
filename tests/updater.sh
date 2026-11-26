@@ -53,12 +53,55 @@ t0_state_unit() {
     config_quarantine_active "confhash2" && { echo "other fingerprint must not be config-quarantined"; exit 1; }
     config_quarantine_clear
     config_quarantine_active "confhash1" && { echo "config clear failed"; exit 1; }
+    # A value that replaces another leaves every other key alone, and no
+    # temporary file behind.
+    state_set OTHER "kept value"
+    state_set LAST_IMAGE_DIGEST "repo@sha256:eee"
+    [ "$(state_get OTHER)" = "kept value" ] && [ "$(state_get LAST_IMAGE_DIGEST)" = "repo@sha256:eee" ] || { echo "another key was lost"; exit 1; }
+    [ "$(grep -c "^LAST_IMAGE_DIGEST=" "$STATE_FILE")" = 1 ] || { echo "a replaced key is there twice"; exit 1; }
+    [ -z "$(ls -A "$STATE_DIR" | grep "^\.state\." || true)" ] || { echo "temporary files left behind"; exit 1; }
     [ "$(to_seconds 45s)" = 45 ] && [ "$(to_seconds 30m)" = 1800 ] \
       && [ "$(to_seconds 1h)" = 3600 ] && [ "$(to_seconds 2d)" = 172800 ] \
       && [ "$(to_seconds 90)" = 90 ] || { echo "to_seconds failed"; exit 1; }
     echo OK') || fail "state unit failed: $out"
   [ "${out##*$'\n'}" = OK ] || fail "state unit did not print OK: $out"
   pass "state, quarantine, config-quarantine and to_seconds behave"
+}
+
+t0_state_full_volume_unit() {
+  # A state volume with no room left: a write must fail and leave state.env
+  # as it was. It used to be replaced by a short or empty file — quarantines,
+  # the deployed fingerprints and a pending swap intent gone, and the next
+  # cycle adopting whatever runs as its baseline.
+  local out
+  out=$(docker run --rm --tmpfs /st:size=64k --entrypoint /bin/bash "$UPDATER_IMAGE" -c '
+    set -uo pipefail
+    export STATE_DIR=/st RETRY_AFTER=1h
+    . /usr/local/lib/unbound-autoupdate/log.sh
+    . /usr/local/lib/unbound-autoupdate/state.sh
+    state_init
+    state_set QUARANTINE_DIGEST "repo@sha256:ccc" || { echo "setup write failed"; exit 1; }
+    state_set SWAP_INTENT "a b c d 1 0 repo - -"  || { echo "setup write failed"; exit 1; }
+    # Padding, so that the copy of the state does not fit in what is left.
+    for i in $(seq 1 40); do state_set "PAD_$i" "$(printf "x%.0s" $(seq 200))" || { echo "setup write $i failed"; exit 1; }; done
+    before=$(sha256sum < "$STATE_FILE")
+    dd if=/dev/zero of=/st/fill bs=1k count=200 2>/dev/null
+    if state_set LAST_IMAGE_DIGEST "repo@sha256:fff" 2>/tmp/err; then echo "a write on a full volume reported success"; exit 1; fi
+    grep -q "previous state kept" /tmp/err || { echo "no error message: $(cat /tmp/err)"; exit 1; }
+    [ "$(sha256sum < "$STATE_FILE")" = "$before" ] || { echo "state.env changed on a failed write"; exit 1; }
+    [ "$(state_get QUARANTINE_DIGEST)" = "repo@sha256:ccc" ] || { echo "the quarantine was lost"; exit 1; }
+    [ -z "$(ls -A /st | grep "^\.state\." || true)" ] || { echo "temporary files left behind"; exit 1; }
+    # Under set -e — the cycle — the failure ends the script.
+    # (A process of its own, run as a plain command: inside an `if` or a
+    # `||` list bash ignores set -e, which would prove nothing.)
+    bash -c "set -e; . /usr/local/lib/unbound-autoupdate/log.sh; . /usr/local/lib/unbound-autoupdate/state.sh; state_set X y 2>/dev/null; echo survived" > /tmp/sete
+    if grep -q survived /tmp/sete; then echo "set -e did not stop on a failed state write"; exit 1; fi
+    rm /st/fill
+    state_set LAST_IMAGE_DIGEST "repo@sha256:fff" || { echo "a write failed once there was room again"; exit 1; }
+    [ "$(state_get LAST_IMAGE_DIGEST)" = "repo@sha256:fff" ] && [ "$(state_get SWAP_INTENT)" = "a b c d 1 0 repo - -" ] || { echo "state wrong after recovery"; exit 1; }
+    echo OK' 2>&1) || fail "state on a full volume: $out"
+  [ "${out##*$'\n'}" = OK ] || fail "state on a full volume did not print OK: $out"
+  pass "a state write that cannot complete (full volume) fails, says so, and leaves state.env untouched"
 }
 
 t0_logfmt_unit() {
@@ -1156,30 +1199,29 @@ LABEL org.opencontainers.image.version=\"2.0.0\"" "unbound-major:2")
   local before; before=$(running_ref "$dir")
 
   fixture_set_image_raw "$dir" 'unbound-distroless' "$fakemajor"
+  # This image is UNSIGNED (registry_up never signs anything it serves). Its
+  # version label is therefore its author's word and nothing more: the cycle
+  # must end at the signature, not at "major version bump not deployed" — a
+  # routine-looking outcome that used to hide an unsigned image behind the
+  # tag for as long as it stayed there. (A SIGNED major bump is refused by
+  # the version guard: t_major_guard_tag_only.)
   local rc=0 out
   out=$(updater_run "$dir" 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "T8: a major bump was deployed without ALLOW_MAJOR"
+  [ "$rc" = 1 ] || fail "T8: an unsigned image labelled as a new major did not end the cycle as blocked (rc=$rc): $out"
+  grep -qi 'cosign verification FAILED' <<<"$out" \
+    || fail "T8: an unsigned image was not refused at the cosign gate: $out"
   grep -qi 'major version bump' <<<"$out" \
-    || fail "T8: the run failed, but not at the major-version guard: $out"
-  [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production moved to a new major version"
+    && fail "T8: the version label of an unsigned image was read and acted on: $out"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production moved to an unsigned image"
 
-  # And the guard is a guard, not a wall: ALLOW_MAJOR=1 lets the bump past
-  # the version guard. This test image is unsigned too, though (registry_up
-  # never signs anything it serves), and the cosign gate sits right after
-  # the major-version guard — deliberately, since there is no point
-  # verifying the signature of something already refused. So this half
-  # cannot reach a successful deployment: it dies one guard further in.
-  # Assert that precisely: the major-version message is gone and the
-  # cosign failure is what's left, per the brief's own note on this case.
+  # ALLOW_MAJOR=1 changes nothing about that.
   rc=0
   out=$(updater_run "$dir" ALLOW_MAJOR=1 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "T8: ALLOW_MAJOR=1 unexpectedly succeeded against an unsigned image"
-  grep -qi 'major version bump' <<<"$out" \
-    && fail "T8: ALLOW_MAJOR=1 was still refused at the major-version guard: $out"
+  [ "$rc" = 1 ] || fail "T8: ALLOW_MAJOR=1 unexpectedly changed the outcome for an unsigned image (rc=$rc): $out"
   grep -qi 'cosign verification FAILED' <<<"$out" \
     || fail "T8: ALLOW_MAJOR=1 failed, but not at the cosign gate: $out"
-  [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production changed even though the bump was never actually deployed"
-  pass "T8: major bump refused by default; ALLOW_MAJOR=1 passes the version guard and is stopped only by the cosign gate"
+  [ "$(running_ref "$dir")" = "$before" ] || fail "T8: production changed even though nothing was deployed"
+  pass "T8: an unsigned image labelled as a new major is refused for its signature, with or without ALLOW_MAJOR — its label is never acted on"
 }
 
 t_self_update_applies() {
@@ -1448,6 +1490,92 @@ t_metrics_scrape() {
   promtool_check "$out" || fail "degraded /metrics rejected by promtool"
   rm -f "$out"
   pass "/metrics degrades to scrape_success=0 with HTTP 200 when the resolver is down"
+}
+
+t_metrics_without_socket() {
+  # The metrics service as the install recipe now runs it: no Docker socket,
+  # an unprivileged user, a read-only root and the state volume read-only.
+  # The loop container's collector reads the resolver for it.
+  local dir="$TEST_TMPDIR/upd-nosock-$$"
+  local p name out="$TEST_TMPDIR/upd-nosock-$$.prom" _i
+  trap 'docker rm -f "upd-nosock-m-$$" >/dev/null 2>&1 || true; fixture_destroy "$dir"' RETURN
+  fixture_create "$dir" "$MOVING_REF"
+  p=$(fixture_project "$dir"); name="upd-nosock-m-$$"
+  updater_run "$dir" >/dev/null || fail "baseline cycle failed"
+  for _i in $(seq 1 5); do
+    updater_exec "$dir" dig +time=5 +tries=2 @unbound example.com A 2>/dev/null \
+      | grep -q 'status: NOERROR' && break
+    [ "$_i" -lt 5 ] || fail "the fixture resolver never answered a query"
+    sleep 3
+  done
+
+  docker run -d --name "$name" --network "${p}_default" \
+    --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp \
+    -e METRICS_STALE_AFTER=6 -v "${p}_ustate:/var/lib/unbound-autoupdate:ro" \
+    "$UPDATER_IMAGE" metrics >/dev/null || fail "the metrics service did not start without the socket, unprivileged"
+  blocker_track "$name"
+  scrape() {
+    for _i in $(seq 1 15); do
+      docker exec "$name" curl -fsS --max-time 20 http://127.0.0.1:9167/metrics > "$out" 2>/dev/null && [ -s "$out" ] && return 0
+      sleep 1
+    done
+    fail "/metrics never answered without the socket: $(docker logs "$name" 2>&1 | tail -5)"
+  }
+
+  # Nothing collected yet: the cycle metrics are served, the resolver's are not.
+  scrape
+  grep -q '^unbound_exporter_scrape_success 0$' "$out" || fail "scrape_success is not 0 before any collection: $(head -20 "$out")"
+  grep -q '^unbound_autoupdate_last_cycle_status{status="up_to_date"} 1$' "$out" \
+    || fail "the cycle metrics are not readable by the unprivileged metrics service: $(updater_exec "$dir" ls -l /var/lib/unbound-autoupdate)"
+  docker exec "$name" cat /var/lib/unbound-autoupdate/state.env >/dev/null 2>&1 \
+    && fail "state.env is readable by the unprivileged metrics service"
+
+  # One collection by the container that has the socket.
+  updater_exec "$dir" /bin/bash -c '
+    LIB=/usr/local/lib/unbound-autoupdate
+    . "$LIB/log.sh"; . "$LIB/state.sh"; . "$LIB/discover.sh"; . "$LIB/metrics.sh"
+    metrics_collect_once' || fail "metrics_collect_once failed on a running resolver"
+  scrape
+  promtool_check "$out" || fail "/metrics without the socket rejected by promtool: $(head -40 "$out")"
+  local expect
+  for expect in \
+    '^unbound_exporter_scrape_success 1$' \
+    '^unbound_exporter_stats_age_seconds [0-9]+$' \
+    '^unbound_queries_total [0-9]+$' \
+    '^unbound_query_types_total{type="A"} [0-9]+$' \
+    '^unbound_trust_anchor_key_info{' \
+    '^unbound_autoupdate_cycles_total{status="up_to_date"} 1$'; do
+    grep -qE "$expect" "$out" || fail "/metrics without the socket: missing '$expect' in: $(head -60 "$out")"
+  done
+
+  # A collector that stopped: old statistics are not served as if current.
+  sleep 8
+  scrape
+  grep -q '^unbound_exporter_scrape_success 0$' "$out" || fail "statistics older than METRICS_STALE_AFTER were served: $(grep exporter "$out")"
+  grep -q '^unbound_queries_total' "$out" && fail "stale resolver statistics are still in the exposition"
+  promtool_check "$out" || fail "the stale exposition is rejected by promtool"
+
+  # The collector as loop mode runs it, and a resolver that stops: the file
+  # goes away at the next collection and the scrape says so.
+  docker compose -p "$p" --project-directory "$dir" -f "$dir/docker-compose.yml" \
+    exec -d -e METRICS_COLLECT_INTERVAL=2s -e INTERVAL=1h updater /usr/local/bin/entrypoint.sh loop
+  for _i in $(seq 1 30); do
+    scrape
+    grep -q '^unbound_exporter_scrape_success 1$' "$out" && break
+    [ "$_i" -lt 30 ] || fail "loop mode with METRICS_COLLECT_INTERVAL never produced fresh statistics: $(grep exporter "$out")"
+    sleep 1
+  done
+  docker compose -p "$p" --project-directory "$dir" -f "$dir/docker-compose.yml" stop unbound >/dev/null 2>&1
+  for _i in $(seq 1 30); do
+    scrape
+    grep -q '^unbound_exporter_scrape_success 0$' "$out" && break
+    [ "$_i" -lt 30 ] || fail "scrape_success stayed 1 after the resolver stopped"
+    sleep 1
+  done
+  updater_exec "$dir" test ! -e /var/lib/unbound-autoupdate/resolver-stats \
+    || fail "the statistics of a stopped resolver were left in the state volume"
+  rm -f "$out"
+  pass "/metrics without the Docker socket, unprivileged and read-only: serves what the loop collects, refuses stale statistics, cannot read state.env"
 }
 
 t1_image_update_actually_lands() {
@@ -2554,6 +2682,7 @@ t_self_update_trust() {
   registry_up
   local v1 tag
   v1=$(registry_publish "FROM $UPDATER_IMAGE
+LABEL org.opencontainers.image.version=\"1.0.0\"
 LABEL test.selftrust=\"1\"" "unbound-autoupdate:1")
   tag="$v1"
   FIXTURE_UPDATER_IMAGE="$v1" signed_resolver_fixture "$dir" "unbound-selftrust:1"
@@ -2562,8 +2691,12 @@ LABEL test.selftrust=\"1\"" "unbound-autoupdate:1")
   [ -n "$id1" ] && [ -n "$d1" ] || fail "setup: no sidecar image id or digest"
 
   # An UNSIGNED v2 under the sidecar's tag in the registry. Locally the tag
-  # still names v1, exactly as on a production host before an update.
+  # still names v1, exactly as on a production host before an update. It is
+  # labelled as a new MAJOR version on top: the label of an unsigned image
+  # must not be what the cycle acts on (it used to end as "major version
+  # bump not applied", green, with the signature never checked).
   local v2; v2=$(registry_publish "FROM $UPDATER_IMAGE
+LABEL org.opencontainers.image.version=\"2.0.0\"
 LABEL test.selftrust=\"2-unsigned\"" "unbound-autoupdate:1")
   local d2; d2=$(registry_digest "$v2")
   [ "$(docker image inspect "$tag" --format '{{.Id}}')" = "$id1" ] || fail "setup: the local tag does not name v1"
@@ -2572,6 +2705,7 @@ LABEL test.selftrust=\"2-unsigned\"" "unbound-autoupdate:1")
   out=$(updater_run "$dir" "${keys[@]}" 2>&1) || rc=$?
   [ "$rc" = 1 ] || fail "an unsigned sidecar image did not fail the cycle (rc=$rc): $out"
   grep -q 'self-update: cosign verification FAILED' <<<"$out" || fail "the refusal was not the sidecar's cosign gate: $out"
+  grep -qi 'major version bump' <<<"$out" && fail "the version label of an unsigned sidecar image was acted on: $out"
   [ "$(docker image inspect "$tag" --format '{{.Id}}' 2>/dev/null)" = "$id1" ] \
     || fail "the local sidecar tag was moved onto the refused image ($(docker image inspect "$tag" --format '{{.Id}}' 2>/dev/null)) — 'docker compose run … check' would run it"
   compose_up_is_noop "$dir" || fail "after a refused sidecar image, a plain 'docker compose up -d' recreated containers"
@@ -2629,6 +2763,7 @@ ALL_TESTS="
   t0_notify_host_unit
   t0_config_fingerprint_directory_unit
   t0_config_fingerprint_exclude_unit
+  t0_state_full_volume_unit
   t0_stats_to_prometheus_unit
   t0_anchor_to_prometheus_unit
   t0_cache_split_unit
@@ -2652,6 +2787,7 @@ ALL_TESTS="
   t_modes
   t_loop_sigterm
   t_metrics_scrape
+  t_metrics_without_socket
   t1_image_update_actually_lands
   t1b_moved_tag_update_actually_lands
   t2_noop_second_cycle

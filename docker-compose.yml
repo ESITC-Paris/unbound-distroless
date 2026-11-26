@@ -3,6 +3,10 @@
 # project, starts it (only the image, the container name and the published
 # host port are overridden) and checks resolution and DNSSEC.
 #
+# As shipped it serves this host only (127.0.0.1). To serve a network, put
+# the host's address on that network in the two `ports:` lines — an address,
+# not all of them: README, "Serving your network".
+#
 # Production: replace the tag below with an X.Y.Z-rN tag or an @sha256:
 # digest taken from https://github.com/ESITC-Paris/unbound-distroless/releases
 # (or keep `:1` and add the update sidecar: updater/README.md).
@@ -20,8 +24,12 @@ services:
     tmpfs:
       - "/run/unbound:uid=65532,gid=65532"
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
+      # One named address, never "53:53": behind Docker's port publishing any
+      # client can appear to Unbound as the Docker bridge, which the shipped
+      # access-control allows — on a host with a public address that is an
+      # open resolver.
+      - "127.0.0.1:53:53/udp"   # this host only: see "Serving your network"
+      - "127.0.0.1:53:53/tcp"
     volumes:
       # DNSSEC trust anchor (RFC 5011 updates) and the hyperlocal root zone copy.
       # Named unbound-rootkey in versions of this file before 2026-11: keep that

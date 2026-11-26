@@ -1,0 +1,12 @@
+# Images the monitor must not publish by itself (upstream-check.yml).
+#
+# Empty (comments only) in normal operation. To freeze an image while a bad
+# release is investigated or rolled back, add a line with `resolver` or
+# `sidecar`, through a pull request. While an image is listed here:
+#   * no new Unbound version, base image or rescan result publishes it;
+#   * its base digests in .build-state.json stay as they are;
+#   * its current release is not re-dispatched or repaired;
+#   * `gh workflow run upstream-check.yml -f rebuild=<image>` still publishes
+#     a new revision, built from exactly what the repository pins.
+# An issue stays open for as long as something is listed.
+# Procedure: docs/operations.md, "Rolling back a release".

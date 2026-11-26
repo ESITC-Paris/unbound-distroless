@@ -11,8 +11,13 @@
 #   RESCAN_RESOLVER_TRIES                             and which attempt this is
 #   RESCAN_UPDATER_DIGEST  RESCAN_UPDATER_VULNS  RESCAN_UPDATER_TRIES
 #   NOW                                               epoch seconds (default: now)
+#   HOLD                                              none|resolver|sidecar|both
+#                                                     (.github/monitor-hold)
 #
-# The four base digests are always written. The rescan attempt record
+# The four base digests are written, except those of an image on hold: its
+# recorded digests are what a rollback revision is built from, and they must
+# still differ from the live ones when the hold is lifted, so that the first
+# run afterwards sees the pending base update. The rescan attempt record
 # (rescan_<image>_digest/_vulns/_at/_tries, read by rescan-decide.sh, which
 # spaces the attempts out with it) is written only when this commit publishes
 # a rebuild of that image AND the rescan asked for one: that is the attempt
@@ -34,12 +39,16 @@ try:
 except FileNotFoundError:
     state = {}
 
-state.update({
-    "debian": env("NEW_DEBIAN"),
-    "distroless": env("NEW_DISTROLESS"),
-    "alpine": env("NEW_ALPINE"),
-    "cosign": env("NEW_COSIGN"),
-})
+hold = env("HOLD", "none") or "none"
+if hold not in ("none", "resolver", "sidecar", "both"):
+    print(f"::error::HOLD has unexpected value {hold!r}", file=sys.stderr)
+    sys.exit(1)
+bases = {}
+if hold not in ("resolver", "both"):
+    bases.update(debian=env("NEW_DEBIAN"), distroless=env("NEW_DISTROLESS"))
+if hold not in ("sidecar", "both"):
+    bases.update(alpine=env("NEW_ALPINE"), cosign=env("NEW_COSIGN"))
+state.update(bases)
 
 def record(image, publishing):
     if env(f"RESCAN_{image.upper()}", "") != "new" or not publishing:
