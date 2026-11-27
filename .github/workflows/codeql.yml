@@ -1,0 +1,51 @@
+name: CodeQL
+
+# Static analysis of the GitHub Actions workflows (CodeQL's `actions`
+# language): injection through `${{ }}` in a `run:` body, untrusted checkouts,
+# over-broad permissions, unpinned actions. The workflows are where this
+# repository's privileges live — they sign and publish the images — and
+# CodeQL has no analyser for shell or Dockerfiles, which shellcheck and
+# hadolint cover in ci.yml.
+#
+# No `schedule` (see CONTRIBUTING.md): every pull request and every push to
+# `main` is analysed, and Dependabot's weekly pull requests for the actions
+# below bring the newer queries with them. The monitor's own commits carry
+# [skip ci] and only touch versions.env and .build-state.json, which this
+# analysis does not read.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (actions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Upload the results to code scanning. Not granted to pull requests
+      # from forks, where the analysis runs and the upload is skipped.
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: actions
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:actions
