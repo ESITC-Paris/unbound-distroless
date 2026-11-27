@@ -3,7 +3,8 @@
   "distroless": "sha256:7088bf1cdc94a65af4e0d5ad94518ed489a372dec1ece38ff4411c6c15fb5864",
   "alpine": "sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf",
   "cosign": "sha256:7d08ec40d6f6fd9ced81a498c367ee6d4dd90d73218f58a791f78661bdbef769",
-  "rescan_updater_digest": "sha256:ce890fac802d58ce81b0c2067569397dfe456e174fde8b0ee76798fbb7f706cc",
-  "rescan_updater_vulns": "38be4bd2b193a97a",
-  "rescan_updater_at": "1795345754"
+  "rescan_updater_digest": "sha256:e95e7414a338c253af2ad3d5641b2ee877e9dac3d579510506938b253d048eb9",
+  "rescan_updater_vulns": "cb0e23bda795b9a5",
+  "rescan_updater_at": "1795782021",
+  "rescan_updater_tries": "1"
 }
