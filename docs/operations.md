@@ -11,6 +11,7 @@ when it stops or a release fails, and the GitHub settings it relies on.
 | [`release.yml`](../.github/workflows/release.yml), [`updater.yml`](../.github/workflows/updater.yml) | A dispatch on the release tag, by the monitor or by hand | Build, test, sign and publish one release ([trust.md](trust.md#from-source-to-registry)). Each workflow has its own concurrency group (`publish-resolver`, `publish-sidecar`): the two can run at the same time, and further dispatches of the same workflow queue (up to 100) instead of being cancelled |
 | [`ci.yml`](../.github/workflows/ci.yml) | Pull requests; pushes to `main` that change more than Markdown | Lint, the resolver's test suites, the sidecar's integration suite, the Trivy gates |
 | [`scorecard.yml`](../.github/workflows/scorecard.yml) | Weekly schedule, pushes to `main` | OpenSSF Scorecard |
+| [`codeql.yml`](../.github/workflows/codeql.yml) | Pull requests, pushes to `main` | CodeQL static analysis of the workflows themselves (`actions` language), reported in code scanning |
 
 The decisions live in scripts tested by [`tests/monitor.sh`](../tests/monitor.sh):
 [`decide-updates.sh`](../.github/scripts/decide-updates.sh) (what to publish),

@@ -151,7 +151,9 @@ and its scripts, exercised by [`tests/monitor.sh`](../tests/monitor.sh):
   `main`, are uploaded to the repository's code scanning, including the
   sidecar's cosign findings that do not block. OpenSSF Scorecard
   ([`scorecard.yml`](../.github/workflows/scorecard.yml)) assesses the
-  repository's practices weekly and on every push to `main`.
+  repository's practices weekly and on every push to `main`. CodeQL
+  ([`codeql.yml`](../.github/workflows/codeql.yml)) analyses the workflows on
+  every pull request and push to `main`.
 
 The monitor runs when it is dispatched, hourly by design
 ([operations.md](operations.md)). A failed run opens or comments on the issue
